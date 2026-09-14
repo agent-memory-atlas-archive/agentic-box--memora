@@ -12,6 +12,23 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.4.1
+
+Absorb latency and embedding-rebuild throughput, plus a proxy container-resolve
+hardening pass.
+
+### Absorb
+- `memory_absorb`'s per-fact LLM classification calls are dispatched concurrently (bounded, `MEMORA_ABSORB_CONCURRENCY`, default 4) instead of one at a time; embeds and searches stay sequential (cheap, and the DB connection isn't safe to touch from worker threads). Measured 3.5x from concurrency alone, up to ~18.5x combined with a faster model, on a 7-fact absorb.
+- A single classify call failing in the concurrent phase degrades to a pending create with reason `classify failed: <type>` instead of aborting the whole batch; the sequential path (always exactly one call in flight — this is also what `scripts/measure_absorb_classifier.py`'s live measurement mode exercises) is unchanged and still propagates a raise immediately.
+- `absorb_inflight` tracking now begins before phase 1, not just phase 3's writes, and is heartbeated after each concurrent classify call — a multi-fact batch no longer goes silent for minutes before the first memory is created.
+- The classify prompt identifies each candidate match by its bracketed id only; a prior `"{i+1}. [#{id}]"` numbering let some models return the list position instead of the id, which failed validation and silently produced an empty classification. The response validator also accepts a bare `"id"` key defensively.
+
+### Embeddings
+- `memory_rebuild_embeddings` processes rows in chunks (`MEMORA_REBUILD_CHUNK_SIZE`, default 32) — one batched embedding call and one commit per chunk. The dominant cost was the rebuild-lease heartbeat's D1 round trip, which fired twice per row; chunking collapses that to twice per chunk. Measured 332.3s -> 103.7s (3.2x) rebuilding a 237-row D1 store.
+
+### Deployment tooling
+- `scripts/memora_proxy.py`'s container-IP resolver is now single-flight (concurrent callers on an expired cache collapse into one `container list` subprocess instead of one each) with stale-while-revalidate serving inside a bounded grace window, and closes three follow-on races in that change (a follower observing an unrelated mutation instead of the flight it joined, a stale connect failure deleting a newer successful resolve, a failed-thread-start leaking a flight permanently). Not deployed by this release — the running proxy is a separate, manual step.
+
 ## 0.4.0
 
 Multi-database release. One memora process now serves every workspace from its
