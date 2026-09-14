@@ -4908,10 +4908,18 @@ def _absorb_classify_fact_safe(
     _classify_fact_against_matches already swallows most provider failures
     internally (returns ([], [])); this is the outer safety net for whatever
     doesn't fit that — e.g. the measurement-only LLM-timeout-strict mode, or
-    a genuinely unexpected bug. Used by BOTH the sequential and concurrent
-    phase-1 classify paths so their behavior doesn't diverge: one bad call
-    must not sink the whole absorb batch, whether or not a thread pool is
-    involved.
+    a genuinely unexpected bug.
+
+    Used ONLY by phase 1's concurrent (ThreadPoolExecutor) classify path,
+    deliberately not the sequential one: a raise there always means exactly
+    one call was in flight, and letting it propagate immediately is the
+    pre-existing, unchanged-since-before-concurrency behavior that
+    scripts/measure_absorb_classifier.py's "live" measurement mode depends
+    on — it always absorbs one fact at a time, so it always takes the
+    sequential branch, and relies on a forced-strict classifier failure
+    reaching its caller unmuted. In the concurrent path, by contrast, one bad
+    call among several already-in-flight ones must not discard the others'
+    results, which is what this wrapper is for.
     """
     try:
         classifications, suggested_tags = _classify_fact_against_matches(fact, match_data)
