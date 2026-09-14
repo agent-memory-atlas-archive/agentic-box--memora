@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -101,6 +102,120 @@ def test_absorb_timeout_falls_back_instead_of_raising(local_db, monkeypatch):
         result = storage.absorb_memory(conn, ["Deployment uses version three"])
     assert isinstance(result, dict) and "decisions" in result
     # Timeout degraded: fact is preserved as a create/link, not an exception.
+
+
+def test_absorb_concurrent_classify_preserves_order_and_dedup(local_db, monkeypatch):
+    """Bounded concurrency for phase 1's LLM classify calls must not change
+    which decision goes with which fact, or skip the no-LLM-needed paths.
+
+    Facts, deliberately in this order:
+      0. "DUP ..."   -> obvious duplicate (skipped before any classify call)
+      1. "NEW ..."   -> no matches at all (queued for creation, no classify)
+      2. "A needs..." -> needs classify, made the SLOWEST call
+      3. "B needs..." -> needs classify, medium
+      4. "C needs..." -> needs classify, made the FASTEST call
+
+    Under concurrency, C's classify call returns before A's — if completion
+    order leaked into decision order, C's "create_and_link" decision would
+    land before A's. It must not: dry_run decisions must come out in the
+    original 0..4 fact order regardless.
+    """
+    import time
+
+    with storage.connect() as conn:
+        dup_target = storage.add_memory(conn, content="duplicate target memory")
+        mem_a = storage.add_memory(conn, content="topic A existing memory")
+        mem_b = storage.add_memory(conn, content="topic B existing memory")
+        mem_c = storage.add_memory(conn, content="topic C existing memory")
+
+        facts = [
+            "DUP fact restating the duplicate target memory",
+            "NEW fact with nothing related in the store",
+            "A needs classify fact about topic A",
+            "B needs classify fact about topic B",
+            "C needs classify fact about topic C",
+        ]
+
+        def fake_compute_embedding(content, metadata, tags):
+            return {"marker": content}
+
+        def fake_search(conn_, corpus_, vector, **kwargs):
+            fact = vector["marker"]
+            if fact.startswith("DUP"):
+                return [{"score": 0.95, "memory": dup_target}]
+            if fact.startswith("NEW"):
+                return []
+            if fact.startswith("A needs"):
+                return [{"score": 0.5, "memory": mem_a}]
+            if fact.startswith("B needs"):
+                return [{"score": 0.5, "memory": mem_b}]
+            if fact.startswith("C needs"):
+                return [{"score": 0.5, "memory": mem_c}]
+            raise AssertionError(f"unexpected fact: {fact}")
+
+        classify_calls = []
+        classify_lock = threading.Lock()
+        # Reverse-order delays: the fact that comes FIRST in the input list
+        # finishes LAST under concurrency, stress-testing the ordering fix.
+        delay_by_fact_prefix = {"A needs": 0.3, "B needs": 0.2, "C needs": 0.1}
+
+        def fake_classify(fact, matches):
+            delay = next(d for prefix, d in delay_by_fact_prefix.items() if fact.startswith(prefix))
+            time.sleep(delay)
+            with classify_lock:
+                classify_calls.append(fact)
+            return (
+                [{"memory_id": matches[0]["id"], "relationship": "RELATED", "reason": f"note-{fact}"}],
+                [],
+            )
+
+        monkeypatch.setattr(storage, "_compute_embedding", fake_compute_embedding)
+        monkeypatch.setattr(storage, "_search_snapshot_full", fake_search)
+        monkeypatch.setattr(storage, "_classify_fact_against_matches", fake_classify)
+
+        monkeypatch.setenv("MEMORA_ABSORB_CONCURRENCY", "1")
+        t0 = time.time()
+        sequential_result = storage.absorb_memory(conn, facts, dry_run=True)
+        sequential_elapsed = time.time() - t0
+        sequential_calls = list(classify_calls)
+
+        classify_calls.clear()
+        monkeypatch.setenv("MEMORA_ABSORB_CONCURRENCY", "4")
+        t0 = time.time()
+        concurrent_result = storage.absorb_memory(conn, facts, dry_run=True)
+        concurrent_elapsed = time.time() - t0
+        concurrent_calls = list(classify_calls)
+
+    # Same decisions, same order, regardless of concurrency.
+    assert concurrent_result == sequential_result
+
+    # Only the 3 classify-needing facts ever reached the LLM — dedup (the
+    # duplicate skip) and the no-match create both bypassed it.
+    assert len(sequential_calls) == 3
+    assert len(concurrent_calls) == 3
+
+    # Concurrency actually ran in parallel: completion order is reversed
+    # from input order (C, the fastest, finishes before A, the slowest).
+    assert concurrent_calls[0].startswith("C needs")
+    assert concurrent_calls[-1].startswith("A needs")
+    # ...yet decisions still read in original fact order.
+    link_decisions = [d for d in concurrent_result["decisions"] if d["action"] == "create_and_link"]
+    assert [d["reason"] for d in link_decisions] == [
+        "note-A needs classify fact about topic A",
+        "note-B needs classify fact about topic B",
+        "note-C needs classify fact about topic C",
+    ]
+
+    # Sequential calls happen strictly in input order; concurrent ones don't
+    # (they finish in reverse) — the elapsed-time gap is the actual proof
+    # that concurrency=4 ran the 3 classify calls in parallel rather than
+    # serially (sum of delays 0.6s vs max delay 0.3s).
+    assert sequential_calls == [
+        "A needs classify fact about topic A",
+        "B needs classify fact about topic B",
+        "C needs classify fact about topic C",
+    ]
+    assert concurrent_elapsed < sequential_elapsed * 0.7
 
 
 def test_resolve_follow_defaults_and_all_escape_hatch():

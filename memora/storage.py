@@ -4672,6 +4672,26 @@ _ABSORB_RELATED_THRESHOLD = 0.35    # Send to LLM for classification
 # Production absorb keeps degrade-to-fallback on timeout.
 _LLM_TIMEOUT_STRICT = False
 
+_DEFAULT_ABSORB_CONCURRENCY = 4
+
+
+def _resolve_absorb_concurrency() -> int:
+    """Worker count for absorb's concurrent classify phase (default 4).
+
+    Resolved at call time (not import time) so tests can monkeypatch the env
+    var; an unset/invalid value falls back to the default rather than
+    raising. 1 (or any non-positive value) disables the thread pool and
+    classifies sequentially, matching pre-concurrency behavior exactly.
+    """
+    raw = os.getenv("MEMORA_ABSORB_CONCURRENCY")
+    if raw is None:
+        return _DEFAULT_ABSORB_CONCURRENCY
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_ABSORB_CONCURRENCY
+    return value if value >= 1 else _DEFAULT_ABSORB_CONCURRENCY
+
 
 def _classify_fact_against_matches(
     fact: str,
@@ -4868,6 +4888,212 @@ def _group_facts_by_similarity(
     return groups
 
 
+def _absorb_phase1_prepare(
+    fact: str,
+    conn: sqlite3.Connection,
+    corpus: _CorpusSnapshot,
+) -> Dict[str, Any]:
+    """Everything about one fact up to (but not including) LLM classification.
+
+    Touches conn (tombstone lookup, match hydration) and must run on the
+    caller's thread — absorb_memory's concurrent phase starts only after
+    this returns, and only for facts this resolves to kind="classify".
+
+    Returns one of:
+      {"kind": "decision", "decision": {...}, "counts": {...}}
+      {"kind": "pending", "pending_create": (...), "counts": {...}}
+      {"kind": "classify", "fact", "vector", "match_data", "top_mem"}
+    """
+    fact = fact.strip()
+    if len(fact) < 3:
+        return {
+            "kind": "decision",
+            "decision": {"fact": fact[:80], "action": "skipped", "reason": "too short"},
+            "counts": {"skipped": 1},
+        }
+
+    # Redact secrets
+    redacted_fact, secrets = _redact_secrets(fact)
+    if secrets:
+        fact = redacted_fact
+
+    tombstone_reason = _lookup_tombstone_by_hash(conn, fact)
+    if tombstone_reason is not None:
+        return {
+            "kind": "decision",
+            "decision": {"fact": fact[:80], "action": "tombstoned", "reason": tombstone_reason},
+            "counts": {"tombstoned": 1, "skipped": 1},
+        }
+
+    # Search for similar existing memories.
+    # N6: initialize vector before try so a strict embedding failure cannot
+    # leave UnboundLocalError below.
+    vector = None
+    try:
+        vector = _compute_embedding(fact, None, [])
+        if not vector:
+            return {
+                "kind": "decision",
+                "decision": {"fact": fact[:80], "action": "skipped", "reason": "embedding failed"},
+                "counts": {"skipped": 1},
+            }
+
+        matches = _search_snapshot_full(
+            conn, corpus, vector, top_k=5, min_score=_ABSORB_RELATED_THRESHOLD,
+        )
+    except Exception as e:
+        # N6: strict mode must fail cleanly (named provider error), not as
+        # UnboundLocalError after matches=[] falls through to pending_creates.
+        from memora.embeddings import EmbeddingProviderError, EmbeddingStrictError
+        if isinstance(e, (EmbeddingStrictError, EmbeddingProviderError)) or (
+            isinstance(e, RuntimeError) and "MEMORA_EMBEDDING_STRICT" in str(e)
+        ):
+            raise
+        logger.warning("Absorb search failed for fact: %s — %s", fact[:50], e, exc_info=True)
+        return {
+            "kind": "decision",
+            "decision": {
+                "fact": fact[:80],
+                "action": "skipped",
+                "reason": f"embedding/search failed: {type(e).__name__}: {e}",
+            },
+            "counts": {"skipped": 1},
+        }
+
+    # Exclude document fragments/roots — they are structural, not standalone
+    matches = [
+        m for m in matches
+        if not _is_document_memory(
+            (m.get("memory") or m).get("metadata")
+        )
+    ]
+    # Retired component members stay in the table but are not absorb targets.
+    matches = [
+        m for m in matches
+        if not _is_tombstoned_id(conn, (m.get("memory") or m)["id"])
+    ]
+
+    # No similar memories — queue for creation (vector is guaranteed set here)
+    if not matches:
+        return {
+            "kind": "pending",
+            "pending_create": (fact, vector, None, []),
+            "counts": {},
+        }
+
+    # Check for high-similarity duplicate first (skip LLM if obvious)
+    top_match = matches[0]
+    top_score = top_match.get("score", 0)
+    top_mem = top_match.get("memory", top_match)
+
+    if top_score >= _ABSORB_DUPLICATE_THRESHOLD:
+        return {
+            "kind": "decision",
+            "decision": {
+                "fact": fact[:80],
+                "action": "skipped",
+                "reason": f"duplicate of #{top_mem['id']} (similarity: {top_score:.2f})",
+                "match_id": top_mem["id"],
+            },
+            "counts": {"skipped": 1},
+        }
+
+    # Needs LLM classification — defer the (slow) call to the caller's
+    # concurrent phase. Build match_data now while matches/conn are at hand.
+    match_data = []
+    for m in matches[:3]:
+        mem = m.get("memory", m)
+        if isinstance(mem, dict) and "id" in mem:
+            match_data.append({
+                "id": mem["id"],
+                "content": mem.get("content", ""),
+                "score": m.get("score", 0),
+                "tags": mem.get("tags", []),
+            })
+    return {
+        "kind": "classify",
+        "fact": fact,
+        "vector": vector,
+        "match_data": match_data,
+        "top_mem": top_mem,
+    }
+
+
+def _absorb_resolve_classification(
+    fact: str,
+    vector: Dict[str, float],
+    match_data: List[Dict[str, Any]],
+    top_mem: Dict[str, Any],
+    classifications: List[Dict[str, Any]],
+    suggested_tags: List[str],
+) -> Dict[str, Any]:
+    """Turn one fact's LLM classification result into a decision or pending-create.
+
+    Pure — no conn, no I/O — safe to call after the concurrent classify phase
+    completes, on any thread.
+    """
+    # If LLM returned no classifications and we have matches, fall through
+    # to create rather than silently dropping knowledge.
+    if not classifications and match_data:
+        # Create with related_to link to preserve knowledge
+        return {
+            "kind": "pending",
+            "pending_create": (
+                fact, vector,
+                ("related_to", top_mem["id"], "LLM classify empty; preserving as related"),
+                suggested_tags,
+            ),
+            "counts": {"linked": 1},
+        }
+
+    # Determine action based on LLM classification
+    for cls in classifications:
+        rel = cls.get("relationship", "").upper()
+        target_id = cls.get("memory_id")
+        reason = cls.get("reason", "")
+
+        if rel == "DUPLICATE":
+            return {
+                "kind": "decision",
+                "decision": {
+                    "fact": fact[:80],
+                    "action": "skipped",
+                    "reason": f"duplicate of #{target_id}: {reason}",
+                    "match_id": target_id,
+                },
+                "counts": {"skipped": 1},
+            }
+
+        elif rel == "UPDATE":
+            # Store the classifier target; resolve leaves at dry-run/write
+            # (shared _resolve_absorb_supersedes_target). CONTRADICT does not.
+            return {
+                "kind": "pending",
+                "pending_create": (fact, vector, ("supersedes", target_id, reason), suggested_tags),
+                "counts": {"superseded": 1},
+            }
+
+        elif rel == "CONTRADICT":
+            return {
+                "kind": "pending",
+                "pending_create": (fact, vector, ("contradicts", target_id, reason), suggested_tags),
+                "counts": {"contradicted": 1},
+            }
+
+        elif rel == "RELATED":
+            return {
+                "kind": "pending",
+                "pending_create": (fact, vector, ("related_to", target_id, reason), suggested_tags),
+                "counts": {"linked": 1},
+            }
+
+    return {
+        "kind": "pending",
+        "pending_create": (fact, vector, None, suggested_tags),
+        "counts": {},
+    }
+
+
 def absorb_memory(
     conn: sqlite3.Connection,
     facts: List[str],
@@ -4932,158 +5158,56 @@ def absorb_memory(
     counts = {"created": 0, "superseded": 0, "skipped": 0, "linked": 0, "contradicted": 0, "consolidated": 0, "tombstoned": 0}
 
     # Phase 1: Classify each fact against existing memories, collect "to create" facts
+    #
+    # Split in two: _absorb_phase1_prepare (conn + corpus, sequential, cheap)
+    # decides per fact whether it needs an LLM classification call at all; the
+    # ones that do are the slow part (measured 12-17s each against a reasoning
+    # model) and are dispatched to a bounded thread pool. Embeds and searches
+    # stay sequential — they're single-digit-hundred-ms D1/HTTP calls, not the
+    # bottleneck, and conn is not safe to touch from worker threads (sqlite3
+    # connections are thread-affine by default; D1Connection carries mutable
+    # session-token state). classify itself needs neither conn nor corpus, so
+    # it's the one call safe to fan out.
     pending_creates: List[tuple] = []  # (fact, vector, link_info_or_None, suggested_tags)
 
-    for fact in facts:
-        fact = fact.strip()
-        if len(fact) < 3:
-            decisions.append({"fact": fact[:80], "action": "skipped", "reason": "too short"})
-            counts["skipped"] += 1
-            continue
+    prepared = [_absorb_phase1_prepare(fact, conn, corpus) for fact in facts]
+    classify_indices = [i for i, p in enumerate(prepared) if p["kind"] == "classify"]
 
-        # Redact secrets
-        redacted_fact, secrets = _redact_secrets(fact)
-        if secrets:
-            fact = redacted_fact
+    classify_results: Dict[int, Tuple[List[Dict[str, Any]], List[str]]] = {}
+    if classify_indices:
+        concurrency = min(_resolve_absorb_concurrency(), len(classify_indices))
+        if concurrency <= 1:
+            for i in classify_indices:
+                p = prepared[i]
+                classify_results[i] = _classify_fact_against_matches(p["fact"], p["match_data"])
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                future_to_index = {
+                    pool.submit(
+                        _classify_fact_against_matches, prepared[i]["fact"], prepared[i]["match_data"]
+                    ): i
+                    for i in classify_indices
+                }
+                for future in as_completed(future_to_index):
+                    classify_results[future_to_index[future]] = future.result()
 
-        tombstone_reason = _lookup_tombstone_by_hash(conn, fact)
-        if tombstone_reason is not None:
-            decisions.append({
-                "fact": fact[:80],
-                "action": "tombstoned",
-                "reason": tombstone_reason,
-            })
-            counts["tombstoned"] += 1
-            counts["skipped"] += 1
-            continue
-
-        # Search for similar existing memories.
-        # N6: initialize vector before try so a strict embedding failure cannot
-        # leave UnboundLocalError on pending_creates.append(..., vector, ...).
-        vector = None
-        try:
-            vector = _compute_embedding(fact, None, [])
-            if not vector:
-                decisions.append({"fact": fact[:80], "action": "skipped", "reason": "embedding failed"})
-                counts["skipped"] += 1
-                continue
-
-            matches = _search_snapshot_full(
-                conn, corpus, vector, top_k=5, min_score=_ABSORB_RELATED_THRESHOLD,
+    # Resolve every fact IN ORIGINAL ORDER, regardless of classify completion
+    # order — decisions/pending_creates must read exactly as the sequential
+    # version did.
+    for i, p in enumerate(prepared):
+        if p["kind"] == "classify":
+            classifications, suggested_tags = classify_results[i]
+            p = _absorb_resolve_classification(
+                p["fact"], p["vector"], p["match_data"], p["top_mem"],
+                classifications, suggested_tags,
             )
-        except Exception as e:
-            # N6: strict mode must fail cleanly (named provider error), not as
-            # UnboundLocalError after matches=[] falls through to pending_creates.
-            from memora.embeddings import EmbeddingProviderError, EmbeddingStrictError
-            if isinstance(e, (EmbeddingStrictError, EmbeddingProviderError)) or (
-                isinstance(e, RuntimeError) and "MEMORA_EMBEDDING_STRICT" in str(e)
-            ):
-                raise
-            logger.warning("Absorb search failed for fact: %s — %s", fact[:50], e, exc_info=True)
-            decisions.append({
-                "fact": fact[:80],
-                "action": "skipped",
-                "reason": f"embedding/search failed: {type(e).__name__}: {e}",
-            })
-            counts["skipped"] += 1
-            continue
-
-        # Exclude document fragments/roots — they are structural, not standalone
-        matches = [
-            m for m in matches
-            if not _is_document_memory(
-                (m.get("memory") or m).get("metadata")
-            )
-        ]
-        # Retired component members stay in the table but are not absorb targets.
-        matches = [
-            m for m in matches
-            if not _is_tombstoned_id(conn, (m.get("memory") or m)["id"])
-        ]
-
-        # No similar memories — queue for creation (vector is guaranteed set here)
-        if not matches:
-            pending_creates.append((fact, vector, None, []))
-            continue
-
-        # Check for high-similarity duplicate first (skip LLM if obvious)
-        top_match = matches[0]
-        top_score = top_match.get("score", 0)
-        top_mem = top_match.get("memory", top_match)
-
-        if top_score >= _ABSORB_DUPLICATE_THRESHOLD:
-            decisions.append({
-                "fact": fact[:80],
-                "action": "skipped",
-                "reason": f"duplicate of #{top_mem['id']} (similarity: {top_score:.2f})",
-                "match_id": top_mem["id"],
-            })
-            counts["skipped"] += 1
-            continue
-
-        # Use LLM to classify relationship with matches
-        match_data = []
-        for m in matches[:3]:
-            mem = m.get("memory", m)
-            if isinstance(mem, dict) and "id" in mem:
-                match_data.append({
-                    "id": mem["id"],
-                    "content": mem.get("content", ""),
-                    "score": m.get("score", 0),
-                    "tags": mem.get("tags", []),
-                })
-        classifications, suggested_tags = _classify_fact_against_matches(fact, match_data) if match_data else ([], [])
-
-        # If LLM returned no classifications and we have matches, fall through
-        # to create rather than silently dropping knowledge.
-        if not classifications and matches:
-            # Create with related_to link to preserve knowledge
-            pending_creates.append((fact, vector, ("related_to", top_mem["id"], "LLM classify empty; preserving as related"), suggested_tags))
-            counts["linked"] += 1
-            continue
-
-        # Determine action based on LLM classification
-        action_taken = False
-        for cls in classifications:
-            rel = cls.get("relationship", "").upper()
-            target_id = cls.get("memory_id")
-            reason = cls.get("reason", "")
-
-            if rel == "DUPLICATE":
-                decisions.append({
-                    "fact": fact[:80],
-                    "action": "skipped",
-                    "reason": f"duplicate of #{target_id}: {reason}",
-                    "match_id": target_id,
-                })
-                counts["skipped"] += 1
-                action_taken = True
-                break
-
-            elif rel == "UPDATE":
-                # Store the classifier target; resolve leaves at dry-run/write
-                # (shared _resolve_absorb_supersedes_target). CONTRADICT does not.
-                pending_creates.append((fact, vector, ("supersedes", target_id, reason), suggested_tags))
-                counts["superseded"] += 1
-                action_taken = True
-                break
-
-            elif rel == "CONTRADICT":
-                # Queue for creation with contradicts link
-                pending_creates.append((fact, vector, ("contradicts", target_id, reason), suggested_tags))
-                counts["contradicted"] += 1
-                action_taken = True
-                break
-
-            elif rel == "RELATED":
-                # Queue for creation with related_to link
-                pending_creates.append((fact, vector, ("related_to", target_id, reason), suggested_tags))
-                counts["linked"] += 1
-                action_taken = True
-                break
-
-        if not action_taken:
-            pending_creates.append((fact, vector, None, suggested_tags))
+        if p["kind"] == "decision":
+            decisions.append(p["decision"])
+        else:  # "pending"
+            pending_creates.append(p["pending_create"])
+        for key, delta in p["counts"].items():
+            counts[key] += delta
 
     # Phase 2: Consolidate pending creates by grouping similar new facts
     if not pending_creates:
