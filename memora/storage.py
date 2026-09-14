@@ -4898,6 +4898,31 @@ def _group_facts_by_similarity(
     return groups
 
 
+def _absorb_classify_fact_safe(
+    fact: str,
+    match_data: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str], Optional[BaseException]]:
+    """_classify_fact_against_matches, with any exception it raises caught
+    and reported instead of propagated.
+
+    _classify_fact_against_matches already swallows most provider failures
+    internally (returns ([], [])); this is the outer safety net for whatever
+    doesn't fit that — e.g. the measurement-only LLM-timeout-strict mode, or
+    a genuinely unexpected bug. Used by BOTH the sequential and concurrent
+    phase-1 classify paths so their behavior doesn't diverge: one bad call
+    must not sink the whole absorb batch, whether or not a thread pool is
+    involved.
+    """
+    try:
+        classifications, suggested_tags = _classify_fact_against_matches(fact, match_data)
+        return classifications, suggested_tags, None
+    except Exception as e:
+        logger.warning(
+            "Absorb classify call failed for fact: %s — %s", fact[:50], e, exc_info=True,
+        )
+        return [], [], e
+
+
 def _absorb_phase1_prepare(
     fact: str,
     conn: sqlite3.Connection,
@@ -5036,6 +5061,8 @@ def _absorb_resolve_classification(
     top_mem: Dict[str, Any],
     classifications: List[Dict[str, Any]],
     suggested_tags: List[str],
+    *,
+    classify_error: Optional[BaseException] = None,
 ) -> Dict[str, Any]:
     """Turn one fact's LLM classification result into a decision or pending-create.
 
@@ -5043,14 +5070,20 @@ def _absorb_resolve_classification(
     completes, on any thread.
     """
     # If LLM returned no classifications and we have matches, fall through
-    # to create rather than silently dropping knowledge.
+    # to create rather than silently dropping knowledge. Same fallback
+    # whether the LLM legitimately answered empty or the call itself raised
+    # (_absorb_classify_fact_safe reduces both to classifications=[]) — the
+    # reason string just says which, for debugging.
     if not classifications and match_data:
-        # Create with related_to link to preserve knowledge
+        if classify_error is not None:
+            reason = f"classify failed: {type(classify_error).__name__}; preserving as related"
+        else:
+            reason = "LLM classify empty; preserving as related"
         return {
             "kind": "pending",
             "pending_create": (
                 fact, vector,
-                ("related_to", top_mem["id"], "LLM classify empty; preserving as related"),
+                ("related_to", top_mem["id"], reason),
                 suggested_tags,
             ),
             "counts": {"linked": 1},
@@ -5167,6 +5200,19 @@ def absorb_memory(
     decisions: List[Dict[str, Any]] = []
     counts = {"created": 0, "superseded": 0, "skipped": 0, "linked": 0, "contradicted": 0, "consolidated": 0, "tombstoned": 0}
 
+    # Track this call's absorb_inflight nonce from the top, not just from
+    # phase 3's writes — phase 1's concurrent classify calls can now run for
+    # minutes (12-17s/call against a reasoning model, several facts per
+    # batch), and a heartbeat during that phase keeps a long-running call
+    # observable the same way phase 3's writes already are. dry_run makes no
+    # writes, so it keeps its existing no-side-effects contract: no nonce, no
+    # inflight row, no heartbeat touches.
+    import uuid
+    absorb_nonce: Optional[str] = None
+    if not dry_run:
+        absorb_nonce = str(uuid.uuid4())
+        _begin_absorb_inflight(conn, absorb_nonce)
+
     # Phase 1: Classify each fact against existing memories, collect "to create" facts
     #
     # Split in two: _absorb_phase1_prepare (conn + corpus, sequential, cheap)
@@ -5183,34 +5229,53 @@ def absorb_memory(
     prepared = [_absorb_phase1_prepare(fact, conn, corpus) for fact in facts]
     classify_indices = [i for i, p in enumerate(prepared) if p["kind"] == "classify"]
 
-    classify_results: Dict[int, Tuple[List[Dict[str, Any]], List[str]]] = {}
+    # (classifications, suggested_tags, error_or_None) per index — the error
+    # slot carries any exception the classify call itself raised. Only the
+    # concurrent path below uses the catch-and-report wrapper: one bad call
+    # there must not discard several other already-fired-off calls' results.
+    # The sequential path calls _classify_fact_against_matches directly, same
+    # as before concurrency existed — a raise there always meant exactly one
+    # call was in flight, so propagating immediately is unchanged pre-existing
+    # behavior (and scripts/measure_absorb_classifier.py's "live" measurement
+    # mode depends on exactly that: it always absorbs one fact at a time, so
+    # it always takes this branch, and relies on a forced-strict classifier
+    # failure reaching pytest.raises() unmuted).
+    classify_results: Dict[int, Tuple[List[Dict[str, Any]], List[str], Optional[BaseException]]] = {}
     if classify_indices:
         concurrency = min(_resolve_absorb_concurrency(), len(classify_indices))
         if concurrency <= 1:
             for i in classify_indices:
                 p = prepared[i]
-                classify_results[i] = _classify_fact_against_matches(p["fact"], p["match_data"])
+                classifications, suggested_tags = _classify_fact_against_matches(p["fact"], p["match_data"])
+                classify_results[i] = (classifications, suggested_tags, None)
+                if absorb_nonce is not None:
+                    _touch_absorb_inflight(conn, absorb_nonce, [])
         else:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
                 future_to_index = {
                     pool.submit(
-                        _classify_fact_against_matches, prepared[i]["fact"], prepared[i]["match_data"]
+                        _absorb_classify_fact_safe, prepared[i]["fact"], prepared[i]["match_data"]
                     ): i
                     for i in classify_indices
                 }
+                # Heartbeat after each completion, not just at the end — a
+                # batch with several facts at 12-17s/call each can otherwise
+                # go a couple of minutes without the inflight lease renewing.
                 for future in as_completed(future_to_index):
                     classify_results[future_to_index[future]] = future.result()
+                    if absorb_nonce is not None:
+                        _touch_absorb_inflight(conn, absorb_nonce, [])
 
     # Resolve every fact IN ORIGINAL ORDER, regardless of classify completion
     # order — decisions/pending_creates must read exactly as the sequential
     # version did.
     for i, p in enumerate(prepared):
         if p["kind"] == "classify":
-            classifications, suggested_tags = classify_results[i]
+            classifications, suggested_tags, classify_error = classify_results[i]
             p = _absorb_resolve_classification(
                 p["fact"], p["vector"], p["match_data"], p["top_mem"],
-                classifications, suggested_tags,
+                classifications, suggested_tags, classify_error=classify_error,
             )
         if p["kind"] == "decision":
             decisions.append(p["decision"])
@@ -5253,8 +5318,8 @@ def absorb_memory(
 
     # Phase 3 prep: precompute EVERY storage vector from FINAL payload (P2-1).
     # Phase-1 vectors stay for similarity search only — not for storage.
-    import uuid
-    absorb_nonce = str(uuid.uuid4())
+    # absorb_nonce was already minted above (None for dry_run, which returns
+    # below before phase3_jobs is ever used for anything but the preview).
     phase3_jobs: List[Dict[str, Any]] = []
 
     for group_indices in groups:
@@ -5358,9 +5423,8 @@ def absorb_memory(
             raise RuntimeError("absorb phase-3 embedding returned empty vector")
 
     # owned_ids tracks every INSERT id, even if add_memory fails mid-function (P1-1).
-    # Durable nonce first: process death skips the except handler, so the
-    # in-flight row must already be committed before the first memory INSERT.
-    _begin_absorb_inflight(conn, absorb_nonce)
+    # absorb_inflight tracking (durable nonce, committed before any writes)
+    # began at the top of this call, before phase 1 — not re-begun here.
     owned_ids: List[int] = []
     try:
         for job in phase3_jobs:

@@ -301,6 +301,116 @@ def test_absorb_concurrent_classify_preserves_order_and_dedup(local_db, monkeypa
     assert concurrent_elapsed < sequential_elapsed * 0.7
 
 
+def test_absorb_concurrent_classify_failure_does_not_sink_batch(local_db, monkeypatch):
+    """One classify call raising (concurrent phase) must not lose the other
+    facts' results or abort the whole absorb — it degrades to a pending
+    create with a 'classify failed' reason for just that fact."""
+    with storage.connect() as conn:
+        mem_a = storage.add_memory(conn, content="topic A existing memory")
+        mem_b = storage.add_memory(conn, content="topic B existing memory")
+        mem_c = storage.add_memory(conn, content="topic C existing memory")
+
+        def fake_compute_embedding(content, metadata, tags):
+            return {"marker": content}
+
+        def fake_search(conn_, corpus_, vector, **kwargs):
+            fact = vector["marker"]
+            target = {"A": mem_a, "B": mem_b, "C": mem_c}[fact[0]]
+            return [{"score": 0.5, "memory": target}]
+
+        def fake_classify(fact, matches):
+            if fact.startswith("B"):
+                raise RuntimeError("simulated provider blip")
+            return (
+                [{"memory_id": matches[0]["id"], "relationship": "RELATED", "reason": f"note-{fact}"}],
+                [],
+            )
+
+        monkeypatch.setattr(storage, "_compute_embedding", fake_compute_embedding)
+        monkeypatch.setattr(storage, "_search_snapshot_full", fake_search)
+        monkeypatch.setattr(storage, "_classify_fact_against_matches", fake_classify)
+        monkeypatch.setenv("MEMORA_ABSORB_CONCURRENCY", "4")
+
+        result = storage.absorb_memory(
+            conn, ["A fact needs classify", "B fact needs classify", "C fact needs classify"],
+            dry_run=True,
+        )
+
+    link_decisions = {
+        d["reason"]: d for d in result["decisions"] if d["action"] == "create_and_link"
+    }
+    assert "note-A fact needs classify" in link_decisions
+    assert "note-C fact needs classify" in link_decisions
+    failed = [d for d in result["decisions"] if d["reason"].startswith("classify failed:")]
+    assert len(failed) == 1
+    assert "RuntimeError" in failed[0]["reason"]
+    assert failed[0]["fact"] == "B fact needs classify"
+
+
+def test_absorb_sequential_classify_failure_still_propagates(local_db, monkeypatch):
+    """Unlike the concurrent path, a single in-flight classify call raising
+    must still propagate immediately — scripts/measure_absorb_classifier.py's
+    live measurement mode (always one fact at a time) depends on this."""
+    with storage.connect() as conn:
+        existing = storage.add_memory(conn, content="topic A existing memory")
+        monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+        monkeypatch.setattr(
+            storage, "_search_snapshot_full",
+            lambda *a, **k: [{"score": 0.5, "memory": existing}],
+        )
+
+        def boom(fact, matches):
+            raise RuntimeError("simulated provider blip")
+
+        monkeypatch.setattr(storage, "_classify_fact_against_matches", boom)
+        monkeypatch.setenv("MEMORA_ABSORB_CONCURRENCY", "1")
+
+        with pytest.raises(RuntimeError, match="simulated provider blip"):
+            storage.absorb_memory(conn, ["A fact needs classify"], dry_run=True)
+
+
+def test_absorb_heartbeats_inflight_during_concurrent_classify(local_db, monkeypatch):
+    """Phase 1's concurrent classify calls must heartbeat absorb_inflight —
+    otherwise a batch of several 12-17s LLM calls looks stale/abandoned for
+    minutes even though it's actively working."""
+    with storage.connect() as conn:
+        mem_a = storage.add_memory(conn, content="topic A existing memory")
+        mem_b = storage.add_memory(conn, content="topic B existing memory")
+
+        def fake_compute_embedding(content, metadata, tags):
+            return {"tagA": 1.0} if content.startswith("A") else {"tagB": 1.0}
+
+        def fake_search(conn_, corpus_, vector, **kwargs):
+            target = mem_a if "tagA" in vector else mem_b
+            return [{"score": 0.5, "memory": target}]
+
+        def fake_classify(fact, matches):
+            return ([{"memory_id": matches[0]["id"], "relationship": "RELATED", "reason": "x"}], [])
+
+        monkeypatch.setattr(storage, "_compute_embedding", fake_compute_embedding)
+        monkeypatch.setattr(storage, "_search_snapshot_full", fake_search)
+        monkeypatch.setattr(storage, "_classify_fact_against_matches", fake_classify)
+
+        touch_calls = []
+        real_touch = storage._touch_absorb_inflight
+
+        def spy_touch(conn_, nonce, owned_ids):
+            touch_calls.append(list(owned_ids))
+            return real_touch(conn_, nonce, owned_ids)
+
+        monkeypatch.setattr(storage, "_touch_absorb_inflight", spy_touch)
+        monkeypatch.setenv("MEMORA_ABSORB_CONCURRENCY", "4")
+
+        result = storage.absorb_memory(conn, ["A fact", "B fact"], dry_run=False)
+
+    # Phase 1's per-classify heartbeats: empty owned_ids, nothing created yet.
+    phase1_touches = [c for c in touch_calls if c == []]
+    assert len(phase1_touches) >= 2
+    # Phase 3 still heartbeats with real ids as before.
+    assert any(c for c in touch_calls if c)
+    assert len(result["decisions"]) == 2
+
+
 def test_resolve_follow_defaults_and_all_escape_hatch():
     assert storage.resolve_follow(None, default=storage.DEFAULT_FOLLOW_LIST) == "active"
     assert storage.resolve_follow(None, default=storage.DEFAULT_FOLLOW_GET, for_get=True) == "latest"
