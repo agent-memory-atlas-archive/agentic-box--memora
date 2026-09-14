@@ -78,6 +78,89 @@ def test_classify_timeout_falls_back_outside_strict_mode(monkeypatch):
     )
 
 
+def test_classify_prompt_has_no_list_position_only_bracketed_id(monkeypatch):
+    """Regression: a '{i+1}. [#id]' prefix let the model confuse list
+    position with memory_id. Matches must be identified by [#id] alone."""
+    captured = {}
+
+    class Completions:
+        def create(self, *args, **kwargs):
+            captured["prompt"] = kwargs["messages"][1]["content"]
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content='{"classifications": [], "suggested_tags": []}')
+            )])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: fake_client)
+
+    # ids deliberately far from their list position (1st match is id 501, not 1)
+    storage._classify_fact_against_matches(
+        "some fact",
+        [
+            {"id": 501, "content": "first match", "score": 0.6, "tags": []},
+            {"id": 502, "content": "second match", "score": 0.5, "tags": []},
+        ],
+    )
+    prompt = captured["prompt"]
+    assert "[#501]" in prompt and "[#502]" in prompt
+    # No "1. [#501]" / "2. [#502]" style list-position prefix anywhere.
+    assert "1. [#501]" not in prompt
+    assert "2. [#502]" not in prompt
+
+
+def test_classify_rejects_response_using_list_position_as_id(monkeypatch):
+    """A response that names a list position instead of a real id is still
+    rejected by the valid_ids check — the fix is the prompt, not a looser
+    validator that would let a wrong id slip through."""
+
+    class Completions:
+        def create(self, *args, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps({
+                    # 1 is a list position, not a real id (real ids are 501/502)
+                    "classifications": [{"memory_id": 1, "relationship": "RELATED", "reason": "x"}],
+                    "suggested_tags": [],
+                }))
+            )])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: fake_client)
+
+    classifications, _ = storage._classify_fact_against_matches(
+        "some fact",
+        [
+            {"id": 501, "content": "first match", "score": 0.6, "tags": []},
+            {"id": 502, "content": "second match", "score": 0.5, "tags": []},
+        ],
+    )
+    assert classifications == []
+
+
+def test_classify_accepts_bare_id_key_defensively(monkeypatch):
+    """Prompt asks for 'memory_id'; a response using the shorter 'id' key
+    must still validate instead of being dropped."""
+
+    class Completions:
+        def create(self, *args, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps({
+                    "classifications": [{"id": 501, "relationship": "RELATED", "reason": "x"}],
+                    "suggested_tags": [],
+                }))
+            )])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: fake_client)
+
+    classifications, _ = storage._classify_fact_against_matches(
+        "some fact",
+        [{"id": 501, "content": "first match", "score": 0.6, "tags": []}],
+    )
+    assert len(classifications) == 1
+    assert classifications[0]["memory_id"] == 501
+    assert classifications[0]["relationship"] == "RELATED"
+
+
 def test_absorb_timeout_falls_back_instead_of_raising(local_db, monkeypatch):
     """Runtime absorb_memory must not raise LLMTimeoutError on a hung provider."""
 
