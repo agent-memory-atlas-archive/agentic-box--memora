@@ -161,6 +161,174 @@ def test_classify_accepts_bare_id_key_defensively(monkeypatch):
     assert classifications[0]["relationship"] == "RELATED"
 
 
+def test_classify_accepts_bracketed_memory_id_string(monkeypatch):
+    """Regression: openai/gpt-4o-mini was observed (live, 2026-09-15)
+    consistently echoing the prompt's own "[#482]" match notation back as
+    memory_id verbatim, e.g. {"memory_id":"[#482]",...} — instead of the
+    bare number the prompt asks for. Captured real response shape below.
+    Every classification was silently dropped by a plain int(mid) — this is
+    the fix, not just the prompt wording (a stronger prompt is not a
+    guarantee a model will comply)."""
+    raw = (
+        '{"classifications":[{"memory_id":"[#482]","relationship":"UPDATE",'
+        '"reason":"The new fact introduces a canary environment, which is a '
+        'newer approach compared to the staging environment previously used."},'
+        '{"memory_id":"[#490]","relationship":"UNRELATED","reason":"The backup '
+        'job information is not related to the deployment pipeline."}],'
+        '"suggested_tags":["deploy/canary","deploy/pipeline","deploy/production"]}'
+    )
+
+    class Completions:
+        def create(self, *args, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=raw))])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: fake_client)
+
+    classifications, _ = storage._classify_fact_against_matches(
+        "Deployment pipeline now uses a canary environment before production rollout",
+        [
+            {"id": 482, "content": "Deployment pipeline uses staging environment before production rollout", "score": 0.62, "tags": []},
+            {"id": 490, "content": "Backup job runs nightly at two AM and uploads to cold storage", "score": 0.41, "tags": []},
+        ],
+    )
+    by_id = {c["memory_id"]: c for c in classifications}
+    assert by_id[482]["relationship"] == "UPDATE"
+    assert by_id[490]["relationship"] == "UNRELATED"
+
+
+@pytest.mark.parametrize("mid_value", ["#482 and #483", "1. [#482]"])
+def test_classify_rejects_ambiguous_id_text_even_when_the_concatenation_collides(
+    monkeypatch, mid_value,
+):
+    """P1 regression: stripping non-digits from "#482 and #483" concatenates
+    to 482483, and from "1. [#482]" to 1482. Both are digit strings that CAN
+    coincide with a real candidate id in the match set — valid_ids membership
+    alone does not catch that, so a naive digit-strip can silently attach the
+    classification to the WRONG memory instead of rejecting the unparseable
+    text. Both fixtures below include that exact collision id as a genuine
+    candidate; the correct behavior is to drop the entry, not misroute it.
+    """
+    collision_id = {"#482 and #483": 482483, "1. [#482]": 1482}[mid_value]
+
+    class Completions:
+        def create(self, *args, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content=json.dumps({
+                    "classifications": [{"memory_id": mid_value, "relationship": "RELATED", "reason": "x"}],
+                    "suggested_tags": [],
+                })
+            ))])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: fake_client)
+
+    classifications, _ = storage._classify_fact_against_matches(
+        "some fact",
+        [
+            {"id": 482, "content": "first match", "score": 0.6, "tags": []},
+            {"id": 483, "content": "second match", "score": 0.5, "tags": []},
+            {"id": collision_id, "content": "decoy match sharing the concatenated id", "score": 0.4, "tags": []},
+        ],
+    )
+    assert classifications == [], (
+        f"{mid_value!r} must be rejected as ambiguous, not silently routed to id {collision_id}"
+    )
+
+
+@pytest.mark.parametrize(
+    "mid_value,expected",
+    [
+        (482, 482),
+        ("482", 482),
+        ("#482", 482),
+        ("[#482]", 482),
+        (" 482 ", 482),
+        (" [#482] ", 482),
+    ],
+)
+def test_parse_memory_id_token_accepts_unambiguous_single_tokens(mid_value, expected):
+    assert storage._parse_memory_id_token(mid_value) == expected
+
+
+@pytest.mark.parametrize(
+    "mid_value",
+    [
+        "#482 and #483",
+        "1. [#482]",
+        "482, 483",
+        "approximately 482",
+        None,
+        3.14,
+        [],
+        {},
+    ],
+)
+def test_parse_memory_id_token_rejects_ambiguous_or_wrong_type_values(mid_value):
+    assert storage._parse_memory_id_token(mid_value) is None
+
+
+def test_parse_memory_id_token_rejects_bool_even_though_it_is_an_int_subclass():
+    """isinstance(True, int) is True in Python — type(mid) is int is what
+    keeps a JSON boolean from silently aliasing memory id 0 or 1."""
+    assert storage._parse_memory_id_token(True) is None
+    assert storage._parse_memory_id_token(False) is None
+
+
+def test_classify_recovers_json_preceded_by_reasoning_text(monkeypatch):
+    """Some models prepend commentary before the JSON despite being told not
+    to. The parser should recover the JSON object rather than give up."""
+
+    class Completions:
+        def create(self, *args, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=(
+                    'Sure, here is my analysis of the fact against the matches:\n'
+                    + json.dumps({
+                        "classifications": [{"memory_id": 501, "relationship": "RELATED", "reason": "x"}],
+                        "suggested_tags": [],
+                    })
+                ))
+            )])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: fake_client)
+
+    classifications, _ = storage._classify_fact_against_matches(
+        "some fact",
+        [{"id": 501, "content": "first match", "score": 0.6, "tags": []}],
+    )
+    assert len(classifications) == 1
+    assert classifications[0]["memory_id"] == 501
+
+
+def test_classify_logs_raw_response_when_nothing_validates(monkeypatch, caplog):
+    """A response the model answered but that fails validation entirely
+    (e.g. an id no fix can recover) must log the raw text at debug level —
+    the whole point is telling "model said nothing useful" apart from
+    "our parser silently ate a good answer" without re-running live."""
+
+    class Completions:
+        def create(self, *args, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content=json.dumps({
+                    "classifications": [{"memory_id": 999999, "relationship": "RELATED", "reason": "x"}],
+                    "suggested_tags": [],
+                })
+            ))])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: fake_client)
+
+    with caplog.at_level("DEBUG", logger="memora.storage"):
+        classifications, _ = storage._classify_fact_against_matches(
+            "some fact",
+            [{"id": 501, "content": "first match", "score": 0.6, "tags": []}],
+        )
+    assert classifications == []
+    assert any("nothing validated" in r.message and "999999" in r.message for r in caplog.records)
+
+
 def test_absorb_timeout_falls_back_instead_of_raising(local_db, monkeypatch):
     """Runtime absorb_memory must not raise LLMTimeoutError on a hung provider."""
 

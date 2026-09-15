@@ -4693,6 +4693,42 @@ def _resolve_absorb_concurrency() -> int:
     return value if value >= 1 else _DEFAULT_ABSORB_CONCURRENCY
 
 
+# Matches (optional whitespace +) exactly one of: 482, #482, [#482] — and
+# nothing else. Three alternatives, each captured so the winner is known.
+_MEMORY_ID_TOKEN_RE = re.compile(r"^\s*(?:\[#(\d+)\]|#(\d+)|(\d+))\s*$")
+
+
+def _parse_memory_id_token(mid: Any) -> Optional[int]:
+    """Extract an int memory id from a classify response value, accepting
+    ONLY an unambiguous single token.
+
+    Stripping every non-digit character (an earlier version of this) is
+    unsafe: "#482 and #483" strips to "482483", and "1. [#482]" (a stray
+    list-position prefix) strips to "1482" — both digit-run concatenations
+    that can coincide with a REAL candidate id in this fact's own match set,
+    silently misrouting a classification (and therefore an update/duplicate
+    decision) onto the wrong memory. valid_ids membership does not catch
+    this: the concatenated number can legitimately be one of the ids on
+    offer. A strict fullmatch on the whole string rejects both cases as
+    unparseable instead of guessing.
+
+    type(mid) is int (not isinstance) so a JSON boolean — which the caller
+    could otherwise treat as an int and alias id 0 or 1 — is rejected too.
+    """
+    if type(mid) is int:
+        return mid
+    if not isinstance(mid, str):
+        return None
+    m = _MEMORY_ID_TOKEN_RE.fullmatch(mid)
+    if not m:
+        return None
+    digits = m.group(1) or m.group(2) or m.group(3)
+    try:
+        return int(digits)
+    except (ValueError, TypeError):
+        return None
+
+
 def _classify_fact_against_matches(
     fact: str,
     matches: List[Dict[str, Any]],
@@ -4738,8 +4774,9 @@ For each memory, classify the relationship:
 Also suggest 1-3 project-prefixed tags for the new fact (e.g. "memora/research", "clmux/architecture").
 Use tags from the matched memories as guidance. Avoid generic single-word tags.
 
-Respond with JSON only (no markdown). "memory_id" must be one of the bracketed
-ids shown above, exactly as written there — never a list position:
+Respond with JSON only (no markdown). "memory_id" must be the BARE NUMBER
+from one of the brackets above — 482, not "[#482]" or "#482" — never a list
+position:
 {{"classifications": [{{"memory_id": <id>, "relationship": "<type>", "reason": "<brief reason>"}}], "suggested_tags": ["tag1", "tag2"]}}"""
 
     try:
@@ -4759,7 +4796,16 @@ ids shown above, exactly as written there — never a list position:
             if result_text.endswith("```"):
                 result_text = result_text[:-3]
             result_text = result_text.strip()
-        parsed = json.loads(result_text)
+        try:
+            parsed = json.loads(result_text)
+        except json.JSONDecodeError:
+            # Some models prepend reasoning/commentary before the JSON object
+            # despite being told not to. Retry against just the outermost
+            # {...} span rather than giving up on the whole response.
+            start, end = result_text.find("{"), result_text.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                raise
+            parsed = json.loads(result_text[start : end + 1])
 
         # Handle both old format (bare array) and new format (object)
         suggested_tags: List[str] = []
@@ -4772,9 +4818,11 @@ ids shown above, exactly as written there — never a list position:
                 [t for t in raw_tags if isinstance(t, str)]
             )
         else:
+            logger.debug("Absorb classify: unparseable response shape: %r", result_text)
             return [], []
 
         if not isinstance(classifications_raw, list):
+            logger.debug("Absorb classify: 'classifications' was not a list: %r", result_text)
             return [], suggested_tags
 
         # Validate: only keep entries with known relationship and valid candidate IDs
@@ -4787,17 +4835,21 @@ ids shown above, exactly as written there — never a list position:
             rel = cls.get("relationship", "").upper()
             # Prompt asks for "memory_id"; accept a bare "id" defensively too
             # since some models answer with the shorter key regardless.
-            mid = cls.get("memory_id", cls.get("id"))
-            # LLMs may return memory_id as string — coerce to int
-            if isinstance(mid, str):
-                try:
-                    mid = int(mid)
-                except (ValueError, TypeError):
-                    continue
+            mid = _parse_memory_id_token(cls.get("memory_id", cls.get("id")))
+            if mid is None:
+                continue
             if rel in valid_rels and mid in valid_ids:
                 cls["relationship"] = rel
                 cls["memory_id"] = mid  # ensure int after coercion
                 validated.append(cls)
+        if not validated and classifications_raw:
+            # The model answered, but nothing survived validation — this is
+            # exactly the class of bug a "returns []" result can't be told
+            # apart from an honest empty answer without the raw text.
+            logger.debug(
+                "Absorb classify: model responded but nothing validated (model=%s): %r",
+                LLM_MODEL, result_text,
+            )
         return validated, suggested_tags
     except Exception as e:
         if _LLM_TIMEOUT_STRICT:
