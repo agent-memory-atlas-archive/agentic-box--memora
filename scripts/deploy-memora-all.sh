@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
-# Full deploy of the live memora-all container (nuc8) to v0.4.1: fetch +
-# build the tagged image, switch MEMORA_LLM_MODEL from x-ai/grok-build-0.1 to
-# openai/gpt-4o-mini, recreate the container, then verify it. Absorb's
-# classification latency was measured at 12-17s/call against the reasoning
-# model (1000-1700 reasoning tokens it ignores reasoning.effort/max_tokens
-# for); gpt-4o-mini answered the same classification correctly in 3-4s in
-# that same measurement, and concurrency + the model switch together were
-# measured at ~18.5x on a synthetic 7-fact absorb.
+# Full deploy of the live memora-all container (nuc8) to v0.4.2: fetch +
+# build the tagged image and recreate the container from it, then verify it.
+#
+# v0.4.1's deploy switched MEMORA_LLM_MODEL to openai/gpt-4o-mini (3-4s per
+# absorb classification call vs 12-17s for the prior reasoning model), but
+# every classification came back "LLM classify empty" — gpt-4o-mini
+# consistently echoes the prompt's own "[#482]" match-display notation back
+# as memory_id instead of the bare number, and the old parser dropped it.
+# v0.4.2 is that parser fix (SHA 201f7c8): confirmed live against the real
+# model, macro_f1 0.931 across the fixture set instead of failing outright.
+# MEMORA_LLM_MODEL is already openai/gpt-4o-mini from the v0.4.1 deploy, so
+# step 2 below is a confirming no-op this time, not a real switch.
 #
 # Steps, all on nuc8:
-#  1. git fetch + checkout the v0.4.1 tag in the nuc8 checkout, docker build.
+#  1. git fetch + checkout the v0.4.2 tag in the nuc8 checkout, docker build.
 #     The image currently tagged memora:latest is kept as memora:rollback-<ts>
 #     before the new one replaces it.
-#  2. Edit MEMORA_LLM_MODEL in ~/.config/memora/credentials.mcp.json.
+#  2. Edit MEMORA_LLM_MODEL in ~/.config/memora/credentials.mcp.json (already
+#     openai/gpt-4o-mini — see above).
 #  3. Recreate memora-all — same image tag, mounts, ports, memory/cpu limits
 #     and restart policy the live container already runs with (checked via
-#     docker inspect on 2026-09-14), only MEMORA_LLM_MODEL and the image
-#     content changed. Old container kept stopped as memora-all-grok-<ts>.
+#     docker inspect on 2026-09-14), only the image content changed. Old
+#     container kept stopped as memora-all-grok-<ts> (name predates this
+#     being a no-op model switch; still accurate as "the container before
+#     this deploy").
 #  4. Wait for GET /health, then run one 3-fact dry-run memory_absorb call
 #     and print its wall time, as a smoke test before calling this done.
 #
@@ -29,7 +36,7 @@
 #   restore ~/.config/memora/credentials.mcp.json.bak-llm-<ts> if MEMORA_LLM_MODEL itself needs reverting
 set -euo pipefail
 
-TAG="v0.4.1"
+TAG="v0.4.2"
 
 # MEMORA_DATABASES names a Cloudflare account + database ids — read from the
 # git-ignored instance config rather than written into this (public) script.

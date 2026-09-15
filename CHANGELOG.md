@@ -12,6 +12,17 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.4.2
+
+Absorb classification fix for the v0.4.1 gpt-4o-mini switch — a same-day
+follow-up.
+
+### Absorb
+- The classify response parser now recovers `memory_id` from a real `int`, or a string that is (optional whitespace +) exactly one of `482`, `#482`, `[#482]` — whole-string only, nothing else in the value. `openai/gpt-4o-mini` was found — live, against the real model — to consistently echo the prompt's own `[#482]` match-display notation back as the value rather than the bare number the prompt asks for, which the old parser rejected outright: every classification on the v0.4.1 deploy came back `LLM classify empty; preserving as related` despite OpenRouter returning 200 on every call. The accepted forms are deliberately narrow: stripping every non-digit character out of an arbitrary string is unsafe, since e.g. `"#482 and #483"` would strip to `482483` and `"1. [#482]"` to `1482` — both digit-run concatenations that can coincide with a genuine candidate id in the same fact's match set and silently misroute the classification onto the wrong memory. Ambiguous text is dropped, not guessed at.
+- `json.loads` now retries against the outermost `{...}` span if the first parse fails, recovering a JSON object a model prefixed with reasoning or commentary text despite being told not to.
+- The classify prompt is more explicit that `memory_id` must be the bare number, not the bracketed form — a second line of defense, not a substitute for the parser fix, since this model didn't comply with the prior wording either way.
+- The raw LLM response is now logged at debug level whenever the model answers but nothing survives validation, so this class of bug is diagnosable from logs without a live repro.
+
 ## 0.4.1
 
 Absorb latency and embedding-rebuild throughput, plus a proxy container-resolve
