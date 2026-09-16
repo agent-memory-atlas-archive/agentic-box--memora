@@ -24,6 +24,18 @@
 # env var for `docker run` from a command substitution without checking its
 # exit status explicitly (`x=$(cmd) || exit 1`, not just `set -e` and hope).
 #
+# HARDENING ROUND 2 (sealed review msg 5698/5699, caught before running):
+# a SEPARATE instance of the same class of bug — the credentials-env
+# parser (ENV_ARGS) streamed straight into its while loop via
+# `done < <(python3 ...)`, whose failure would be just as invisible to
+# set -e as the MEMORA_DATABASES bug above was. Now captured to a
+# variable and checked (exit status + non-empty) before any destructive
+# step. The health-wait loop's `$(seq ...)` also replaced with shell
+# arithmetic, and the MCP smoke test now asserts no JSON-RPC error / a
+# real session id at initialize and no JSON-RPC error / isError at
+# tools/call — a JSON-RPC error rides HTTP 200, which the prior
+# HTTP-status-only check would have printed and exited zero on.
+#
 # Old host: 100.85.27.63:11434 (decommissioned M1 — offline in clmux's own
 #   mesh peer registry too, ~/.clmux-mesh/network/peers.json on nuc8; that
 #   file is clmux's, not memora's, and was out of scope here, untouched).
@@ -102,6 +114,24 @@ VOLUME_ID=$(docker inspect memora-all --format '{{range .Mounts}}{{.Name}}{{end}
 IMAGE_ID=$(docker inspect memora-all --format '{{.Image}}')
 [ -n "$IMAGE_ID" ] || { echo "could not read memora-all's image id" >&2; exit 1; }
 
+# Captured to a variable FIRST, not streamed straight into the while loop
+# via process substitution (`done < <(python3 ...)`) — a parser failure
+# inside a process substitution is invisible to both the while loop and
+# set -e, so ENV_ARGS could silently end up empty and the script would
+# still stop/rename/recreate the live container on the next lines. This
+# exact failure class caused the 2026-09-16 MEMORA_DATABASES incident this
+# script's own header post-mortems (a different line, same root cause: an
+# unchecked command substitution feeding a destructive step). Check exit
+# status AND non-empty output explicitly, before any destructive step.
+ENV_LINES="$(python3 -c "
+import json
+env = json.load(open('$CRED'))['mcpServers']['memora']['env']
+for k, v in env.items():
+    if v != '':
+        print(f'{k}={v}')
+")" || { echo "credentials parser failed — aborting before touching the live container" >&2; exit 1; }
+[ -n "$ENV_LINES" ] || { echo "credentials parser produced no output — aborting before touching the live container" >&2; exit 1; }
+
 ENV_ARGS=()
 while IFS='=' read -r key value; do
   [ -z "$key" ] && continue
@@ -109,13 +139,7 @@ while IFS='=' read -r key value; do
     MEMORA_STORAGE_URI|MEMORA_DB_PATH|MEMORA_DATABASES|MEMORA_DEFAULT_DB) continue ;;
   esac
   ENV_ARGS+=(-e "$key=$value")
-done < <(python3 -c "
-import json
-env = json.load(open('$CRED'))['mcpServers']['memora']['env']
-for k, v in env.items():
-    if v != '':
-        print(f'{k}={v}')
-")
+done <<< "$ENV_LINES"
 
 docker stop memora-all
 docker rename memora-all "memora-all-embhost-$TS"
@@ -142,7 +166,7 @@ echo "rollback: docker rm -f memora-all && docker rename memora-all-embhost-$TS 
 
 echo "waiting for /health..."
 healthy=0
-for i in $(seq 1 30); do
+for ((i = 1; i <= 30; i++)); do
   if curl -sf -m 3 http://127.0.0.1:8920/health >/dev/null 2>&1; then
     healthy=1
     echo "healthy after about $((i * 2))s"
@@ -156,7 +180,7 @@ if [ "$healthy" -ne 1 ]; then
 fi
 
 python3 - <<'PY'
-import json, time, urllib.request
+import json, sys, time, urllib.request
 
 BASE = "http://127.0.0.1:8920/mcp/memora"
 HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
@@ -177,11 +201,24 @@ def _parse_sse(raw):
             return json.loads(line[len("data: "):])
     return json.loads(raw)
 
-sid, _ = _post({
+# A JSON-RPC error rides HTTP 200 — urllib/curl's own status checks never
+# see it. Check the envelope's own "error" key and, for initialize, that a
+# session id actually came back; a smoke test that only checks HTTP status
+# would print and exit zero on a server that answers but can't actually
+# serve requests.
+sid, init_raw = _post({
     "jsonrpc": "2.0", "id": 1, "method": "initialize",
     "params": {"protocolVersion": "2024-11-05", "capabilities": {},
                "clientInfo": {"name": "deploy-check", "version": "0"}},
 })
+init_result = _parse_sse(init_raw)
+if "error" in init_result:
+    print(f"initialize returned a JSON-RPC error: {init_result['error']}", file=sys.stderr)
+    sys.exit(1)
+if not sid:
+    print("initialize succeeded but no mcp-session-id header was returned", file=sys.stderr)
+    sys.exit(1)
+
 _post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id=sid)
 
 facts = [
@@ -196,7 +233,14 @@ _, raw = _post({
 }, session_id=sid)
 elapsed = time.time() - t0
 result = _parse_sse(raw)
+if "error" in result:
+    print(f"tools/call returned a JSON-RPC error: {result['error']}", file=sys.stderr)
+    sys.exit(1)
+tool_result = result.get("result", {})
+if tool_result.get("isError"):
+    print(f"memory_absorb reported isError=true: {json.dumps(tool_result)[:2000]}", file=sys.stderr)
+    sys.exit(1)
 print(f"3-fact dry-run absorb via memory store: {elapsed:.1f}s")
-print(json.dumps(result.get("result", result), indent=2)[:2000])
+print(json.dumps(tool_result, indent=2)[:2000])
 PY
 REMOTE
