@@ -67,6 +67,11 @@ class FakeD1Connection(D1Connection):
                 last = self.execute(statement)
         return last if last is not None else self._conn.execute("SELECT 1 WHERE 0")
 
+    @property
+    def request_count(self):
+        # Mirrors D1Connection.request_count: one per statement == one HTTPS POST.
+        return self.statement_count
+
     def cursor(self):
         return self
 

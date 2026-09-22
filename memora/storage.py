@@ -57,6 +57,7 @@ from .embeddings import (
     upsert_embedding as _upsert_embedding,
 )
 from .schema import ensure_schema as _ensure_schema
+from .absorb_profile import absorb_count, absorb_phase, absorb_profile
 
 logger = logging.getLogger(__name__)
 
@@ -5025,7 +5026,10 @@ def _absorb_phase1_prepare(
     # leave UnboundLocalError below.
     vector = None
     try:
-        vector = _compute_embedding(fact, None, [])
+        with absorb_phase("embeddings"):
+            absorb_count("embedding_requests")
+            absorb_count("embedding_texts")
+            vector = _compute_embedding(fact, None, [])
         if not vector:
             return {
                 "kind": "decision",
@@ -5197,7 +5201,88 @@ def _absorb_resolve_classification(
     }
 
 
+def _absorb_run_classification(
+    conn: sqlite3.Connection,
+    prepared: List[Dict[str, Any]],
+    classify_indices: List[int],
+    absorb_nonce: Optional[str],
+) -> Dict[int, Tuple[List[Dict[str, Any]], List[str], Optional[BaseException]]]:
+    """Phase 1's LLM step: classify every prepared[i] for i in classify_indices.
+
+    Sequential when the resolved concurrency is 1 (a raise propagates, see
+    absorb_memory), otherwise a bounded thread pool through
+    _absorb_classify_fact_safe. Heartbeats the inflight row after each
+    completion when absorb_nonce is set.
+    """
+    classify_results: Dict[int, Tuple[List[Dict[str, Any]], List[str], Optional[BaseException]]] = {}
+    concurrency = min(_resolve_absorb_concurrency(), len(classify_indices))
+    if concurrency <= 1:
+        for i in classify_indices:
+            p = prepared[i]
+            classifications, suggested_tags = _classify_fact_against_matches(p["fact"], p["match_data"])
+            classify_results[i] = (classifications, suggested_tags, None)
+            if absorb_nonce is not None:
+                with absorb_phase("inflight"):
+                    _touch_absorb_inflight(conn, absorb_nonce, [])
+        return classify_results
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        future_to_index = {
+            pool.submit(
+                _absorb_classify_fact_safe, prepared[i]["fact"], prepared[i]["match_data"]
+            ): i
+            for i in classify_indices
+        }
+        # Heartbeat after each completion, not just at the end — a
+        # batch with several facts at 12-17s/call each can otherwise
+        # go a couple of minutes without the inflight lease renewing.
+        for future in as_completed(future_to_index):
+            classify_results[future_to_index[future]] = future.result()
+            if absorb_nonce is not None:
+                with absorb_phase("inflight"):
+                    _touch_absorb_inflight(conn, absorb_nonce, [])
+    return classify_results
+
+
 def absorb_memory(
+    conn: sqlite3.Connection,
+    facts: List[str],
+    *,
+    source: str = "manual",
+    confidence: float = 0.8,
+    context: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    tags: Optional[List[str]] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Intelligently absorb facts; see _absorb_memory_impl.
+
+    Wraps the call in an AbsorbProfile: per-phase wall time and DB request
+    counts are logged at INFO and returned under result["profile"]. On an
+    exception the profile is logged (with the failure) and the exception
+    propagates unchanged.
+    """
+    with absorb_profile(conn) as profile:
+        profile.count("facts", len(facts or []))
+        try:
+            result = _absorb_memory_impl(
+                conn, facts, source=source, confidence=confidence,
+                context=context, metadata=metadata, tags=tags, dry_run=dry_run,
+            )
+        except BaseException as exc:
+            summary = profile.finish()
+            logger.info(
+                "absorb profile (failed: %s): %s",
+                type(exc).__name__, json.dumps(summary, sort_keys=True),
+            )
+            raise
+        summary = profile.finish()
+    logger.info("absorb profile: %s", json.dumps(summary, sort_keys=True))
+    result["profile"] = summary
+    return result
+
+
+def _absorb_memory_impl(
     conn: sqlite3.Connection,
     facts: List[str],
     *,
@@ -5255,7 +5340,8 @@ def absorb_memory(
     # still cannot observe writes committed by other agents after the stamp
     # read. A concurrent duplicate committed after that read is not caught
     # here (a later absorb sees it because its stamp check fails).
-    corpus = get_corpus_snapshot(conn)
+    with absorb_phase("corpus_load"):
+        corpus = get_corpus_snapshot(conn)
 
     decisions: List[Dict[str, Any]] = []
     counts = {"created": 0, "superseded": 0, "skipped": 0, "linked": 0, "contradicted": 0, "consolidated": 0, "tombstoned": 0}
@@ -5271,7 +5357,8 @@ def absorb_memory(
     absorb_nonce: Optional[str] = None
     if not dry_run:
         absorb_nonce = str(uuid.uuid4())
-        _begin_absorb_inflight(conn, absorb_nonce)
+        with absorb_phase("inflight"):
+            _begin_absorb_inflight(conn, absorb_nonce)
 
     # Phase 1: Classify each fact against existing memories, collect "to create" facts
     #
@@ -5286,8 +5373,10 @@ def absorb_memory(
     # it's the one call safe to fan out.
     pending_creates: List[tuple] = []  # (fact, vector, link_info_or_None, suggested_tags)
 
-    prepared = [_absorb_phase1_prepare(fact, conn, corpus) for fact in facts]
+    with absorb_phase("phase1_prep"):
+        prepared = [_absorb_phase1_prepare(fact, conn, corpus) for fact in facts]
     classify_indices = [i for i, p in enumerate(prepared) if p["kind"] == "classify"]
+    absorb_count("llm_classify_calls", len(classify_indices))
 
     # (classifications, suggested_tags, error_or_None) per index — the error
     # slot carries any exception the classify call itself raised. Only the
@@ -5302,30 +5391,10 @@ def absorb_memory(
     # failure reaching pytest.raises() unmuted).
     classify_results: Dict[int, Tuple[List[Dict[str, Any]], List[str], Optional[BaseException]]] = {}
     if classify_indices:
-        concurrency = min(_resolve_absorb_concurrency(), len(classify_indices))
-        if concurrency <= 1:
-            for i in classify_indices:
-                p = prepared[i]
-                classifications, suggested_tags = _classify_fact_against_matches(p["fact"], p["match_data"])
-                classify_results[i] = (classifications, suggested_tags, None)
-                if absorb_nonce is not None:
-                    _touch_absorb_inflight(conn, absorb_nonce, [])
-        else:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                future_to_index = {
-                    pool.submit(
-                        _absorb_classify_fact_safe, prepared[i]["fact"], prepared[i]["match_data"]
-                    ): i
-                    for i in classify_indices
-                }
-                # Heartbeat after each completion, not just at the end — a
-                # batch with several facts at 12-17s/call each can otherwise
-                # go a couple of minutes without the inflight lease renewing.
-                for future in as_completed(future_to_index):
-                    classify_results[future_to_index[future]] = future.result()
-                    if absorb_nonce is not None:
-                        _touch_absorb_inflight(conn, absorb_nonce, [])
+        with absorb_phase("classification"):
+            classify_results = _absorb_run_classification(
+                conn, prepared, classify_indices, absorb_nonce,
+            )
 
     # Resolve every fact IN ORIGINAL ORDER, regardless of classify completion
     # order — decisions/pending_creates must read exactly as the sequential
@@ -5391,7 +5460,9 @@ def absorb_memory(
         final_tags = _merge_tags(tags, group_suggested)
 
         if len(group_facts) >= 2:
-            consolidated = _consolidate_facts_llm(group_facts, context)
+            absorb_count("llm_consolidate_calls")
+            with absorb_phase("consolidation"):
+                consolidated = _consolidate_facts_llm(group_facts, context)
             phase3_jobs.append({
                 "content": consolidated,
                 "vector": None,
@@ -5448,7 +5519,8 @@ def absorb_memory(
                     "reason": reason,
                 }
                 if edge_type == "supersedes":
-                    plan = _resolve_absorb_supersedes_target(conn, target_id)
+                    with absorb_phase("supersede_resolve"):
+                        plan = _resolve_absorb_supersedes_target(conn, target_id)
                     if plan.get("tombstoned"):
                         stored_reason = _retirement_reason_for_id(conn, target_id)
                         decision["action"] = "tombstoned"
@@ -5477,10 +5549,13 @@ def absorb_memory(
         return {"decisions": decisions, **counts}
 
     # Precompute ALL storage embeddings from final content + merged_meta + tags.
-    for job in phase3_jobs:
-        job["vector"] = _compute_embedding(job["content"], merged_meta, job["tags"] or [])
-        if not job["vector"]:
-            raise RuntimeError("absorb phase-3 embedding returned empty vector")
+    with absorb_phase("embeddings"):
+        for job in phase3_jobs:
+            absorb_count("embedding_requests")
+            absorb_count("embedding_texts")
+            job["vector"] = _compute_embedding(job["content"], merged_meta, job["tags"] or [])
+            if not job["vector"]:
+                raise RuntimeError("absorb phase-3 embedding returned empty vector")
 
     # owned_ids tracks every INSERT id, even if add_memory fails mid-function (P1-1).
     # absorb_inflight tracking (durable nonce, committed before any writes)
@@ -5488,18 +5563,19 @@ def absorb_memory(
     owned_ids: List[int] = []
     try:
         for job in phase3_jobs:
-            record = add_memory(
-                conn,
-                content=job["content"],
-                metadata=merged_meta,
-                tags=job["tags"],
-                embedding=job["vector"],
-                commit=False,
-                owned_ids=owned_ids,
-                absorb_nonce=absorb_nonce,
-                absorb_operation_key=str(uuid.uuid4()),
-                corpus=corpus,
-            )
+            with absorb_phase("phase3_insert"):
+                record = add_memory(
+                    conn,
+                    content=job["content"],
+                    metadata=merged_meta,
+                    tags=job["tags"],
+                    embedding=job["vector"],
+                    commit=False,
+                    owned_ids=owned_ids,
+                    absorb_nonce=absorb_nonce,
+                    absorb_operation_key=str(uuid.uuid4()),
+                    corpus=corpus,
+                )
             # Append the created memory to the in-memory corpus so a LATER
             # create's crossref scan (and any later scan in this call) sees it,
             # matching the old behavior where each crossref pass re-read the
@@ -5515,19 +5591,23 @@ def absorb_memory(
             owned_hook = _after_absorb_owned_insert
             if owned_hook is not None:
                 owned_hook(record["id"], absorb_nonce)
-            _touch_absorb_inflight(conn, absorb_nonce, owned_ids)
+            with absorb_phase("inflight"):
+                _touch_absorb_inflight(conn, absorb_nonce, owned_ids)
             if job["link"] is not None:
                 edge_type, target_id, reason = job["link"]
                 if edge_type == "supersedes":
                     # Write-boundary re-resolution: see concurrent absorb's new leaf
                     # and refuse to resurrect a component tombstoned after classify.
-                    plan = _resolve_absorb_supersedes_target(conn, target_id)
+                    with absorb_phase("supersede_resolve"):
+                        plan = _resolve_absorb_supersedes_target(conn, target_id)
                     hook = _after_absorb_resolve
                     if hook is not None:
                         hook(plan)
-                    if plan.get("tombstoned") or any(
-                        _is_tombstoned_id(conn, tid) for tid in plan.get("targets") or []
-                    ) or _is_tombstoned_id(conn, target_id):
+                    with absorb_phase("supersede_resolve"):
+                        retired_at_boundary = plan.get("tombstoned") or any(
+                            _is_tombstoned_id(conn, tid) for tid in plan.get("targets") or []
+                        ) or _is_tombstoned_id(conn, target_id)
+                    if retired_at_boundary:
                         ok = delete_memory(
                             conn, record["id"], require_absorb_nonce=absorb_nonce,
                         )
@@ -5565,13 +5645,15 @@ def absorb_memory(
                         prelink(record["id"], list(targets))
                     linked_ids: List[int] = []
                     try:
-                        for tid in targets:
-                            add_link(
-                                conn, record["id"], tid,
-                                edge_type="supersedes", commit=False,
-                            )
-                            linked_ids.append(tid)
-                        _heal_supersession_fork(conn, record["id"])
+                        with absorb_phase("supersede_link"):
+                            for tid in targets:
+                                add_link(
+                                    conn, record["id"], tid,
+                                    edge_type="supersedes", commit=False,
+                                )
+                                linked_ids.append(tid)
+                        with absorb_phase("fork_heal"):
+                            _heal_supersession_fork(conn, record["id"])
                     except Exception as link_err:
                         # ALL-OR-COMPENSATE: partial collapse is worse than the fork.
                         raise RuntimeError(
@@ -5580,9 +5662,11 @@ def absorb_memory(
                     # Deletion wins: a marker that landed after resolve (or a
                     # delete-side rewalk that marked this new leaf) must not
                     # leave N current. Compensate the absorb row.
-                    if _is_tombstoned_id(conn, record["id"]) or any(
-                        _is_tombstoned_id(conn, tid) for tid in linked_ids
-                    ):
+                    with absorb_phase("final_checks"):
+                        retired_after_link = _is_tombstoned_id(conn, record["id"]) or any(
+                            _is_tombstoned_id(conn, tid) for tid in linked_ids
+                        )
+                    if retired_after_link:
                         ok = delete_memory(
                             conn, record["id"], require_absorb_nonce=absorb_nonce,
                         )
@@ -5620,7 +5704,8 @@ def absorb_memory(
                             collapsed,
                             record["id"],
                         )
-                    live_now, _cycle = _component_live_leaves(conn, record["id"])
+                    with absorb_phase("final_checks"):
+                        live_now, _cycle = _component_live_leaves(conn, record["id"])
                     current_id = max(live_now) if live_now else record["id"]
                     if current_id != record["id"]:
                         counts["superseded"] = max(0, counts["superseded"] - 1)
@@ -5648,7 +5733,8 @@ def absorb_memory(
                     continue
                 link_error: Optional[Exception] = None
                 try:
-                    add_link(conn, record["id"], target_id, edge_type=edge_type, commit=False)
+                    with absorb_phase("phase3_link"):
+                        add_link(conn, record["id"], target_id, edge_type=edge_type, commit=False)
                 except (ValueError, Exception) as link_err:
                     logger.warning(
                         "Absorb link failed (memory #%d -> #%d): %s",
@@ -5698,7 +5784,8 @@ def absorb_memory(
                 counts["created"] += 1
         # Mark completed before dropping the tracking row so a death in this
         # window cannot be reaped as a partial write.
-        _complete_absorb_inflight(conn, absorb_nonce)
+        with absorb_phase("inflight"):
+            _complete_absorb_inflight(conn, absorb_nonce)
         conn.commit()
         # Invalidate the cached base: absorb wrote rows (or compensated/deleted
         # them), so the cached snapshot no longer represents the DB. The next
@@ -5710,6 +5797,7 @@ def absorb_memory(
         # cache entry would not match anyway, but invalidating is explicit.)
         invalidate_corpus_cache(conn, key=corpus._cache_key)
     except Exception as write_exc:
+        absorb_count("compensations")
         # A D1 INSERT can commit remotely while its response is lost before
         # lastrowid reaches add_memory. Recover every row owned by this call.
         for recovered_id in _recover_absorb_owned_ids(conn, absorb_nonce):

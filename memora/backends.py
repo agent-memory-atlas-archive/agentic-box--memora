@@ -871,6 +871,8 @@ class D1Connection:
         self.row_factory = None
         self._pending_statements = []
         self._session_token: Optional[str] = None
+        # One per HTTPS POST to the query API; read by memora.absorb_profile.
+        self.request_count = 0
         # Set by D1Backend.connect() so _execute_api can push new bookmarks
         # back up to the backend-level singleton. May be None for connections
         # constructed directly without a backend (tests, ad-hoc tooling).
@@ -882,6 +884,7 @@ class D1Connection:
         import urllib.request
 
         url = f"{self.base_url}/query"
+        self.request_count += 1
 
         body = {"sql": sql}
         if params:

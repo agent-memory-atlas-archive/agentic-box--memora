@@ -437,7 +437,10 @@ def test_absorb_concurrent_classify_preserves_order_and_dedup(local_db, monkeypa
         concurrent_elapsed = time.time() - t0
         concurrent_calls = list(classify_calls)
 
-    # Same decisions, same order, regardless of concurrency.
+    # Same decisions, same order, regardless of concurrency. The profile
+    # carries wall times and heartbeat counts, which legitimately differ.
+    sequential_result.pop("profile")
+    concurrent_result.pop("profile")
     assert concurrent_result == sequential_result
 
     # Only the 3 classify-needing facts ever reached the LLM — dedup (the
