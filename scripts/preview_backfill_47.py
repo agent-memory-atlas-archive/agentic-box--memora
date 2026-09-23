@@ -88,6 +88,33 @@ def refuse_unsupported_store(db_name: Optional[str]) -> None:
     raise SystemExit(UNSUPPORTED_STORE.format(uri=uri))
 
 
+def _bootstrap(db_name: Optional[str]) -> None:
+    """Refuse an unsupported store, pin the import-time backend, THEN import
+    memora (whose storage module builds a backend at import)."""
+    global storage, legacy, CloudSQLiteBackend, LocalSQLiteBackend
+    import os
+
+    refuse_unsupported_store(db_name)
+    pinned = "memora.storage" not in sys.modules  # already imported: nothing left to pin
+    saved = os.environ.get("MEMORA_STORAGE_URI")
+    if pinned:
+        pin_import_time_backend(db_name)
+    try:
+        import _legacy_project_detection as _legacy
+        from memora import storage as _storage
+        from memora.backends import CloudSQLiteBackend as _Cloud, LocalSQLiteBackend as _Local
+    finally:
+        # The pin only has to hold for that first import; leave the caller's
+        # environment as it was.
+        if pinned:
+            if saved is None:
+                os.environ.pop("MEMORA_STORAGE_URI", None)
+            else:
+                os.environ["MEMORA_STORAGE_URI"] = saved
+
+    storage, legacy, CloudSQLiteBackend, LocalSQLiteBackend = _storage, _legacy, _Cloud, _Local
+
+
 def pin_import_time_backend(db_name: Optional[str]) -> None:
     """memora.storage builds a module-level backend from MEMORA_STORAGE_URI
     at IMPORT, whatever the registry selects. With a registry present, the
@@ -101,18 +128,11 @@ def pin_import_time_backend(db_name: Optional[str]) -> None:
         os.environ["MEMORA_STORAGE_URI"] = configured_uri(db_name)
 
 
-if __name__ == "__main__":
-    # Before importing memora: refuse an unsupported selected store, and
-    # keep the import-time backend on the selected one (see above).
-    _pre = argparse.ArgumentParser(add_help=False)
-    _pre.add_argument("--db")
-    _db = _pre.parse_known_args()[0].db
-    refuse_unsupported_store(_db)
-    pin_import_time_backend(_db)
 
-import _legacy_project_detection as legacy  # noqa: E402
-from memora import storage  # noqa: E402
-from memora.backends import CloudSQLiteBackend, LocalSQLiteBackend  # noqa: E402
+# memora and the legacy detector are imported by _bootstrap() inside main(),
+# AFTER the store is checked and the import-time backend pinned: importing
+# this module has no side effects.
+storage = legacy = CloudSQLiteBackend = LocalSQLiteBackend = None
 
 
 class StoreInUse(SystemExit):
@@ -281,7 +301,7 @@ def main(argv=None) -> int:
     ap.add_argument("--out", required=True, help="preview JSON file to write (the approval list)")
     ap.add_argument("--markdown", help="also write a markdown table here")
     args = ap.parse_args(argv)
-    refuse_unsupported_store(args.db)  # before ANY backend is resolved or built
+    _bootstrap(args.db)  # refuse or pin FIRST, then import memora
 
     token = storage.CURRENT_DB.set(args.db) if args.db else None
     try:

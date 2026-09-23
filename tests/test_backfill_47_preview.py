@@ -189,6 +189,57 @@ def test_the_script_refuses_an_s3_storage_uri_before_importing_memora(tmp_path):
 
 
 
+def _combined_env_run(tmp_path, argv_code):
+    """Run python code in a fresh process with a registry-selected local store
+    AND MEMORA_STORAGE_URI=s3://..., under a guard that aborts if a
+    CloudSQLiteBackend is ever constructed."""
+    import sqlite3 as _sqlite3
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    home = tmp_path / "home"
+    home.mkdir()
+    local = tmp_path / "l.db"
+    conn = _sqlite3.connect(local)
+    conn.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT, metadata TEXT, tags TEXT)")
+    conn.commit()
+    conn.close()
+    guard = tmp_path / "guard"
+    guard.mkdir()
+    (guard / "sitecustomize.py").write_text(
+        "import memora.backends as b\n"
+        "def _no(self, *a, **k):\n"
+        "    raise SystemExit('CloudSQLiteBackend constructed')\n"
+        "b.CloudSQLiteBackend.__init__ = _no\n")
+    root = Path(__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("MEMORA_", "AWS_"))}
+    env.update({
+        "HOME": str(home),
+        "PYTHONPATH": os.pathsep.join([str(guard), str(root)]),
+        "MEMORA_DATABASES": json.dumps({"local": str(local)}),
+        "MEMORA_STORAGE_URI": "s3://some-bucket/memora/memories.db",
+    })
+    out = tmp_path / "p.json"
+    proc = subprocess.run([sys.executable, "-c", argv_code.format(out=str(out))],
+                          env=env, capture_output=True, text=True, cwd=str(root))
+    return proc, out, home
+
+
+def test_importing_the_module_then_calling_main_constructs_no_cloud_backend(tmp_path):
+    proc, out, home = _combined_env_run(tmp_path, (
+        "import sys\n"
+        "from scripts import preview_backfill_47 as p\n"
+        "assert 'memora.storage' not in sys.modules, 'importing the module imported memora'\n"
+        "import os\n"
+        "rc = p.main(['--out', {out!r}, '--db', 'local'])\n"
+        "assert os.environ['MEMORA_STORAGE_URI'] == 's3://some-bucket/memora/memories.db', 'env left changed'\n"
+        "sys.exit(rc)\n"))
+    assert proc.returncode == 0, proc.stderr
+    assert out.exists() and not (home / ".cache").exists()
+    assert "CloudSQLiteBackend constructed" not in proc.stderr + proc.stdout
+
+
 def test_the_script_ignores_an_s3_storage_uri_when_the_registry_selects_a_local_store(tmp_path):
     """Registry selects a local store AND MEMORA_STORAGE_URI=s3://... (which
     memora.storage would build at import): the import-time backend is pinned
