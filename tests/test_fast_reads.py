@@ -666,7 +666,8 @@ def test_corpus_cache_evicts_entries_of_a_replaced_model(tmp_path, monkeypatch, 
     storage._corpus_cache.clear()
 
 
-@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "Infinity", "0", "-5", "abc", ""])
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "Infinity", "0", "-5", "abc", "",
+                                 "1e308", "1048576.001", "1048577"])
 def test_corpus_cache_budget_invalid_values_fall_back_to_default(monkeypatch, raw):
     monkeypatch.setenv("MEMORA_CORPUS_CACHE_BUDGET_MB", raw)
     assert storage._corpus_cache_budget_bytes() == storage._DEFAULT_CORPUS_CACHE_BUDGET_MB * 1024 * 1024
@@ -675,3 +676,9 @@ def test_corpus_cache_budget_invalid_values_fall_back_to_default(monkeypatch, ra
 def test_corpus_cache_budget_valid_value(monkeypatch):
     monkeypatch.setenv("MEMORA_CORPUS_CACHE_BUDGET_MB", "0.5")
     assert storage._corpus_cache_budget_bytes() == 512 * 1024
+
+
+def test_corpus_cache_budget_ceiling_is_accepted(monkeypatch):
+    for raw, mb in (("1048576", 1048576), ("1048575.5", 1048575.5)):
+        monkeypatch.setenv("MEMORA_CORPUS_CACHE_BUDGET_MB", raw)
+        assert storage._corpus_cache_budget_bytes() == int(mb * 1024 * 1024)

@@ -2953,6 +2953,7 @@ _corpus_cache_lock = threading.Lock()
 _EPOCH_KEY = "embedding_change_epoch"
 _CORPUS_LOAD_RETRIES = 3
 _DEFAULT_CORPUS_CACHE_BUDGET_MB = 384
+_MAX_CORPUS_CACHE_BUDGET_MB = 1024 * 1024  # 1 TiB: a sane ceiling, not a target
 # Measured bytes per vector component for the Dict[str, float] vectors
 # json_to_embedding builds (~93 KB per 1024-dim row), plus fixed per-entry
 # overhead. An estimate for the budget, not an exact accounting.
@@ -2968,9 +2969,11 @@ def _corpus_cache_budget_bytes() -> int:
         mb = float(raw) if raw is not None else _DEFAULT_CORPUS_CACHE_BUDGET_MB
     except ValueError:
         mb = _DEFAULT_CORPUS_CACHE_BUDGET_MB
-    # Only a finite positive number is valid: float() also accepts "nan" and
-    # "inf", which pass a <= 0 check and then break int() on every cold load.
-    if not math.isfinite(mb) or mb <= 0:
+    # Valid only in (0, _MAX_CORPUS_CACHE_BUDGET_MB]. float() also accepts
+    # "nan" and "inf", and a finite huge value like 1e308 overflows to inf
+    # once converted to bytes; any of those would make int() raise on every
+    # cold load. Bounding mb itself makes the byte value always finite.
+    if not (math.isfinite(mb) and 0 < mb <= _MAX_CORPUS_CACHE_BUDGET_MB):
         mb = _DEFAULT_CORPUS_CACHE_BUDGET_MB
     return int(mb * 1024 * 1024)
 
