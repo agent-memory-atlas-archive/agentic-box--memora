@@ -95,11 +95,10 @@ def _predict_case(case: Dict[str, Any], mode: str, db_path: Path) -> Dict[str, A
 
                 storage._classify_fact_against_matches = stub_classifier
 
-                def stub_check(fact, match_data, classifications, suggested_tags, **_kw):
-                    if storage._absorb_update_candidate(classifications) is None:
-                        return None
-                    return {"verdict": "supersede", "gate": "stub", "reason": "measurement stub",
-                            "score": FIXTURE_SIMILARITY, "old_text": ""}
+                def stub_check(fact, leaf, suggested_tags, **_kw):
+                    return {"leaf_id": leaf["id"], "verdict": "supersede", "gate": "stub",
+                            "reason": "measurement stub", "score": FIXTURE_SIMILARITY,
+                            "old_text": leaf.get("content", "")}
 
                 storage._absorb_check_supersede = stub_check
             else:

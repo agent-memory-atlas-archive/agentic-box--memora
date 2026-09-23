@@ -243,10 +243,8 @@ def supersede_gate_open(monkeypatch):
     are not about whether it should have been accepted. The gate itself is
     covered in tests/test_absorb_supersede_gate.py.
     """
-    def confirm(fact, match_data, classifications, suggested_tags, **_kw):
-        if storage._absorb_update_candidate(classifications) is None:
-            return None
-        return {"verdict": "supersede", "gate": "test", "reason": "gate open in test",
-                "score": 1.0, "old_text": ""}
+    def confirm(fact, leaf, suggested_tags, **_kw):
+        return {"leaf_id": leaf["id"], "verdict": "supersede", "gate": "test",
+                "reason": "gate open in test", "score": 1.0, "old_text": leaf.get("content", "")}
 
     monkeypatch.setattr(storage, "_absorb_check_supersede", confirm)

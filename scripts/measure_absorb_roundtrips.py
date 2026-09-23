@@ -11,15 +11,22 @@ Scenario (the shape of an update-heavy absorb call):
   - a store of --rows background memories (default 964, the live size) plus
     supersession chains of length 3 and 5 and a few related-target memories;
   - one absorb of 9 facts: 3 new (two of them similar enough to consolidate),
-    3 RELATED to existing memories, 3 UPDATE (supersede) — one aimed at a
-    chain leaf, one at a length-5 chain leaf, one at a STALE chain middle
-    that write-boundary resolution must move to the current leaf.
+    3 RELATED to existing memories, 3 UPDATE (supersede). The fake classifier
+    always picks the OLDEST candidate, i.e. a stale chain version, so every
+    UPDATE must be re-resolved to its chain's current leaf.
 
 LLM and embedding calls are faked with fixed sleeps (--llm-latency,
 --embed-latency) so their share is visible but deterministic. The classifier
-answers from a marker in each fact, and a supersede verifier (when the code
-has one) confirms the intended UPDATEs, so both code versions take the same
-decisions and the request counts are comparable.
+answers from a marker in each fact. The supersede verifier (when the code
+has one) judges the text it is shown, the LEAF's text:
+  --scenario confirm       every leaf is the same entity: all 3 supersede
+                           (the pre-gate code takes the same decisions, so
+                           --compare against a pre-gate run must match);
+  --scenario leaf-differs  chainC's leaf is marked a different entity: the
+                           verifier rejects it and chainC's fact is linked
+                           RELATED instead (pre-gate code would supersede it).
+The run ASSERTS the expected actions for the scenario, and with
+--compare BASELINE.json that the decisions equal a previous --json run.
 
 Default latencies: D1 0.2 s/request (memora #973 measured ~20 s for ~100
 requests on the live store), embeddings 0.1 s/request (bge-m3 on the M1 from
@@ -94,16 +101,19 @@ def install_fakes(embed_latency: float, llm_latency: float) -> None:
     def classify(fact, match_data):
         time.sleep(llm_latency)
         rel = fact[fact.index("[expect:") + 8 : fact.index("]", fact.index("[expect:"))]
-        return [{"memory_id": match_data[0]["id"], "relationship": rel, "reason": "bench"}], []
+        stale = min(m["id"] for m in match_data)  # the oldest version: stale
+        return [{"memory_id": stale, "relationship": rel, "reason": "bench"}], []
 
     def consolidate(group, context=None):
         time.sleep(llm_latency)
         return " / ".join(group)
 
-    def verify(*args, **kwargs):
+    def verify(new_fact, old_content, **kwargs):
         time.sleep(llm_latency)
-        return {"verdict": "supersede", "same_project": True, "same_entity": True,
-                "fully_replaces": True, "reason": "bench"}
+        same = "[entity:other]" not in old_content
+        return {"verdict": "supersede" if same else "related", "same_project": True,
+                "same_entity": same, "fully_replaces": same, "related": True,
+                "reason": "bench: same entity" if same else "bench: leaf is a different entity"}
 
     storage._compute_embedding = embed
     storage._compute_embeddings_batch = embed_batch
@@ -125,14 +135,16 @@ def _insert(conn, content: str) -> int:
     return mid
 
 
-def seed(conn, rows: int) -> dict:
+def seed(conn, rows: int, scenario: str) -> dict:
     for i in range(rows):
         _insert(conn, f"[topic:bg{i}] background memory {i} about subsystem {i % 37}")
     chains = {}
     for name, length in (("chainA", 3), ("chainB", 5), ("chainC", 3)):
         ids = []
         for v in range(length):
-            ids.append(_insert(conn, f"[topic:{name}] {name} setting version {v}"))
+            other = scenario == "leaf-differs" and name == "chainC" and v == length - 1
+            marker = " [entity:other] a different component's setting" if other else ""
+            ids.append(_insert(conn, f"[topic:{name}] {name} setting version {v}{marker}"))
             if v:
                 storage.add_link(conn, ids[-1], ids[-2], edge_type="supersedes")
         chains[name] = ids
@@ -140,6 +152,13 @@ def seed(conn, rows: int) -> dict:
     conn.commit()
     return {"chains": chains, "related": related}
 
+
+EXPECTED_ACTIONS = {
+    "confirm": ["consolidated", "created", "linked", "linked", "linked",
+                "superseded", "superseded", "superseded"],
+    "leaf-differs": ["consolidated", "created", "linked", "linked", "linked",
+                     "superseded", "superseded", "linked"],
+}
 
 FACTS = [
     "[topic:newA] [expect:none] brand new fact one",
@@ -161,6 +180,8 @@ def main() -> int:
     ap.add_argument("--embed-latency", type=float, default=0.1)
     ap.add_argument("--llm-latency", type=float, default=2.0)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--scenario", choices=sorted(EXPECTED_ACTIONS), default="confirm")
+    ap.add_argument("--compare", type=Path, help="a previous --json output; decisions must match")
     args = ap.parse_args()
 
     tmp = Path(tempfile.mkdtemp(prefix="memora-roundtrips-"))
@@ -171,16 +192,7 @@ def main() -> int:
     install_fakes(args.embed_latency, args.llm_latency)
 
     with storage.connect() as conn:
-        seed(conn, args.rows)
-    # Make chainC's classifier target the STALE middle: the fake classifier
-    # points at the top match, so hide chainC's leaf from the snapshot by
-    # giving it a different topic embedding.
-    with storage.connect() as conn:
-        leaf = conn.execute(
-            "SELECT id FROM memories WHERE content = ?", ("[topic:chainC] chainC setting version 2",)
-        ).fetchone()[0]
-        storage._upsert_embedding(conn, int(leaf), fake_vector("[topic:elsewhere] x"))
-        conn.commit()
+        seeded = seed(conn, args.rows, args.scenario)
 
     storage.invalidate_corpus_cache(storage.connect())
     LatencyFakeD1Connection.latency = args.d1_latency
@@ -191,7 +203,17 @@ def main() -> int:
     LatencyFakeD1Connection.latency = 0.0
 
     profile = result.get("profile", {})
-    decisions = [(d.get("action"), d.get("target_id"), d.get("memory_id")) for d in result["decisions"]]
+    decisions = [[d.get("action"), d.get("target_id"), d.get("memory_id")] for d in result["decisions"]]
+    actions = [d[0] for d in decisions]
+    expected = EXPECTED_ACTIONS[args.scenario]
+    assert actions == expected, f"scenario {args.scenario}: actions {actions} != expected {expected}"
+    # Every UPDATE landed on its chain's CURRENT leaf, never the stale target.
+    leaves = {ids[-1] for ids in seeded["chains"].values()}
+    for (action, target, _mid), fact in zip(decisions[-3:], FACTS[-3:]):
+        assert target in leaves, f"{fact}: {action} target #{target} is not a chain leaf"
+    if args.compare:
+        baseline = json.loads(args.compare.read_text())["decisions"]
+        assert decisions == baseline, f"decisions differ from {args.compare}:\n{decisions}\n{baseline}"
     if args.json:
         print(json.dumps({"wall_seconds": wall, "profile": profile, "decisions": decisions}, indent=2))
         return 0
