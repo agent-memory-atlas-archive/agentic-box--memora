@@ -12,6 +12,17 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## Unreleased
+
+### Project identity is explicit, never guessed (issue #47)
+- **Removed** keyword-based project detection (`_detect_project`, `_PROJECT_INDICATORS`, `_TAG_PROJECT_MAP`, `_KNOWN_PROJECT_PREFIXES`). Generic words such as "embedding", "workspace", "daemon" or "sidebar" no longer put a memory into `memora` or `clmux`; that misfiled memories, prefixed their generic tags with the wrong project (`clmux/architecture` on pi facts, #1109-#1114) and fed a wrong supersession (#1082).
+- A memory's project now comes, in order, from: an explicit **`project`** argument (new, optional, on `memory_create`, `memory_create_issue`, `memory_create_todo`, `memory_absorb`, the CLI `absorb --project`, and the storage functions); else the memory's `metadata.project`; else exactly one tag naming a project configured for the store. Otherwise it has no project. An explicit project is also recorded as `metadata.project`.
+- **`MEMORA_PROJECTS`** (new, optional): the projects a store holds, as a JSON list (every store) or `{store: [projects]}` (`"default"` for a single-store deployment). Unset: no project is inferred from tags, and explicit projects are accepted as any valid name (`[a-z0-9_-]{1,64}`). Set: an explicit project outside the store's list is rejected (`invalid_input`). Deployments that relied on `memora/...` and `clmux/...` tags implying a project should set it, e.g. `MEMORA_PROJECTS='["memora","clmux"]'`.
+- Section/subsection assignment and generic-tag prefixing (`architecture` -> `<project>/architecture`) now act only on that resolved project; the memora/clmux section conventions are unchanged when the project is given, and now work for any project.
+- LLM-suggested absorb tags are kept when the configured tag allowlist permits them (`MEMORA_ALLOW_ANY_TAG` permits any project-prefixed tag), instead of only `memora/` and `clmux/`; with an explicit project, a suggestion naming a different configured project is dropped. The classify prompt no longer uses `memora/research` and `clmux/architecture` as examples.
+- `memory_create_issue` / `memory_create_todo` still default to the `memora/issues` / `memora/todos` tags without a project; with `project` they use `<project>/issues` / `<project>/todos`.
+- Existing memories are not modified. `scripts/report_project_detection.py` (read-only) lists memories whose stored section or project-prefixed tags came from the removed keyword heuristics and would differ under the new rules, to decide on a backfill.
+
 ## 0.4.4
 
 Fast reads. Prompted by live timings from the Mac against memora-all:

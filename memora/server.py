@@ -365,8 +365,11 @@ def _create_memory(
     content: str,
     metadata: Optional[Dict[str, Any]],
     tags: Optional[list[str]],
+    project: Optional[str] = None,
 ):
-    return add_memory(conn, content=content.strip(), metadata=metadata, tags=tags or [])
+    return add_memory(
+        conn, content=content.strip(), metadata=metadata, tags=tags or [], project=project,
+    )
 
 
 @_with_connection(profile=True)
@@ -451,6 +454,7 @@ def _absorb_memory(
     metadata: Optional[Dict[str, Any]],
     tags: Optional[List[str]],
     dry_run: bool,
+    project: Optional[str] = None,
 ):
     return absorb_memory(
         conn,
@@ -461,6 +465,7 @@ def _absorb_memory(
         metadata=metadata,
         tags=tags,
         dry_run=dry_run,
+        project=project,
     )
 
 
@@ -957,6 +962,7 @@ async def memory_create(
     suggest_similar: bool = True,
     similarity_threshold: float = 0.2,
     response_mode: Literal["full", "minimal"] = "full",
+    project: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new memory entry.
 
@@ -967,6 +973,11 @@ async def memory_create(
         suggest_similar: If True, find similar memories and suggest consolidation (default: True)
         similarity_threshold: Minimum similarity score for suggestions (default: 0.2)
         response_mode: "full" (default) or "minimal" response payload size
+        project: Optional project this memory belongs to (e.g. "clmux"). Recorded
+            as metadata.project and used for section and tag prefixing. Without
+            it, the project comes only from metadata.project or a tag naming a
+            project configured in MEMORA_PROJECTS; it is never guessed from the
+            text (issue #47).
     """
     if response_mode not in CREATE_RESPONSE_MODES:
         valid = ", ".join(sorted(CREATE_RESPONSE_MODES))
@@ -997,7 +1008,9 @@ async def memory_create(
         logger.warning("Secret redaction failed, storing original content: %s", exc)
 
     try:
-        record = await _create_memory(content=redacted_content, metadata=metadata, tags=tags or [])
+        record = await _create_memory(
+            content=redacted_content, metadata=metadata, tags=tags or [], project=project,
+        )
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
 
@@ -1125,6 +1138,7 @@ async def memory_create_issue(
     severity: str = "minor",
     component: Optional[str] = None,
     category: Optional[str] = None,
+    project: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new issue/bug memory.
 
@@ -1135,9 +1149,11 @@ async def memory_create_issue(
         severity: Issue severity - "critical", "major", "minor" (default)
         component: Component/area affected (e.g., "graph", "storage", "api")
         category: Issue category (e.g., "bug", "enhancement", "performance")
+        project: Optional project the issue belongs to; its tag becomes
+            "<project>/issues" (default, without a project: "memora/issues")
 
     Returns:
-        Created issue memory with auto-assigned tag "memora/issues"
+        Created issue memory with auto-assigned tag "<project>/issues"
     """
     # Validate status
     valid_statuses = {"open", "closed"}
@@ -1171,10 +1187,10 @@ async def memory_create_issue(
         metadata["category"] = category
 
     # Create with auto-tag
-    tags = ["memora/issues"]
+    tags = [f"{project}/issues" if project else "memora/issues"]
 
     try:
-        record = await _create_memory(content.strip(), metadata, tags)
+        record = await _create_memory(content.strip(), metadata, tags, project)
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
 
@@ -1189,6 +1205,7 @@ async def memory_create_todo(
     closed_reason: Optional[str] = None,
     priority: str = "medium",
     category: Optional[str] = None,
+    project: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new TODO/task memory.
 
@@ -1198,9 +1215,11 @@ async def memory_create_todo(
         closed_reason: If closed, the reason - "complete" or "not_planned"
         priority: Task priority - "high", "medium" (default), "low"
         category: Task category (e.g., "cloud-backend", "graph-visualization", "docs")
+        project: Optional project the task belongs to; its tag becomes
+            "<project>/todos" (default, without a project: "memora/todos")
 
     Returns:
-        Created TODO memory with auto-assigned tag "memora/todos"
+        Created TODO memory with auto-assigned tag "<project>/todos"
     """
     # Validate status
     valid_statuses = {"open", "closed"}
@@ -1232,10 +1251,10 @@ async def memory_create_todo(
         metadata["category"] = category
 
     # Create with auto-tag
-    tags = ["memora/todos"]
+    tags = [f"{project}/todos" if project else "memora/todos"]
 
     try:
-        record = await _create_memory(content.strip(), metadata, tags)
+        record = await _create_memory(content.strip(), metadata, tags, project)
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
 
@@ -1535,6 +1554,7 @@ async def memory_absorb(
     metadata: Optional[Dict[str, Any]] = None,
     tags: Optional[list[str]] = None,
     dry_run: bool = False,
+    project: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Intelligently absorb facts into memory with dedup and consolidation.
 
@@ -1551,6 +1571,12 @@ async def memory_absorb(
         metadata: Optional metadata to attach to created memories
         tags: Optional tags to attach to created memories
         dry_run: If True, preview what would happen without writing anything
+        project: Optional project these facts belong to (e.g. "clmux"). Recorded
+            on every created memory as metadata.project and used for section and
+            tag prefixing; suggested tags naming a different configured project
+            are dropped. Without it, the project comes only from metadata.project
+            or a tag naming a project configured in MEMORA_PROJECTS; it is never
+            guessed from the text (issue #47).
     """
     if not facts:
         return {"error": "invalid_input", "message": "facts list is empty"}
@@ -1559,7 +1585,7 @@ async def memory_absorb(
 
     try:
         result = await _absorb_memory(
-            facts, source, confidence, context, metadata, tags, dry_run,
+            facts, source, confidence, context, metadata, tags, dry_run, project,
         )
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}

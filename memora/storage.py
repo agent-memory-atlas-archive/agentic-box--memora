@@ -1303,97 +1303,114 @@ def _validate_tags(tags: Optional[Iterable[str]]) -> List[str]:
 # Deterministic tag normalization — prefix generic tags with project name
 # ---------------------------------------------------------------------------
 
-_PROJECT_INDICATORS: Dict[str, List[str]] = {
-    "memora": [
-        r"\bmemora\b", r"\bmemory.server\b", r"\bmcp.server\b",
-        r"\bstorage\.py\b", r"\babsorb\b", r"\bembedding", r"\bcrossref",
-        r"\bgraph.visualization\b", r"\bknowledge.graph\b",
-        r"\bmemory_create\b", r"\bmemory_absorb\b", r"\bmemory_search\b",
-    ],
-    "clmux": [
-        r"\bclmux\b", r"\btmux.workspace\b", r"\bmultiplexer\b",
-        r"\btmux\b", r"\bpane\b", r"\bworkspace\b", r"\bsidebar\b",
-        r"\btui\b", r"\bdaemon\b", r"\bsocket.server\b",
-    ],
-}
+# ---------------------------------------------------------------------------
+# Project identity (issue #47).
+#
+# A memory's project is never guessed from its content any more. Keyword
+# indicators ("embedding" -> memora, "workspace"/"daemon" -> clmux) put
+# unrelated memories into those two projects, prefixed their generic tags
+# (clmux/architecture on pi facts) and let project confusion feed a wrong
+# supersession (#1082 by #1109). A project now comes, in order, from:
+#   1. an explicit `project` argument (MCP create/absorb tools, CLI, API);
+#   2. the memory's own metadata.project;
+#   3. exactly one tag naming a project CONFIGURED for this store
+#      ("<project>" or "<project>/...");
+# and otherwise the memory has no project, and nothing is inferred.
+#
+# Known projects come from MEMORA_PROJECTS: a JSON list of project names
+# (every store), or a JSON object {store: [projects]} per registry store
+# ("default" for a single-store deployment). Unset: no store has configured
+# projects, so step 3 never applies; explicit projects are still accepted.
+# ---------------------------------------------------------------------------
 
-# Tags that imply a project (checked when content detection fails)
-_TAG_PROJECT_MAP: Dict[str, str] = {
-    "clmux": "clmux",
-    "tui": "clmux",
-    "tmux": "clmux",
-    "memora": "memora",
-}
+_PROJECT_NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
 
 _GENERIC_TAGS_TO_PREFIX = {
     "plan", "analysis", "research", "architecture", "roadmap",
     "design", "status", "reference",
 }
 
-# Valid project prefixes for LLM-suggested tag filtering
-_KNOWN_PROJECT_PREFIXES = tuple(f"{p}/" for p in _PROJECT_INDICATORS)
+
+class ProjectConfigError(ValueError):
+    """MEMORA_PROJECTS is malformed, or an explicit project is not allowed."""
 
 
-def _detect_project(
-    content: str,
-    metadata: Optional[Dict[str, Any]] = None,
-    tags: Optional[List[str]] = None,
-    context: Optional[str] = None,
+def configured_projects(store: Optional[str] = None) -> Tuple[str, ...]:
+    """Projects MEMORA_PROJECTS declares for `store` (default: the store this
+    call is bound to). Empty when none are configured."""
+    raw = os.getenv("MEMORA_PROJECTS", "").strip()
+    if not raw:
+        return ()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ProjectConfigError(f"MEMORA_PROJECTS is not valid JSON: {exc}") from exc
+    if isinstance(data, dict):
+        if store is None:
+            store = effective_database_name() or "default"
+        data = data.get(store, [])
+    if not isinstance(data, list) or not all(
+        isinstance(p, str) and _PROJECT_NAME_RE.match(p) for p in data
+    ):
+        raise ProjectConfigError(
+            "MEMORA_PROJECTS must be a JSON list of project names or {store: [project names]}"
+        )
+    return tuple(dict.fromkeys(data))
+
+
+def _projects_in_tags(tags: Optional[Iterable[str]], known: Iterable[str]) -> set:
+    found = set()
+    for tag in tags or []:
+        if not isinstance(tag, str):
+            continue
+        head = tag.split("/", 1)[0]
+        if head in known:
+            found.add(head)
+    return found
+
+
+def _resolve_project(
+    explicit: Optional[str],
+    tags: Optional[Iterable[str]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
-    """Detect which project content belongs to. Returns None if ambiguous or unknown."""
-    text = content.lower()
-    if metadata:
-        section = str(metadata.get("section", "")).lower()
-        meta_context = str(metadata.get("context", "")).lower()
-        text = f"{text} {section} {meta_context}"
-    if context:
-        text = f"{text} {context.lower()}"
+    """The memory's project, from explicit markers only (see the block above).
 
-    matched = set()
-    for project, patterns in _PROJECT_INDICATORS.items():
-        if any(re.search(p, text) for p in patterns):
-            matched.add(project)
-
-    # If content is ambiguous or unknown, check tags for project hints
-    if len(matched) != 1 and tags:
-        tag_projects = set()
-        for tag in tags:
-            # Check direct tag match
-            if tag in _TAG_PROJECT_MAP:
-                tag_projects.add(_TAG_PROJECT_MAP[tag])
-            # Check slash-prefixed tag (e.g., "memora/todos" → memora)
-            if "/" in tag:
-                prefix = tag.split("/", 1)[0]
-                if prefix in _PROJECT_INDICATORS:
-                    tag_projects.add(prefix)
-            # Check hyphen-prefixed tag (e.g., "clmux-architecture" → clmux)
-            if "-" in tag:
-                hyphen_prefix = tag.split("-", 1)[0]
-                if hyphen_prefix in _PROJECT_INDICATORS:
-                    tag_projects.add(hyphen_prefix)
-        if len(tag_projects) == 1:
-            return tag_projects.pop()
-
-    if len(matched) == 1:
-        return matched.pop()
-    return None  # ambiguous (multiple) or unknown (none)
+    An explicit project must be a valid name and, when the store configures
+    projects, one of them (ProjectConfigError otherwise). Ambiguous tags (two
+    configured projects) give no project rather than a guess.
+    """
+    known = configured_projects()
+    if explicit is not None:
+        if not isinstance(explicit, str) or not _PROJECT_NAME_RE.match(explicit):
+            raise ProjectConfigError(f"invalid project name {explicit!r}")
+        if known and explicit not in known:
+            raise ProjectConfigError(
+                f"project {explicit!r} is not configured for this store "
+                f"(MEMORA_PROJECTS: {', '.join(known)})"
+            )
+        return explicit
+    meta_project = metadata.get("project") if isinstance(metadata, Mapping) else None
+    if isinstance(meta_project, str) and _PROJECT_NAME_RE.match(meta_project):
+        return meta_project
+    if known:
+        found = _projects_in_tags(tags, known)
+        if len(found) == 1:
+            return found.pop()
+    return None
 
 
 def _normalize_tags(
     tags: List[str],
-    content: str,
-    metadata: Optional[Dict[str, Any]] = None,
+    project: Optional[str],
 ) -> List[str]:
-    """Normalize generic tags to project-prefixed form when context is unambiguous.
+    """Prefix generic tags ("architecture") with the memory's project.
 
-    Idempotent: tags already containing '/' are never touched.
-    Returns the normalized tag list.
+    Only for an explicitly resolved project (_resolve_project); with none,
+    tags are returned unchanged. Idempotent: tags containing '/' are never
+    touched.
     """
-    if not tags:
-        return tags
-
-    project = _detect_project(content, metadata, tags)
-    if not project:
+    if not tags or not project:
         return tags
 
     normalized = []
@@ -1411,25 +1428,70 @@ def _normalize_tags(
     return normalized
 
 
-def _filter_suggested_tags(suggested: List[str]) -> List[str]:
-    """Filter LLM-suggested tags to only known project prefixes + known suffixes."""
-    filtered = []
+def _filter_suggested_tags(
+    suggested: List[str],
+    project: Optional[str] = None,
+) -> List[str]:
+    """Keep the LLM-suggested tags the tag policy permits.
+
+    - The configured allowlist decides (TAG_WHITELIST, wildcards included);
+      MEMORA_ALLOW_ANY_TAG (an empty allowlist) permits any tag. There is no
+      hardcoded project-prefix list any more (#47).
+    - Suggestions must be project-prefixed ("<project>/<topic>"), as the
+      classify prompt asks, and pass _validate_tags' format rules.
+    - When the memory's project is known, a suggestion prefixed with a
+      DIFFERENT configured project is dropped: it would file the memory
+      under the wrong project.
+    """
+    from . import TAG_WHITELIST
+
+    known = set(configured_projects())
+    filtered: List[str] = []
     for tag in suggested:
         if not isinstance(tag, str) or "/" not in tag:
             continue
         prefix, _, suffix = tag.partition("/")
-        if f"{prefix}/" in _KNOWN_PROJECT_PREFIXES and suffix in _GENERIC_TAGS_TO_PREFIX:
+        if not prefix or not suffix:
+            continue
+        if project and prefix != project and prefix in known:
+            continue
+        if TAG_WHITELIST and not tag_matches_policy(tag, TAG_WHITELIST):
+            continue
+        try:
+            _validate_tags([tag])
+        except ValueError:
+            continue
+        if tag not in filtered:
             filtered.append(tag)
     return filtered
 
 
+def _project_metadata(
+    project: Optional[str],
+    metadata: Optional[Dict[str, Any]],
+    tags: Optional[List[str]],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """(resolved project, metadata) for a write. An explicit project is also
+    recorded as metadata.project, so the memory carries its identity."""
+    resolved = _resolve_project(project, tags, metadata)
+    if project is not None:
+        metadata = dict(metadata or {})
+        metadata["project"] = project
+    return resolved, metadata
+
+
 def _auto_assign_section(
     metadata: Optional[Dict[str, Any]],
-    content: str,
-    tags: Optional[List[str]] = None,
+    tags: Optional[List[str]],
+    project: Optional[str],
 ) -> Optional[Dict[str, Any]]:
-    """Auto-assign metadata.section and subsection based on detected project and tags."""
-    project = _detect_project(content, metadata, tags)
+    """Fill metadata.section (and subsection) from the memory's project.
+
+    Only for an explicitly resolved project (_resolve_project); with none,
+    metadata is returned unchanged. The section is the project; the
+    subsection comes from the most specific "<project>/..." tag, else a
+    known topic tag -- the memora/clmux section convention, for any project.
+    """
     if not project:
         return metadata
 
@@ -5197,8 +5259,13 @@ def add_memory(
     absorb_nonce: Optional[str] = None,
     absorb_operation_key: Optional[str] = None,
     corpus: Optional[_CorpusSnapshot] = None,
+    project: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a memory.
+
+    project: the memory's project, explicitly (issue #47). Recorded as
+    metadata.project and drives section/tag prefixing; without it the
+    project comes only from metadata.project or a configured project tag.
 
     embedding: optional precomputed vector from FINAL content+metadata+tags.
     commit: when False, skip conn.commit() so callers can batch (local SQLite).
@@ -5212,10 +5279,11 @@ def add_memory(
     """
     content = _validate_content(content)
 
-    metadata = _auto_assign_section(metadata, content, tags)
+    resolved_project, metadata = _project_metadata(project, metadata, tags)
+    metadata = _auto_assign_section(metadata, tags, resolved_project)
 
     validated_tags = _validate_tags(tags)
-    validated_tags = _normalize_tags(validated_tags, content, metadata)
+    validated_tags = _normalize_tags(validated_tags, resolved_project)
     _enforce_tag_whitelist(validated_tags)
     tags_json = json.dumps(validated_tags, ensure_ascii=False)
 
@@ -5348,10 +5416,11 @@ def add_memories(
         content = str(entry["content"]).strip()
         metadata = entry.get("metadata")
         tags = entry.get("tags") or []
-        metadata = _auto_assign_section(metadata, content, tags)
+        resolved_project, metadata = _project_metadata(entry.get("project"), metadata, tags)
+        metadata = _auto_assign_section(metadata, tags, resolved_project)
         prepared_metadata = _prepare_metadata(metadata)
         validated_tags = _validate_tags(tags)
-        validated_tags = _normalize_tags(validated_tags, content, metadata)
+        validated_tags = _normalize_tags(validated_tags, resolved_project)
         _enforce_tag_whitelist(validated_tags)
         metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
         tags_json = json.dumps(validated_tags, ensure_ascii=False)
@@ -5562,8 +5631,9 @@ For each memory, classify the relationship:
 - RELATED: different aspect of same topic, or a different piece of work in the same area
 - UNRELATED: false positive similarity match
 
-Also suggest 1-3 project-prefixed tags for the new fact (e.g. "memora/research", "clmux/architecture").
-Use tags from the matched memories as guidance. Avoid generic single-word tags.
+Also suggest 1-3 project-prefixed tags for the new fact, in the form "<project>/<topic>".
+Take the project only from the matched memories' own tags; if they show none, suggest no tags.
+Do not guess a project from the subject matter. Avoid generic single-word tags.
 
 Respond with JSON only (no markdown). "memory_id" must be the BARE NUMBER
 from one of the brackets above — 482, not "[#482]" or "#482" — never a list
@@ -6718,6 +6788,7 @@ def absorb_memory(
     metadata: Optional[Dict[str, Any]] = None,
     tags: Optional[List[str]] = None,
     dry_run: bool = False,
+    project: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Intelligently absorb facts; see _absorb_memory_impl.
 
@@ -6732,6 +6803,7 @@ def absorb_memory(
             result = _absorb_memory_impl(
                 conn, facts, source=source, confidence=confidence,
                 context=context, metadata=metadata, tags=tags, dry_run=dry_run,
+                project=project,
             )
         except BaseException as exc:
             summary = profile.finish()
@@ -6756,6 +6828,7 @@ def _absorb_memory_impl(
     metadata: Optional[Dict[str, Any]] = None,
     tags: Optional[List[str]] = None,
     dry_run: bool = False,
+    project: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Intelligently absorb facts into memory with dedup and reconciliation.
 
@@ -6776,12 +6849,19 @@ def _absorb_memory_impl(
         metadata: Optional metadata to attach to created memories
         tags: Optional tags to attach to created memories
         dry_run: If True, preview decisions without writing
+        project: The facts' project, explicitly (issue #47): recorded on every
+            created memory, drives section/tag prefixing, and drops suggested
+            tags that name a different configured project. Validated before
+            any work (ProjectConfigError, a ValueError).
 
     Returns:
         Dict with decisions list and summary counts
     """
     if not facts:
         return {"decisions": [], "created": 0, "superseded": 0, "skipped": 0, "linked": 0, "contradicted": 0, "consolidated": 0, "tombstoned": 0}
+    if project is not None:
+        # Fail before any work: an unknown project is a caller error (#47).
+        _resolve_project(project, tags, metadata)
 
     # Scan-once: load the corpus into a SKINNY snapshot a single time and score
     # every fact (and every write-time crossref pass) against it, instead of
@@ -6925,7 +7005,7 @@ def _absorb_memory_impl(
         group_suggested: List[str] = []
         for gi in group_indices:
             group_suggested.extend(pure_new[gi][1][3])
-        group_suggested = _filter_suggested_tags(list(set(group_suggested)))
+        group_suggested = _filter_suggested_tags(list(set(group_suggested)), project)
         final_tags = _merge_tags(tags, group_suggested)
 
         if len(group_facts) >= 2:
@@ -6960,7 +7040,7 @@ def _absorb_memory_impl(
             "check": link_info[3] if len(link_info) > 3 else None,
             # Phase-1 vector: scores leaves first seen at the write boundary.
             "search_vector": search_vector,
-            "tags": _merge_tags(tags, _filter_suggested_tags(fact_suggested)),
+            "tags": _merge_tags(tags, _filter_suggested_tags(fact_suggested, project)),
             "kind": "linked",
             "source_facts": None,
         })
@@ -7090,6 +7170,7 @@ def _absorb_memory_impl(
                     absorb_nonce=absorb_nonce,
                     absorb_operation_key=str(uuid.uuid4()),
                     corpus=corpus,
+                    project=project,
                 )
             # Append the created memory to the in-memory corpus so a LATER
             # create's crossref scan (and any later scan in this call) sees it,
@@ -7528,7 +7609,8 @@ def backfill_tags(
     """Re-tag existing memories with project-prefixed tags via deterministic normalization.
 
     Idempotent: re-running produces the same result; already-prefixed tags are unchanged.
-    No LLM calls — uses _normalize_tags() only.
+    No LLM calls — uses _normalize_tags() only, on the project each memory
+    carries explicitly (metadata.project or a configured project tag; #47).
 
     Args:
         conn: Database connection
@@ -7567,10 +7649,11 @@ def backfill_tags(
             old_tags = []
 
         processed += 1
-        new_tags = _normalize_tags(old_tags, content, metadata)
+        resolved_project = _resolve_project(None, old_tags, metadata)
+        new_tags = _normalize_tags(old_tags, resolved_project)
 
         # Auto-assign section if missing
-        new_metadata = _auto_assign_section(metadata, content, old_tags)
+        new_metadata = _auto_assign_section(metadata, old_tags, resolved_project)
         old_section = (metadata or {}).get("section")
         old_subsection = (metadata or {}).get("subsection")
         new_section = (new_metadata or {}).get("section")
@@ -7889,7 +7972,7 @@ def update_memory(
     new_tags = _validate_tags(tags) if tags is not None else existing.get("tags", [])
 
     if tags is not None:
-        new_tags = _normalize_tags(new_tags, new_content, new_metadata)
+        new_tags = _normalize_tags(new_tags, _resolve_project(None, new_tags, new_metadata))
         _enforce_tag_whitelist(new_tags)
 
     # Check what changed (affects whether we need to recompute indexes)
@@ -9236,10 +9319,11 @@ def import_memories(
             created_at = entry.get("created_at")
 
             # Prepare data
-            metadata = _auto_assign_section(metadata, content, tags)
+            resolved_project, metadata = _project_metadata(entry.get("project"), metadata, tags)
+            metadata = _auto_assign_section(metadata, tags, resolved_project)
             prepared_metadata = _prepare_metadata(metadata) if metadata else None
             validated_tags = _validate_tags(tags)
-            validated_tags = _normalize_tags(validated_tags, content, metadata)
+            validated_tags = _normalize_tags(validated_tags, resolved_project)
             _enforce_tag_whitelist(validated_tags)
 
             metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None

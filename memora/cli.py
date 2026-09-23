@@ -3,7 +3,7 @@
 Usage:
     python3 -m memora.cli search "query" [--top-k 7] [--tags tag1,tag2]
     python3 -m memora.cli health
-    echo "fact" | python3 -m memora.cli absorb [--source S] [--context C] [--tags t1,t2]
+    echo "fact" | python3 -m memora.cli absorb [--source S] [--context C] [--tags t1,t2] [--project P]
 
 Env loading: handled by `memora/__init__.py` _bootstrap_mcp_env() which
 walks up from cwd to find .mcp.json and exports the memora server env
@@ -77,18 +77,24 @@ def cmd_absorb(
     source: str = "manual",
     context: str | None = None,
     tags: list[str] | None = None,
+    project: str | None = None,
 ) -> None:
     from .storage import absorb_memory, connect
 
     conn = connect()
     try:
-        result = absorb_memory(
-            conn,
-            [fact],
-            source=source,
-            context=context,
-            tags=tags or None,
-        )
+        try:
+            result = absorb_memory(
+                conn,
+                [fact],
+                source=source,
+                context=context,
+                tags=tags or None,
+                project=project,
+            )
+        except ValueError as exc:  # e.g. an unknown --project (issue #47)
+            json.dump({"error": "invalid_input", "message": str(exc)}, sys.stdout)
+            sys.exit(2)
     finally:
         conn.close()
 
@@ -131,9 +137,13 @@ def main() -> None:
         source = "manual"
         context: str | None = None
         tags: list[str] | None = None
+        project: str | None = None
         i = 1
         while i < len(args):
-            if args[i] == "--source" and i + 1 < len(args):
+            if args[i] == "--project" and i + 1 < len(args):
+                project = args[i + 1]
+                i += 2
+            elif args[i] == "--source" and i + 1 < len(args):
                 source = args[i + 1]
                 i += 2
             elif args[i] == "--context" and i + 1 < len(args):
@@ -144,7 +154,7 @@ def main() -> None:
                 i += 2
             else:
                 i += 1
-        cmd_absorb(fact, source=source, context=context, tags=tags)
+        cmd_absorb(fact, source=source, context=context, tags=tags, project=project)
     else:
         print(f"unknown command: {cmd}", file=sys.stderr)
         sys.exit(1)
