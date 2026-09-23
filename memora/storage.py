@@ -2879,21 +2879,40 @@ def invalidate_corpus_cache(
 
 
 def _hydrate_memories_by_ids(conn: sqlite3.Connection, ids) -> Dict[int, sqlite3.Row]:
-    """Fetch full memory rows for a bounded set of ids in ONE IN query."""
+    """Fetch full memory rows for a bounded set of ids: one IN query per
+    _D1_MAX_BOUND_PARAMS ids (absorb hydrates every fact's top-5 at once)."""
     if not ids:
         return {}
     unique = list(dict.fromkeys(ids))
-    placeholders = ",".join("?" for _ in unique)
-    rows = conn.execute(f"SELECT * FROM memories WHERE id IN ({placeholders})", unique).fetchall()
-    return {row["id"]: row for row in rows}
+    out: Dict[int, sqlite3.Row] = {}
+    for chunk in _chunked(unique):
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(f"SELECT * FROM memories WHERE id IN ({placeholders})", chunk).fetchall():
+            out[row["id"]] = row
+    return out
 
 
-def _search_snapshot_full(conn: sqlite3.Connection, corpus: _CorpusSnapshot, vector, *, top_k: int = 5, min_score: Optional[float] = None):
+def _search_snapshot_full(
+    conn: sqlite3.Connection,
+    corpus: _CorpusSnapshot,
+    vector,
+    *,
+    top_k: int = 5,
+    min_score: Optional[float] = None,
+    prefetched: Optional[Tuple[List[Tuple[int, float]], Dict[int, sqlite3.Row]]] = None,
+):
     """Exhaustive snapshot search returning hydrated full memories, matching the
     ``_search_by_vector`` (no-filter) shape absorb relies on: [{score, memory}].
-    Top-k candidate ids are hydrated in ONE bounded IN query."""
-    ids_scores = corpus.search(vector, top_k=top_k, min_score=min_score)
-    rows = _hydrate_memories_by_ids(conn, [entry_id for entry_id, _ in ids_scores])
+    Top-k candidate ids are hydrated in ONE bounded IN query.
+
+    prefetched: (ids_scores, rows) already computed for this vector by a
+    batched caller (absorb phase 1 scores every fact, then hydrates the union
+    of their candidates at once); used as-is, with no DB access here."""
+    if prefetched is not None:
+        ids_scores, rows = prefetched
+    else:
+        ids_scores = corpus.search(vector, top_k=top_k, min_score=min_score)
+        rows = _hydrate_memories_by_ids(conn, [entry_id for entry_id, _ in ids_scores])
     return [
         {"score": score, "memory": _serialise_row(rows[entry_id])}
         for entry_id, score in ids_scores
@@ -3176,12 +3195,11 @@ def add_link(
     if edge_type not in EDGE_TYPES:
         raise ValueError(f"Invalid edge_type '{edge_type}'. Must be one of: {', '.join(sorted(EDGE_TYPES))}")
 
-    # Verify both memories exist
-    from_mem = get_memory(conn, from_id)
-    to_mem = get_memory(conn, to_id)
-    if not from_mem:
+    # Verify both memories exist. SELECT 1, not get_memory: the full row plus
+    # its crossref blob was two D1 round trips per endpoint for a yes/no.
+    if not _memory_exists(conn, from_id):
         raise ValueError(f"Memory {from_id} not found")
-    if not to_mem:
+    if not _memory_exists(conn, to_id):
         raise ValueError(f"Memory {to_id} not found")
 
     links_created = []
@@ -3319,6 +3337,7 @@ def _walk_chain(
     memory_id: int,
     edge_type: str,
     max_depth: int = _MAX_CHAIN_DEPTH,
+    view: Optional["_SupersessionView"] = None,
 ) -> List[int]:
     """Walk a chain of edges from a memory, returning ordered list of IDs.
 
@@ -3330,10 +3349,13 @@ def _walk_chain(
         memory_id: Starting memory ID
         edge_type: Edge type to follow (e.g. "superseded_by" to walk forward)
         max_depth: Maximum chain depth to prevent infinite loops
+        view: optional prefetched supersession neighborhood to read instead
+            of issuing get_crossrefs/_memory_exists per node
 
     Returns:
         List of memory IDs reachable via edge_type, in BFS order (starting with memory_id)
     """
+    crossrefs, exists = _graph_readers(conn, view)
     visited = {memory_id}
     chain = [memory_id]
     queue = [memory_id]
@@ -3342,12 +3364,12 @@ def _walk_chain(
     while queue and depth < max_depth:
         next_queue: List[int] = []
         for current in queue:
-            refs = get_crossrefs(conn, current)
+            refs = crossrefs(current)
             for ref in refs:
                 rid = ref["id"]
                 if (ref.get("edge_type") == edge_type
                         and rid not in visited
-                        and _memory_exists(conn, rid)):
+                        and exists(rid)):
                     visited.add(rid)
                     chain.append(rid)
                     next_queue.append(rid)
@@ -3469,6 +3491,62 @@ def _lookup_tombstone_by_hash(
     row = rows[0]
     reason = row["reason"] if isinstance(row, sqlite3.Row) else row[0]
     return reason or "deleted"
+
+
+def _lookup_tombstones_by_hash_batch(
+    conn: sqlite3.Connection, contents: List[str]
+) -> Dict[str, str]:
+    """_lookup_tombstone_by_hash for many contents: {content_hash: reason}.
+
+    Same precedence per hash as the single lookup — tombstone_components
+    first, the legacy tombstones table only for hashes it did not answer,
+    newest created_at then highest memory_id — in one IN query per table per
+    _D1_MAX_BOUND_PARAMS hashes instead of up to two queries per content.
+    """
+    digests = list(dict.fromkeys(content_tombstone_hash(c) for c in contents))
+    found: Dict[str, str] = {}
+    for table in ("tombstone_components", "tombstones"):
+        pending = [d for d in digests if d not in found]
+        best: Dict[str, Tuple[str, int, str]] = {}
+        for chunk in _chunked(pending):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = _select_retirement_rows(
+                conn,
+                table,
+                f"SELECT content_hash, reason, created_at, memory_id FROM {table} "
+                f"WHERE content_hash IN ({placeholders})",
+                tuple(chunk),
+            )
+            for row in rows:
+                digest = _row_field(row, 0, "content_hash")
+                rank = (
+                    _row_field(row, 2, "created_at") or "",
+                    int(_row_field(row, 3, "memory_id") or 0),
+                )
+                if digest not in best or rank > best[digest][:2]:
+                    best[digest] = (*rank, _row_field(row, 1, "reason") or "deleted")
+        for digest, (_created, _mid, reason) in best.items():
+            found[digest] = reason
+    return found
+
+
+def _retired_ids_among(conn: sqlite3.Connection, memory_ids: List[int]) -> set[int]:
+    """Which of memory_ids are retired (component marker or per-member
+    tombstone). Bounded form of retired_memory_ids: one IN query per table
+    per _D1_MAX_BOUND_PARAMS ids, with the same fail-closed error policy."""
+    unique = list(dict.fromkeys(int(m) for m in memory_ids))
+    out: set[int] = set()
+    for table in ("tombstone_components", "tombstones"):
+        for chunk in _chunked(unique):
+            placeholders = ",".join("?" for _ in chunk)
+            for row in _select_retirement_rows(
+                conn,
+                table,
+                f"SELECT memory_id FROM {table} WHERE memory_id IN ({placeholders})",
+                tuple(chunk),
+            ):
+                out.add(int(_row_field(row, 0, "memory_id")))
+    return out
 
 
 def _is_tombstoned_hash(conn: sqlite3.Connection, content: str) -> bool:
@@ -3618,37 +3696,171 @@ def _tombstone_component(
             )
 
 
+# Past this many nodes (or BFS levels) a neighborhood is not prefetched;
+# callers fall back to the per-row reads the view replaces.
+_SUPERSESSION_VIEW_MAX_NODES = 1000
+_SUPERSESSION_VIEW_MAX_LEVELS = 2 * _MAX_CHAIN_DEPTH
+_SUPERSESSION_EDGE_TYPES = ("supersedes", "superseded_by")
+
+
+class _SupersessionView:
+    """A read-only copy of one supersession neighborhood.
+
+    Holds, for every memory reachable from the seeds along supersedes /
+    superseded_by edges: its crossref list (as get_crossrefs returns it),
+    whether it exists, and whether it is retired. _walk_chain,
+    _get_full_history and _component_live_leaves only ever follow those two
+    edge types, so every read they make lands inside this set, and they
+    return what the per-row reads would have returned at load time.
+
+    Valid only until the next graph write: callers load one, answer their
+    questions, and discard it before linking.
+    """
+
+    def __init__(
+        self,
+        crossrefs: Dict[int, List[Dict[str, Any]]],
+        existing: set[int],
+        retired: set[int],
+    ) -> None:
+        self._crossrefs = crossrefs
+        self._existing = existing
+        self.retired = retired
+
+    def crossrefs(self, memory_id: int) -> List[Dict[str, Any]]:
+        return self._crossrefs.get(memory_id, [])
+
+    def exists(self, memory_id: int) -> bool:
+        return memory_id in self._existing
+
+
+def _graph_readers(conn: sqlite3.Connection, view: Optional[_SupersessionView]):
+    if view is not None:
+        return view.crossrefs, view.exists
+    return (
+        lambda mid: get_crossrefs(conn, mid),
+        lambda mid: _memory_exists(conn, mid),
+    )
+
+
+def _parse_crossrefs_blob(raw: Optional[str]) -> List[Dict[str, Any]]:
+    # Same tolerance as get_crossrefs: missing/invalid/non-list -> [].
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _load_supersession_view(
+    conn: sqlite3.Connection, seeds: List[int]
+) -> Optional[_SupersessionView]:
+    """Load the supersession neighborhood of seeds, one query per BFS level.
+
+    Each level is one ``memories LEFT JOIN memories_crossrefs`` query (per
+    _D1_MAX_BOUND_PARAMS ids): a returned row proves the id exists and
+    carries its crossrefs, a missing row means it does not exist. Only
+    existing ids are expanded, as _walk_chain only steps onto existing ids.
+    Retirement is then read for the whole set in two queries.
+
+    Replaces get_crossrefs + _memory_exists per node per walk (the old
+    _component_live_leaves re-read each node several times) with
+    O(depth) + 2 requests. Returns None when the neighborhood exceeds
+    _SUPERSESSION_VIEW_MAX_NODES / _MAX_LEVELS, so the caller reads per row.
+    """
+    crossrefs: Dict[int, List[Dict[str, Any]]] = {}
+    existing: set[int] = set()
+    checked: set[int] = set()
+    frontier = list(dict.fromkeys(int(s) for s in seeds))
+    levels = 0
+    while frontier:
+        levels += 1
+        if levels > _SUPERSESSION_VIEW_MAX_LEVELS or len(checked) + len(frontier) > _SUPERSESSION_VIEW_MAX_NODES:
+            return None
+        for chunk in _chunked(frontier):
+            placeholders = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                "SELECT m.id AS id, c.related AS related FROM memories m "
+                "LEFT JOIN memories_crossrefs c ON c.memory_id = m.id "
+                f"WHERE m.id IN ({placeholders})",
+                chunk,
+            ).fetchall():
+                mid = int(_row_field(row, 0, "id"))
+                existing.add(mid)
+                crossrefs[mid] = _parse_crossrefs_blob(_row_field(row, 1, "related"))
+        if levels == 1:
+            # The walks read a SEED's crossrefs even when its memory row is
+            # gone (e.g. deleted concurrently); only later steps require
+            # existence. Rare, so one extra query only when it happens.
+            missing = [mid for mid in frontier if mid not in existing]
+            for chunk in _chunked(missing):
+                placeholders = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    "SELECT memory_id, related FROM memories_crossrefs "
+                    f"WHERE memory_id IN ({placeholders})",
+                    chunk,
+                ).fetchall():
+                    crossrefs[int(_row_field(row, 0, "memory_id"))] = _parse_crossrefs_blob(
+                        _row_field(row, 1, "related")
+                    )
+        checked.update(frontier)
+        nxt: List[int] = []
+        for mid in frontier:
+            for ref in crossrefs.get(mid, []):
+                if not isinstance(ref, dict) or ref.get("edge_type") not in _SUPERSESSION_EDGE_TYPES:
+                    continue
+                rid = ref.get("id")
+                if isinstance(rid, int) and rid not in checked:
+                    nxt.append(rid)
+        frontier = list(dict.fromkeys(nxt))
+    retired = _retired_ids_among(conn, list(checked))
+    return _SupersessionView(crossrefs, existing, retired)
+
+
 def _component_live_leaves(
-    conn: sqlite3.Connection, memory_id: int
+    conn: sqlite3.Connection,
+    memory_id: int,
+    view: Optional["_SupersessionView"] = None,
 ) -> Tuple[List[int], bool]:
     """Live leaves of the full supersession component containing memory_id.
 
     Returns (leaves_sorted, is_cycle). is_cycle True means no leaves (SCC);
     caller must not collapse — use [max(component)] as today's fallback.
+
+    view: a neighborhood already loaded for memory_id since the last graph
+    write. When omitted, one is loaded fresh for this call (falling back to
+    per-row reads if the neighborhood exceeds the view's bounds), so a
+    caller that has written since can never be answered from stale data.
     """
-    if _is_tombstoned_id(conn, memory_id):
+    if view is None:
+        view = _load_supersession_view(conn, [memory_id])
+    crossrefs, exists = _graph_readers(conn, view)
+    retired = view.retired if view is not None else None
+    if _is_tombstoned_id(conn, memory_id, retired):
         return [], False
-    component = _get_full_history(conn, memory_id)
+    component = _get_full_history(conn, memory_id, view=view)
     if not component:
         return [memory_id], False
-    if any(_is_tombstoned_id(conn, mid) for mid in component):
+    if any(_is_tombstoned_id(conn, mid, retired) for mid in component):
         return [], False
     comp = set(component)
     leaves: List[int] = []
     for mid in component:
-        refs = get_crossrefs(conn, mid)
+        refs = crossrefs(mid)
         has_successor = any(
             ref.get("edge_type") == "superseded_by"
             and ref["id"] in comp
             and ref["id"] != mid
-            and _memory_exists(conn, ref["id"])
+            and exists(ref["id"])
             for ref in refs
         )
         if not has_successor:
             leaves.append(mid)
     if not leaves:
         return [max(component)], True
-    live = [mid for mid in leaves if not _is_tombstoned_id(conn, mid)]
+    live = [mid for mid in leaves if not _is_tombstoned_id(conn, mid, retired)]
     return sorted(live), False
 
 
@@ -3697,11 +3909,15 @@ def _resolve_absorb_supersedes_target(
 
     Cycle / no-leaf components keep the max(id) fallback and are never
     collapsed (collapsible=False). Dry-run and persist share this function.
+    Reads one fresh supersession neighborhood and answers every question
+    from it — no graph write happens in between.
     """
-    leaves, is_cycle = _component_live_leaves(conn, memory_id)
+    view = _load_supersession_view(conn, [memory_id])
+    retired = view.retired if view is not None else None
+    leaves, is_cycle = _component_live_leaves(conn, memory_id, view=view)
     if is_cycle:
-        component = _get_full_history(conn, memory_id)
-        if component and all(_is_tombstoned_id(conn, mid) for mid in component):
+        component = _get_full_history(conn, memory_id, view=view)
+        if component and all(_is_tombstoned_id(conn, mid, retired) for mid in component):
             return {
                 "targets": [],
                 "collapsible": False,
@@ -3778,22 +3994,28 @@ def _is_superseded(conn: sqlite3.Connection, memory_id: int) -> bool:
     return False
 
 
-def _get_full_history(conn: sqlite3.Connection, memory_id: int) -> List[int]:
+def _get_full_history(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    view: Optional["_SupersessionView"] = None,
+) -> List[int]:
     """Get the full supersession graph containing this memory.
 
     Walks backward to find all roots, then forward to find all descendants.
     Returns all unique IDs in the connected component (BFS order from roots).
+    view: optional prefetched neighborhood (see _load_supersession_view).
     """
+    crossrefs, exists = _graph_readers(conn, view)
     # Walk backward to find all ancestors (roots)
-    ancestors = _walk_chain(conn, memory_id, "supersedes")
+    ancestors = _walk_chain(conn, memory_id, "supersedes", view=view)
     # The roots are the leaves of the backward walk
     roots: set[int] = set()
     for mid in ancestors:
-        refs = get_crossrefs(conn, mid)
+        refs = crossrefs(mid)
         has_parent = any(
             ref.get("edge_type") == "supersedes"
             and ref["id"] not in {mid}
-            and _memory_exists(conn, ref["id"])
+            and exists(ref["id"])
             for ref in refs
         )
         if not has_parent:
@@ -3805,7 +4027,7 @@ def _get_full_history(conn: sqlite3.Connection, memory_id: int) -> List[int]:
     all_ids: List[int] = []
     seen: set[int] = set()
     for root in sorted(roots):
-        for mid in _walk_chain(conn, root, "superseded_by"):
+        for mid in _walk_chain(conn, root, "superseded_by", view=view):
             if mid not in seen:
                 seen.add(mid)
                 all_ids.append(mid)
@@ -4984,138 +5206,256 @@ def _absorb_classify_fact_safe(
         return [], [], e
 
 
+def _is_strict_embedding_failure(exc: BaseException) -> bool:
+    """Embedding failures absorb must propagate rather than skip the fact."""
+    from memora.embeddings import EmbeddingProviderError, EmbeddingStrictError
+    return isinstance(exc, (EmbeddingStrictError, EmbeddingProviderError)) or (
+        isinstance(exc, RuntimeError) and "MEMORA_EMBEDDING_STRICT" in str(exc)
+    )
+
+
+def _compute_embeddings_many(
+    entries: List[Tuple[str, Optional[Dict[str, Any]], List[str]]],
+) -> List[Dict[str, float]]:
+    """Embed several (content, metadata, tags) entries.
+
+    The dense "openai" backend (any OpenAI-compatible host, including the
+    Ollama bge-m3 host) gets ONE batch request; compute_embeddings_batch
+    assembles each text exactly like compute_embedding does. Every other
+    backend embeds one at a time through _compute_embedding — which is what
+    compute_embeddings_batch would do for them anyway.
+    """
+    if not entries:
+        return []
+    if EMBEDDING_MODEL == "openai" and len(entries) > 1:
+        absorb_count("embedding_requests")
+        absorb_count("embedding_texts", len(entries))
+        vectors = _compute_embeddings_batch(
+            [{"content": c, "metadata": m, "tags": t or []} for c, m, t in entries],
+            EMBEDDING_MODEL,
+        )
+        if len(vectors) != len(entries):
+            raise RuntimeError(
+                f"embedding batch returned {len(vectors)} vectors for {len(entries)} texts"
+            )
+        return vectors
+    out = []
+    for content, meta, entry_tags in entries:
+        absorb_count("embedding_requests")
+        absorb_count("embedding_texts")
+        out.append(_compute_embedding(content, meta, entry_tags or []))
+    return out
+
+
+def _absorb_fact_vectors(facts: List[str]) -> List[Any]:
+    """Phase-1 search vectors for facts: a vector, or the exception for that fact.
+
+    One batch request when the backend supports it. If the batch fails with a
+    non-strict error, fall back to one request per fact so a single bad input
+    cannot sink the others (the pre-batch per-fact skip semantics). Strict
+    and provider failures propagate, exactly as the per-fact path did.
+    """
+    try:
+        return _compute_embeddings_many([(f, None, []) for f in facts])
+    except Exception as e:
+        if _is_strict_embedding_failure(e):
+            raise
+        if len(facts) == 1:
+            return [e]
+        logger.warning("Absorb batch embedding failed, retrying per fact: %s", e)
+    out: List[Any] = []
+    for f in facts:
+        try:
+            out.extend(_compute_embeddings_many([(f, None, [])]))
+        except Exception as e:
+            if _is_strict_embedding_failure(e):
+                raise
+            out.append(e)
+    return out
+
+
 def _absorb_phase1_prepare(
     fact: str,
     conn: sqlite3.Connection,
     corpus: _CorpusSnapshot,
 ) -> Dict[str, Any]:
-    """Everything about one fact up to (but not including) LLM classification.
+    """Single-fact form of _absorb_phase1_prepare_batch."""
+    return _absorb_phase1_prepare_batch([fact], conn, corpus)[0]
 
-    Touches conn (tombstone lookup, match hydration) and must run on the
-    caller's thread — absorb_memory's concurrent phase starts only after
-    this returns, and only for facts this resolves to kind="classify".
 
-    Returns one of:
+def _absorb_phase1_prepare_batch(
+    facts: List[str],
+    conn: sqlite3.Connection,
+    corpus: _CorpusSnapshot,
+) -> List[Dict[str, Any]]:
+    """Everything about each fact up to (but not including) LLM classification.
+
+    Touches conn and must run on the caller's thread — absorb_memory's
+    concurrent phase starts only after this returns, and only for facts this
+    resolves to kind="classify".
+
+    Batched across facts so the D1 request count does not scale with the
+    fact count: one tombstone-hash lookup (_lookup_tombstones_by_hash_batch),
+    one embedding request (_absorb_fact_vectors), one hydration of the
+    union of every fact's top-5 candidates, and one retirement lookup for
+    that union (_retired_ids_among). These are READ-SNAPSHOT checks only;
+    phase 3 re-checks retirement fresh at the write boundary.
+
+    Returns, per input fact in order, one of:
       {"kind": "decision", "decision": {...}, "counts": {...}}
       {"kind": "pending", "pending_create": (...), "counts": {...}}
       {"kind": "classify", "fact", "vector", "match_data", "top_mem"}
     """
-    fact = fact.strip()
-    if len(fact) < 3:
-        return {
+    results: List[Optional[Dict[str, Any]]] = [None] * len(facts)
+
+    def _skip(i: int, fact: str, reason: str) -> None:
+        results[i] = {
             "kind": "decision",
-            "decision": {"fact": fact[:80], "action": "skipped", "reason": "too short"},
+            "decision": {"fact": fact[:80], "action": "skipped", "reason": reason},
             "counts": {"skipped": 1},
         }
 
-    # Redact secrets
-    redacted_fact, secrets = _redact_secrets(fact)
-    if secrets:
-        fact = redacted_fact
+    staged: List[Tuple[int, str]] = []
+    for i, raw in enumerate(facts):
+        fact = raw.strip()
+        if len(fact) < 3:
+            _skip(i, fact, "too short")
+            continue
+        # Redact secrets
+        redacted_fact, secrets = _redact_secrets(fact)
+        if secrets:
+            fact = redacted_fact
+        staged.append((i, fact))
 
-    tombstone_reason = _lookup_tombstone_by_hash(conn, fact)
-    if tombstone_reason is not None:
-        return {
-            "kind": "decision",
-            "decision": {"fact": fact[:80], "action": "tombstoned", "reason": tombstone_reason},
-            "counts": {"tombstoned": 1, "skipped": 1},
-        }
+    tombstone_reasons = _lookup_tombstones_by_hash_batch(conn, [f for _, f in staged])
+    to_embed: List[Tuple[int, str]] = []
+    for i, fact in staged:
+        tombstone_reason = tombstone_reasons.get(content_tombstone_hash(fact))
+        if tombstone_reason is not None:
+            results[i] = {
+                "kind": "decision",
+                "decision": {"fact": fact[:80], "action": "tombstoned", "reason": tombstone_reason},
+                "counts": {"tombstoned": 1, "skipped": 1},
+            }
+            continue
+        to_embed.append((i, fact))
 
     # Search for similar existing memories.
-    # N6: initialize vector before try so a strict embedding failure cannot
-    # leave UnboundLocalError below.
-    vector = None
-    try:
-        with absorb_phase("embeddings"):
-            absorb_count("embedding_requests")
-            absorb_count("embedding_texts")
-            vector = _compute_embedding(fact, None, [])
+    with absorb_phase("embeddings"):
+        vectors = _absorb_fact_vectors([f for _, f in to_embed]) if to_embed else []
+    searched: List[Tuple[int, str, Dict[str, float], Optional[List[Tuple[int, float]]]]] = []
+    for (i, fact), vector in zip(to_embed, vectors):
+        if isinstance(vector, BaseException):
+            logger.warning("Absorb search failed for fact: %s — %s", fact[:50], vector)
+            _skip(i, fact, f"embedding/search failed: {type(vector).__name__}: {vector}")
+            continue
         if not vector:
-            return {
+            _skip(i, fact, "embedding failed")
+            continue
+        # Pre-score in memory so hydration can be batched. A vector the
+        # corpus cannot score is left to _search_snapshot_full, which reports
+        # (or, in tests, stubs) it per fact exactly as before batching.
+        ids_scores: Optional[List[Tuple[int, float]]]
+        try:
+            ids_scores = corpus.search(vector, top_k=5, min_score=_ABSORB_RELATED_THRESHOLD)
+        except Exception:
+            ids_scores = None
+        searched.append((i, fact, vector, ids_scores))
+
+    # One hydration for the union of every fact's candidates, then the
+    # per-fact seam (_search_snapshot_full) consumes it without DB access.
+    candidate_ids = list(dict.fromkeys(
+        mid for *_, ids in searched if ids is not None for mid, _ in ids
+    ))
+    rows: Dict[int, sqlite3.Row] = {}
+    try:
+        rows = _hydrate_memories_by_ids(conn, candidate_ids)
+    except Exception as e:
+        if _is_strict_embedding_failure(e):
+            raise
+        logger.warning("Absorb candidate hydration failed: %s", e, exc_info=True)
+        for i, fact, _v, _ids in searched:
+            _skip(i, fact, f"embedding/search failed: {type(e).__name__}: {e}")
+        searched = []
+    with_matches: List[Tuple[int, str, Dict[str, float], List[Dict[str, Any]]]] = []
+    for i, fact, vector, ids_scores in searched:
+        try:
+            matches = _search_snapshot_full(
+                conn, corpus, vector, top_k=5, min_score=_ABSORB_RELATED_THRESHOLD,
+                prefetched=(ids_scores, rows) if ids_scores is not None else None,
+            )
+        except Exception as e:
+            if _is_strict_embedding_failure(e):
+                raise
+            logger.warning("Absorb search failed for fact: %s — %s", fact[:50], e, exc_info=True)
+            _skip(i, fact, f"embedding/search failed: {type(e).__name__}: {e}")
+            continue
+        # Exclude document fragments/roots — they are structural, not standalone
+        matches = [
+            m for m in matches
+            if not _is_document_memory((m.get("memory") or m).get("metadata"))
+        ]
+        with_matches.append((i, fact, vector, matches))
+
+    # Retired component members stay in the table but are not absorb targets.
+    # One lookup for every fact's matches. Not wrapped: a failing retirement
+    # query raises RetirementIntegrityError, as the per-match probe it
+    # replaces did.
+    match_ids = [(m.get("memory") or m)["id"] for *_, ms in with_matches for m in ms]
+    retired = _retired_ids_among(conn, match_ids) if match_ids else set()
+
+    for i, fact, vector, matches in with_matches:
+        matches = [m for m in matches if (m.get("memory") or m)["id"] not in retired]
+
+        # No similar memories — queue for creation (vector is guaranteed set here)
+        if not matches:
+            results[i] = {
+                "kind": "pending",
+                "pending_create": (fact, vector, None, []),
+                "counts": {},
+            }
+            continue
+
+        # Check for high-similarity duplicate first (skip LLM if obvious)
+        top_match = matches[0]
+        top_score = top_match.get("score", 0)
+        top_mem = top_match.get("memory", top_match)
+
+        if top_score >= _ABSORB_DUPLICATE_THRESHOLD:
+            results[i] = {
                 "kind": "decision",
-                "decision": {"fact": fact[:80], "action": "skipped", "reason": "embedding failed"},
+                "decision": {
+                    "fact": fact[:80],
+                    "action": "skipped",
+                    "reason": f"duplicate of #{top_mem['id']} (similarity: {top_score:.2f})",
+                    "match_id": top_mem["id"],
+                },
                 "counts": {"skipped": 1},
             }
+            continue
 
-        matches = _search_snapshot_full(
-            conn, corpus, vector, top_k=5, min_score=_ABSORB_RELATED_THRESHOLD,
-        )
-    except Exception as e:
-        # N6: strict mode must fail cleanly (named provider error), not as
-        # UnboundLocalError after matches=[] falls through to pending_creates.
-        from memora.embeddings import EmbeddingProviderError, EmbeddingStrictError
-        if isinstance(e, (EmbeddingStrictError, EmbeddingProviderError)) or (
-            isinstance(e, RuntimeError) and "MEMORA_EMBEDDING_STRICT" in str(e)
-        ):
-            raise
-        logger.warning("Absorb search failed for fact: %s — %s", fact[:50], e, exc_info=True)
-        return {
-            "kind": "decision",
-            "decision": {
-                "fact": fact[:80],
-                "action": "skipped",
-                "reason": f"embedding/search failed: {type(e).__name__}: {e}",
-            },
-            "counts": {"skipped": 1},
-        }
-
-    # Exclude document fragments/roots — they are structural, not standalone
-    matches = [
-        m for m in matches
-        if not _is_document_memory(
-            (m.get("memory") or m).get("metadata")
-        )
-    ]
-    # Retired component members stay in the table but are not absorb targets.
-    matches = [
-        m for m in matches
-        if not _is_tombstoned_id(conn, (m.get("memory") or m)["id"])
-    ]
-
-    # No similar memories — queue for creation (vector is guaranteed set here)
-    if not matches:
-        return {
-            "kind": "pending",
-            "pending_create": (fact, vector, None, []),
-            "counts": {},
-        }
-
-    # Check for high-similarity duplicate first (skip LLM if obvious)
-    top_match = matches[0]
-    top_score = top_match.get("score", 0)
-    top_mem = top_match.get("memory", top_match)
-
-    if top_score >= _ABSORB_DUPLICATE_THRESHOLD:
-        return {
-            "kind": "decision",
-            "decision": {
-                "fact": fact[:80],
-                "action": "skipped",
-                "reason": f"duplicate of #{top_mem['id']} (similarity: {top_score:.2f})",
-                "match_id": top_mem["id"],
-            },
-            "counts": {"skipped": 1},
-        }
-
-    # Needs LLM classification — defer the (slow) call to the caller's
-    # concurrent phase. Build match_data now while matches/conn are at hand.
-    match_data = []
-    for m in matches[:3]:
-        mem = m.get("memory", m)
-        if isinstance(mem, dict) and "id" in mem:
+        # Needs LLM classification — defer the (slow) call to the caller's
+        # concurrent phase.
+        match_data = []
+        for m in matches[:3]:
+            mem = m.get("memory", m)
+            if not (isinstance(mem, dict) and "id" in mem):
+                continue
             match_data.append({
                 "id": mem["id"],
                 "content": mem.get("content", ""),
                 "score": m.get("score", 0),
                 "tags": mem.get("tags", []),
+                "created_at": mem.get("created_at"),
             })
-    return {
-        "kind": "classify",
-        "fact": fact,
-        "vector": vector,
-        "match_data": match_data,
-        "top_mem": top_mem,
-    }
+        results[i] = {
+            "kind": "classify",
+            "fact": fact,
+            "vector": vector,
+            "match_data": match_data,
+            "top_mem": top_mem,
+        }
+    return results  # type: ignore[return-value]
 
 
 def _absorb_resolve_classification(
@@ -5374,7 +5714,7 @@ def _absorb_memory_impl(
     pending_creates: List[tuple] = []  # (fact, vector, link_info_or_None, suggested_tags)
 
     with absorb_phase("phase1_prep"):
-        prepared = [_absorb_phase1_prepare(fact, conn, corpus) for fact in facts]
+        prepared = _absorb_phase1_prepare_batch(list(facts), conn, corpus)
     classify_indices = [i for i, p in enumerate(prepared) if p["kind"] == "classify"]
     absorb_count("llm_classify_calls", len(classify_indices))
 
@@ -5549,13 +5889,17 @@ def _absorb_memory_impl(
         return {"decisions": decisions, **counts}
 
     # Precompute ALL storage embeddings from final content + merged_meta + tags.
+    # One batch request on the dense backend. Phase-1 vectors cannot be
+    # reused here: they embed the bare fact, these embed content + merged_meta
+    # (always non-empty: source, confidence) + tags, a different text.
     with absorb_phase("embeddings"):
-        for job in phase3_jobs:
-            absorb_count("embedding_requests")
-            absorb_count("embedding_texts")
-            job["vector"] = _compute_embedding(job["content"], merged_meta, job["tags"] or [])
-            if not job["vector"]:
-                raise RuntimeError("absorb phase-3 embedding returned empty vector")
+        vectors = _compute_embeddings_many(
+            [(job["content"], merged_meta, job["tags"] or []) for job in phase3_jobs]
+        )
+    for job, vector in zip(phase3_jobs, vectors):
+        job["vector"] = vector
+        if not job["vector"]:
+            raise RuntimeError("absorb phase-3 embedding returned empty vector")
 
     # owned_ids tracks every INSERT id, even if add_memory fails mid-function (P1-1).
     # absorb_inflight tracking (durable nonce, committed before any writes)
@@ -5603,10 +5947,12 @@ def _absorb_memory_impl(
                     hook = _after_absorb_resolve
                     if hook is not None:
                         hook(plan)
+                    # Fresh read (after the hook), batched: 2 queries for
+                    # every target instead of 2 per target.
                     with absorb_phase("supersede_resolve"):
-                        retired_at_boundary = plan.get("tombstoned") or any(
-                            _is_tombstoned_id(conn, tid) for tid in plan.get("targets") or []
-                        ) or _is_tombstoned_id(conn, target_id)
+                        retired_at_boundary = bool(plan.get("tombstoned")) or bool(
+                            _retired_ids_among(conn, list(plan.get("targets") or []) + [target_id])
+                        )
                     if retired_at_boundary:
                         ok = delete_memory(
                             conn, record["id"], require_absorb_nonce=absorb_nonce,
@@ -5663,8 +6009,8 @@ def _absorb_memory_impl(
                     # delete-side rewalk that marked this new leaf) must not
                     # leave N current. Compensate the absorb row.
                     with absorb_phase("final_checks"):
-                        retired_after_link = _is_tombstoned_id(conn, record["id"]) or any(
-                            _is_tombstoned_id(conn, tid) for tid in linked_ids
+                        retired_after_link = bool(
+                            _retired_ids_among(conn, [record["id"], *linked_ids])
                         )
                     if retired_after_link:
                         ok = delete_memory(

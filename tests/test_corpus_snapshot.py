@@ -71,6 +71,9 @@ def test_absorb_scan_once_equals_per_fact_exhaustive(tmp_path, monkeypatch):
     original = storage._search_snapshot_full
 
     def exhaustive_delegate(conn, corpus, vector, **kwargs):
+        # The batched phase 1 hands over its own scoring; ignore it and
+        # re-score exhaustively, as the pre-snapshot absorb did.
+        kwargs.pop("prefetched", None)
         return storage._search_by_vector(conn, vector, **kwargs)
 
     monkeypatch.setattr(storage, "_search_snapshot_full", exhaustive_delegate)
