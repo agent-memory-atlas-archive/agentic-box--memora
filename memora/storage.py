@@ -5974,8 +5974,13 @@ def _verify_absorb_supersede_llm(
     old_tags: Optional[List[str]] = None,
     new_tags: Optional[List[str]] = None,
     old_created_at: Optional[str] = None,
+    old_type: Optional[str] = None,
+    new_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Second, narrow check before absorb supersedes old_id with new_fact.
+
+    Both sides' metadata.type is shown (the gate only calls this for a
+    same-type pair; see _absorb_check_supersede's type boundary).
 
     The classifier saw up to three candidates truncated to a few hundred
     characters and answered for all of them at once; this call sees ONE pair
@@ -6015,13 +6020,15 @@ def _verify_absorb_supersede_llm(
     blocks = [
         _data_block(
             "OLD_MEMORY",
-            f"id: {old_id}\ncreated: {old_created_at or 'unknown'}\ntags: {json.dumps(old_tags or [])}\n"
+            f"id: {old_id}\ncreated: {old_created_at or 'unknown'}\ntype: {_type_label(old_type)}\n"
+            f"tags: {json.dumps(old_tags or [])}\n"
             f"text:\n{old_content[:_SUPERSEDE_VERIFY_MAX_CHARS]}",
             nonce,
         ),
         _data_block(
             "NEW_FACT",
-            f"tags: {json.dumps(new_tags or [])}\ntext:\n{new_fact[:_SUPERSEDE_VERIFY_MAX_CHARS]}",
+            f"type: {_type_label(new_type)}\ntags: {json.dumps(new_tags or [])}\n"
+            f"text:\n{new_fact[:_SUPERSEDE_VERIFY_MAX_CHARS]}",
             nonce,
         ),
     ]
@@ -6046,7 +6053,7 @@ different entities.
 
 Answer each question strictly, about the two texts' subjects:
 - same_project: are both about the same project?
-- same_entity: are both about the same specific thing (the same design, decision, setting, component state or piece of work), not merely the same area?
+- same_entity: are both about the same specific thing (the same design, decision, setting, component state or piece of work), not merely the same area? Each block states its memory type (todo, issue, section, document, or plain memory).
 - fully_replaces: does the NEW fact make EVERY claim in the OLD memory outdated or wrong? If the OLD memory holds anything the NEW fact does not restate or overturn, answer false.
 - related: are they meaningfully related at all?
 When unsure, answer false.
@@ -6147,11 +6154,26 @@ def _absorb_leaf_infos(
             "content": mem.get("content", ""),
             "tags": mem.get("tags", []),
             "created_at": mem.get("created_at"),
+            "type": _memory_type((mem.get("metadata") or {}).get("type")
+                                 if isinstance(mem.get("metadata"), dict) else None),
             "score": float(score),
             "vector": vec,
             "fingerprint": _leaf_fingerprint(mem.get("content", ""), mem.get("tags", [])),
         }
     return out
+
+
+def _memory_type(value: Any) -> Optional[str]:
+    """A memory's metadata.type for the supersede type boundary: a non-empty
+    string (todo, issue, section, document_root, document_fragment, ...), or
+    None for a plain memory."""
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return None
+
+
+def _type_label(value: Optional[str]) -> str:
+    return value or "plain memory"
 
 
 def _absorb_check_supersede(
@@ -6161,19 +6183,31 @@ def _absorb_check_supersede(
     *,
     caller_tags: Optional[List[str]] = None,
     context: Optional[str] = None,
+    fact_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Gate superseding ONE leaf (see _absorb_leaf_infos for its shape).
 
-    A deterministic guard first (no LLM call): the fact's similarity to this
-    leaf. Only a leaf that passes it reaches the LLM check, which also sees
+    TYPE BOUNDARY first (no LLM call): a supersession never crosses
+    metadata.type -- a plain narrative fact must not hide an open todo or
+    issue, nor a todo a section (memora issue memory 1126: narrative #1122
+    superseded open todo #1118). A leaf whose type differs from the new
+    fact's (fact_type; None = plain memory) is downgraded to RELATED, with
+    type_mismatch reported. Then a deterministic guard: the fact's
+    similarity to this leaf. Only a leaf that passes it reaches the LLM check, which also sees
     both sides' tags. Returns the check dict (see _verify_absorb_supersede_llm)
     with "gate" naming the step that decided, plus "leaf_id", "score" and
     the leaf's text for the audit log. Pure apart from the one LLM call —
     safe on a worker thread.
     """
     score = float(leaf.get("score") or 0.0)
+    old_type, new_type = _memory_type(leaf.get("type")), _memory_type(fact_type)
     audit = {"leaf_id": leaf["id"], "score": score, "old_text": leaf.get("content", ""),
-             "fingerprint": leaf.get("fingerprint")}
+             "fingerprint": leaf.get("fingerprint"), "old_type": old_type, "new_type": new_type}
+    if old_type != new_type:
+        return {**audit, "verdict": "related", "gate": "type", "type_mismatch": True,
+                "same_project": False, "same_entity": False, "fully_replaces": False, "related": True,
+                "reason": (f"type boundary: the new fact is a {_type_label(new_type)}, the leaf a "
+                           f"{_type_label(old_type)}; a supersession never crosses types")}
     if score < _ABSORB_SUPERSEDE_MIN_SCORE:
         return {**audit, "verdict": "related", "gate": "score",
                 "reason": f"similarity {score:.2f} below supersede minimum {_ABSORB_SUPERSEDE_MIN_SCORE:.2f}"}
@@ -6183,6 +6217,7 @@ def _absorb_check_supersede(
         old_id=leaf["id"], score=score, context=context,
         old_tags=leaf.get("tags"), new_tags=new_tags,
         old_created_at=leaf.get("created_at"),
+        old_type=old_type, new_type=new_type,
     )
     return {**audit, **check, "gate": "llm"}
 
@@ -6193,12 +6228,13 @@ def _absorb_check_supersede_safe(
     suggested_tags: List[str],
     caller_tags: Optional[List[str]],
     context: Optional[str],
+    fact_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """_absorb_check_supersede; any unexpected raise becomes a rejection of
     this leaf (never a supersession)."""
     try:
         return _absorb_check_supersede(
-            fact, leaf, suggested_tags, caller_tags=caller_tags, context=context,
+            fact, leaf, suggested_tags, caller_tags=caller_tags, context=context, fact_type=fact_type,
         )
     except Exception as e:
         logger.warning("Absorb supersede check raised for #%s: %s", leaf.get("id"), e, exc_info=True)
@@ -6211,6 +6247,7 @@ def _absorb_run_leaf_checks(
     tasks: List[Tuple[Any, str, Dict[str, Any], List[str]]],
     caller_tags: Optional[List[str]],
     context: Optional[str],
+    fact_type: Optional[str] = None,
 ) -> Dict[Any, Dict[str, Any]]:
     """Run _absorb_check_supersede_safe for (key, fact, leaf, suggested_tags)
     tasks, on the absorb classify pool size, and return {key: check}."""
@@ -6219,13 +6256,13 @@ def _absorb_run_leaf_checks(
     concurrency = min(_resolve_absorb_concurrency(), len(tasks))
     if concurrency <= 1:
         return {
-            key: _absorb_check_supersede_safe(fact, leaf, sugg, caller_tags, context)
+            key: _absorb_check_supersede_safe(fact, leaf, sugg, caller_tags, context, fact_type)
             for key, fact, leaf, sugg in tasks
         }
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {
-            key: pool.submit(_absorb_check_supersede_safe, fact, leaf, sugg, caller_tags, context)
+            key: pool.submit(_absorb_check_supersede_safe, fact, leaf, sugg, caller_tags, context, fact_type)
             for key, fact, leaf, sugg in tasks
         }
         return {key: f.result() for key, f in futures.items()}
@@ -6276,7 +6313,9 @@ def _absorb_partition_targets(
         else:
             absorb_count("regated_supersede_checks")
             logger.info("absorb supersede: leaf #%s changed since verification; re-checking", t)
-        checks[t] = _absorb_check_supersede_safe(job["content"], info, [], job.get("tags"), context)
+        checks[t] = _absorb_check_supersede_safe(
+            job["content"], info, [], job.get("tags"), context, job.get("fact_type"),
+        )
     passing = [t for t in targets if checks[t].get("verdict") == "supersede"]
     rejected = {t: checks[t] for t in targets if t not in passing}
     return passing, rejected
@@ -6306,7 +6345,10 @@ def _absorb_check_sibling_pair(
     vn, vo = newer.get("vector"), older.get("vector")
     leaf = dict(older, score=float(_cosine_similarity(vn, vo)) if (vn and vo) else 0.0)
     absorb_count("sibling_supersede_checks")
-    return _absorb_check_supersede_safe(newer["content"], leaf, [], newer.get("tags"), context)
+    # Same type boundary as a leaf: siblings of different types never collapse.
+    return _absorb_check_supersede_safe(
+        newer["content"], leaf, [], newer.get("tags"), context, newer.get("type"),
+    )
 
 
 def _absorb_best_related_leaf(rejected: Dict[int, Dict[str, Any]]) -> Optional[int]:
@@ -6322,6 +6364,7 @@ def _supersede_check_summary(check: Optional[Dict[str, Any]]) -> Optional[Dict[s
         return None
     out = {k: check.get(k) for k in (
         "leaf_id", "gate", "verdict", "reason", "same_project", "same_entity", "fully_replaces",
+        "type_mismatch", "old_type", "new_type",
     ) if k in check}
     out["score"] = round(float(check.get("score") or 0.0), 4)
     return out
@@ -6909,8 +6952,10 @@ def _absorb_gate_updates(
     *,
     caller_tags: Optional[List[str]],
     context: Optional[str],
+    fact_type: Optional[str] = None,
 ) -> Dict[int, Dict[str, Any]]:
     """Gate every classifier UPDATE against the leaves it would supersede.
+    fact_type: the metadata.type every new fact of this absorb gets.
 
     Phase 3 never supersedes the classifier's candidate as such: it
     re-resolves it to every live leaf of its component and supersedes those.
@@ -6945,7 +6990,7 @@ def _absorb_gate_updates(
                     continue
                 tasks.append(((i, leaf_id), prepared[i]["fact"], leaf, suggested_tags))
     with absorb_phase("supersede_verify"):
-        results = _absorb_run_leaf_checks(tasks, caller_tags, context)
+        results = _absorb_run_leaf_checks(tasks, caller_tags, context, fact_type)
     for (i, leaf_id), check in results.items():
         gates[i]["checks"][leaf_id] = check
     absorb_count(
@@ -7118,6 +7163,7 @@ def _absorb_memory_impl(
             )
         supersede_gates = _absorb_gate_updates(
             conn, corpus, prepared, classify_results, caller_tags=tags, context=context,
+            fact_type=_memory_type((metadata or {}).get("type")),
         )
 
     # Resolve every fact IN ORIGINAL ORDER, regardless of classify completion
@@ -7220,6 +7266,9 @@ def _absorb_memory_impl(
             "kind": "linked",
             "source_facts": None,
         })
+    for job in phase3_jobs:
+        # Every new row is written with merged_meta: its type bounds the gate.
+        job["fact_type"] = _memory_type(merged_meta.get("type"))
 
     if dry_run:
         for job in phase3_jobs:

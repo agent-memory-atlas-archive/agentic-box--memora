@@ -522,3 +522,91 @@ def test_llm_bool_coercion_is_strict():
     assert storage._coerce_llm_bool("yes") is True
     for v in (False, "false", "no", None, 1, "maybe", ""):
         assert storage._coerce_llm_bool(v) is False
+
+
+# --- type boundary (memora issue memory 1126: narrative #1122 superseded open todo #1118) ---
+
+OPEN_TODO = "TODO: wire the sidebar health dot to /health/db/<store> and show stale proofs in amber."
+NARRATIVE = ("The sidebar health dot is wired to /health/db/<store>; it reiterates and confirms "
+             "the plan to show stale proofs in amber.")
+
+
+@pytest.mark.parametrize("leaf_type", ["todo", "issue", "section"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_a_plain_fact_never_supersedes_a_typed_leaf(fake_d1_backend, monkeypatch, leaf_type, dry_run):
+    with storage.connect() as conn:
+        leaf = storage.add_memory(conn, content=OPEN_TODO, metadata={"type": leaf_type},
+                                  tags=["clmux/ideas"])
+    # verify=None: the gate must decide without an LLM call.
+    llm = FakeLLM(classify=_update(leaf["id"], "reiterates and confirms the todo"))
+    result, active, crossrefs = _absorb(monkeypatch, llm, leaf, NARRATIVE, dry_run=dry_run)
+    (decision,) = result["decisions"]
+    assert decision["downgraded_from"] == "UPDATE"
+    check = decision["supersede_check"]
+    assert check["gate"] == "type" and check["verdict"] == "related" and check["type_mismatch"] is True
+    assert check["old_type"] == leaf_type and check["new_type"] is None
+    assert any(c.get("type_mismatch") for c in decision["leaf_checks"])
+    assert llm.verify_prompts() == []
+    assert leaf["id"] in active  # the open item stays live
+    if not dry_run:
+        assert decision["action"] == "linked" and result["superseded"] == 0
+        assert all(r.get("edge_type") != "superseded_by" for r in crossrefs)
+        assert any(r["id"] == decision["memory_id"] and r.get("edge_type") == "related_to" for r in crossrefs)
+
+
+def test_a_typed_fact_never_supersedes_a_plain_leaf(seeded, monkeypatch):
+    llm = FakeLLM(classify=_update(seeded["id"]))
+    result, active, _ = _absorb(monkeypatch, llm, seeded, PI_CHANNEL_WORK,
+                                metadata={"type": "todo"})
+    (decision,) = result["decisions"]
+    assert decision["supersede_check"]["gate"] == "type"
+    assert decision["supersede_check"]["new_type"] == "todo" and seeded["id"] in active
+
+
+def test_an_issue_fact_can_still_supersede_an_issue_leaf(fake_d1_backend, monkeypatch):
+    with storage.connect() as conn:
+        leaf = storage.add_memory(conn, content="ISSUE: the proxy drops idle connections after 60 s.",
+                                  metadata={"type": "issue"}, tags=["clmux/ideas"])
+    fact = "ISSUE: the proxy drops idle connections after 60 s; root cause is the nginx keepalive default."
+    llm = FakeLLM(classify=_update(leaf["id"], "same issue, root cause found"), verify=_verdict(True, True, True))
+    result, active, _ = _absorb(monkeypatch, llm, leaf, fact, metadata={"type": "issue"})
+    (decision,) = result["decisions"]
+    assert decision["action"] == "superseded" and decision["supersede_check"]["gate"] == "llm"
+    assert leaf["id"] not in active
+    # The verifier sees both sides' type.
+    (vp,) = llm.verify_prompts()
+    assert "type: issue" in _old_block(vp)
+    new_block = vp[vp.index("<<<NEW_FACT_"):vp.index("<<<END_NEW_FACT_")]
+    assert "type: issue" in new_block
+
+
+def test_plain_pairs_show_their_type_to_the_verifier(seeded, monkeypatch):
+    llm = FakeLLM(classify=_update(seeded["id"]), verify=_verdict(True, False, False))
+    _absorb(monkeypatch, llm, seeded, PI_CHANNEL_WORK)
+    (vp,) = llm.verify_prompts()
+    assert "type: plain memory" in _old_block(vp)
+
+
+def test_sibling_pairs_of_different_types_never_collapse(fake_d1_backend, monkeypatch):
+    llm = FakeLLM(classify=_update(0), verify=None)  # a verifier call would fail the test
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: llm)
+    with storage.connect() as conn:
+        todo = storage.add_memory(conn, content=OPEN_TODO, metadata={"type": "todo"}, tags=["clmux/ideas"])
+        plain = storage.add_memory(conn, content=NARRATIVE, tags=["clmux/ideas"])
+        corpus = storage.get_corpus_snapshot(conn)
+        for newer, older in ((plain["id"], todo["id"]), (todo["id"], plain["id"])):
+            check = storage._absorb_check_sibling_pair(conn, corpus, newer, older, context=None)
+            assert check["verdict"] == "related" and check["gate"] == "type" and check["type_mismatch"]
+    assert llm.verify_prompts() == []
+
+
+@pytest.mark.parametrize("old_type,new_type", [
+    ("document_fragment", None), ("document_root", None), (None, "section"), ("todo", "issue"),
+])
+def test_the_gate_refuses_every_cross_type_pair_without_an_llm_call(monkeypatch, old_type, new_type):
+    # (Document fragments/roots never even reach absorb's matching; the gate
+    # refuses them anyway.)
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: FakeLLM(classify=None))
+    leaf = {"id": 7, "content": "x", "tags": [], "score": 0.99, "type": old_type}
+    check = storage._absorb_check_supersede("y", leaf, [], fact_type=new_type)
+    assert check["verdict"] == "related" and check["gate"] == "type" and check["type_mismatch"] is True
