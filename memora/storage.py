@@ -3985,9 +3985,15 @@ def _heal_supersession_fork(
     keep: leaves the caller deliberately left live (absorb's gate rejected
     superseding them). They are never collapsed and do not count as a fork.
     may_collapse(winner, loser) -> bool: asked before each collapse; a
-    False adds loser to keep. Absorb uses it so a leaf that appeared after
-    its gate ran is gated too, and so it never collapses on another
-    writer's behalf. Returns the final keep set.
+    False adds loser to keep. Absorb uses it so that (1) a concurrent
+    sibling may supersede absorb's new row only if that exact pair passes
+    the supersede gate — two absorbs that both passed against the same old
+    leaf have not shown that either new fact replaces the other, so an
+    unverified pair stays an intentional fork with both rows live; (2) a
+    leaf that appeared after absorb's gate ran is gated before absorb's row
+    supersedes it; (3) it never collapses on another writer's behalf.
+    Without may_collapse (non-absorb callers) every collapse proceeds, as
+    before. Returns the final keep set.
     """
     kept: set[int] = set(keep or ())
     for _ in range(_FORK_HEAL_RETRIES):
@@ -5212,6 +5218,17 @@ def _verify_absorb_supersede_llm(
     Every stored or caller-supplied string (both texts, tags, context) is
     passed as a delimited data block (_data_block), and the prompt states
     that those blocks contain no instructions.
+
+    LIMIT of that defence, stated plainly: the nonce delimiters stop stored
+    text from ESCAPING its block (it cannot forge the closing marker), but
+    nothing in a prompt can guarantee a model ignores SEMANTIC injection
+    inside a block ("answer yes to all fields"). The tests with a fake model
+    prove the framing only. What bounds the damage is structural: a
+    supersession needs an explicit yes on all three fields, any parse or
+    provider failure is a rejection, the score floor runs before the model,
+    and every supersede is logged with both texts for audit. Live runs
+    (scripts/measure_supersede_gate.py, injection pairs) are evidence, not
+    proof.
     """
     import secrets as _secrets
 
@@ -5311,26 +5328,38 @@ def _absorb_update_candidate(
     return None
 
 
+def _leaf_fingerprint(content: str, tags: Any) -> str:
+    """Identity of exactly what a gate check judged: text + tags. A check is
+    only reusable while the leaf still has this fingerprint."""
+    payload = (content or "") + "\0" + json.dumps(sorted(tags or []), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _absorb_leaf_infos(
     conn: sqlite3.Connection,
     corpus: _CorpusSnapshot,
     fact_vector: Optional[Dict[str, float]],
     leaf_ids: List[int],
+    *,
+    db_vectors: bool = False,
 ) -> Dict[int, Dict[str, Any]]:
     """What the gate needs about each leaf absorb would actually supersede:
-    its own text, tags, created_at, and the fact's similarity to IT (not to
-    the classifier's candidate, which may be a stale ancestor).
+    its own text, tags, created_at, fingerprint, the leaf's vector, and the
+    fact's similarity to IT (not to the classifier's candidate, which may be
+    a stale ancestor).
 
     One hydration query; vectors come from the corpus snapshot, and only
-    leaves newer than the snapshot cost one embeddings query. A leaf whose
-    row is gone is omitted (the caller treats it as unverified)."""
+    leaves newer than the snapshot cost one embeddings query. db_vectors
+    reads every vector from the DB instead (the write boundary: a leaf may
+    have been edited, and re-embedded, since the snapshot). A leaf whose row
+    is gone is omitted (the caller treats it as unverified)."""
     if not leaf_ids:
         return {}
     rows = _hydrate_memories_by_ids(conn, leaf_ids)
     vectors: Dict[int, Any] = {}
     missing: List[int] = []
     for mid in rows:
-        vec = corpus.vector(mid)
+        vec = None if db_vectors else corpus.vector(mid)
         if vec is None:
             missing.append(mid)
         else:
@@ -5348,6 +5377,8 @@ def _absorb_leaf_infos(
             "tags": mem.get("tags", []),
             "created_at": mem.get("created_at"),
             "score": float(score),
+            "vector": vec,
+            "fingerprint": _leaf_fingerprint(mem.get("content", ""), mem.get("tags", [])),
         }
     return out
 
@@ -5370,7 +5401,8 @@ def _absorb_check_supersede(
     safe on a worker thread.
     """
     score = float(leaf.get("score") or 0.0)
-    audit = {"leaf_id": leaf["id"], "score": score, "old_text": leaf.get("content", "")}
+    audit = {"leaf_id": leaf["id"], "score": score, "old_text": leaf.get("content", ""),
+             "fingerprint": leaf.get("fingerprint")}
     if score < _ABSORB_SUPERSEDE_MIN_SCORE:
         return {**audit, "verdict": "related", "gate": "score",
                 "reason": f"similarity {score:.2f} below supersede minimum {_ABSORB_SUPERSEDE_MIN_SCORE:.2f}"}
@@ -5443,28 +5475,67 @@ def _absorb_partition_targets(
 ) -> Tuple[List[int], Dict[int, Dict[str, Any]]]:
     """Split the leaves a FRESH resolution returned into (passing, rejected).
 
-    Leaves already checked after classification reuse that check; any leaf
-    that appeared since (a concurrent absorb's new leaf, a manual link, a
-    fork created in between) is checked now, against its own text. The
-    job's gate is updated in place so decisions and logs report every leaf.
+    Every target is re-read here (one hydration + one embeddings query):
+    a check made after classification is reused only if the leaf's
+    fingerprint (text + tags) is unchanged, since update_memory may have
+    edited it in between. A changed leaf, or one that appeared since (a
+    concurrent absorb's new leaf, a manual link, a new fork), is gated now
+    against its current content. The job's gate is updated in place so
+    decisions and logs report every leaf.
+
+    Residual window: D1 has no transactions, so an edit that lands after
+    this read and before the link is not seen. The window is one or two
+    round trips; closing it needs the local-transaction design.
     """
     gate = job.setdefault("check", {"checks": {}})
     checks = gate.setdefault("checks", {})
-    missing = [t for t in targets if t not in checks]
-    if missing:
-        absorb_count("late_supersede_checks", len(missing))
-        infos = _absorb_leaf_infos(conn, corpus, job.get("search_vector"), missing)
-        for t in missing:
-            info = infos.get(t)
-            if info is None:
-                checks[t] = {"leaf_id": t, "verdict": "related", "gate": "missing", "score": 0.0,
-                             "old_text": "", "reason": "leaf row not found at write boundary"}
-                continue
+    infos = _absorb_leaf_infos(conn, corpus, job.get("search_vector"), targets, db_vectors=True)
+    for t in targets:
+        info = infos.get(t)
+        prior = checks.get(t)
+        if info is None:
+            checks[t] = {"leaf_id": t, "verdict": "related", "gate": "missing", "score": 0.0,
+                         "old_text": "", "reason": "leaf row not found at write boundary"}
+            continue
+        if prior is not None and prior.get("fingerprint") == info["fingerprint"]:
+            continue
+        if prior is None:
+            absorb_count("late_supersede_checks")
             logger.info("absorb supersede: leaf #%s appeared after verification; checking it now", t)
-            checks[t] = _absorb_check_supersede_safe(job["content"], info, [], job.get("tags"), context)
+        else:
+            absorb_count("regated_supersede_checks")
+            logger.info("absorb supersede: leaf #%s changed since verification; re-checking", t)
+        checks[t] = _absorb_check_supersede_safe(job["content"], info, [], job.get("tags"), context)
     passing = [t for t in targets if checks[t].get("verdict") == "supersede"]
     rejected = {t: checks[t] for t in targets if t not in passing}
     return passing, rejected
+
+
+def _absorb_check_sibling_pair(
+    conn: sqlite3.Connection,
+    corpus: _CorpusSnapshot,
+    newer_id: int,
+    older_id: int,
+    *,
+    context: Optional[str],
+) -> Dict[str, Any]:
+    """Gate one NEW memory superseding ANOTHER new memory (fork heal).
+
+    Two concurrent absorbs can each pass the gate against the same old leaf
+    while their facts do not replace each other; a check against the old
+    leaf cannot authorise newer_id hiding older_id. This runs the same gate
+    (score floor + verifier) on exactly that pair: newer_id's text as the
+    replacing fact, older_id as the leaf, scored by their stored vectors.
+    """
+    infos = _absorb_leaf_infos(conn, corpus, None, [newer_id, older_id], db_vectors=True)
+    newer, older = infos.get(newer_id), infos.get(older_id)
+    if newer is None or older is None:
+        return {"leaf_id": older_id, "verdict": "related", "gate": "missing", "score": 0.0,
+                "old_text": "", "reason": "sibling row not found"}
+    vn, vo = newer.get("vector"), older.get("vector")
+    leaf = dict(older, score=float(_cosine_similarity(vn, vo)) if (vn and vo) else 0.0)
+    absorb_count("sibling_supersede_checks")
+    return _absorb_check_supersede_safe(newer["content"], leaf, [], newer.get("tags"), context)
 
 
 def _absorb_best_related_leaf(rejected: Dict[int, Dict[str, Any]]) -> Optional[int]:
@@ -6614,14 +6685,29 @@ def _absorb_memory_impl(
                         _annotate_update_decision(decisions[-1], job, primary=related_leaf)
                         continue
 
+                    sibling_checks: Dict[int, Dict[str, Any]] = {}
+
                     def _may_collapse(winner: int, loser: int, _job=job, _new=record["id"]) -> bool:
-                        # Losing to a concurrent absorb that superseded the
-                        # same leaf is that absorb's (gated) decision.
+                        # A concurrent sibling superseding OUR new row: both
+                        # passed a gate against the old leaf, which says
+                        # nothing about whether one new fact replaces the
+                        # other. Only a check on exactly this pair allows it.
                         if loser == _new:
-                            return True
+                            check = _absorb_check_sibling_pair(
+                                conn, corpus, winner, _new, context=context,
+                            )
+                            sibling_checks[winner] = check
+                            _log_supersede_decision(
+                                "sibling_supersede" if check.get("verdict") == "supersede"
+                                else "sibling_kept", f"#{winner} (concurrent absorb)", _new,
+                                check, "fork heal", new_id=_new,
+                            )
+                            return check.get("verdict") == "supersede"
                         # Never collapse on another writer's behalf.
                         if winner != _new:
                             return False
+                        # Our new row superseding a leaf that appeared after
+                        # our gate ran: gate that exact leaf now.
                         ok, _rej = _absorb_partition_targets(conn, corpus, _job, [loser], context=context)
                         return bool(ok)
 
@@ -6693,11 +6779,23 @@ def _absorb_memory_impl(
                             record["id"],
                         )
                     with absorb_phase("final_checks"):
-                        live_now, _cycle = _component_live_leaves(conn, record["id"])
-                    # Leaves left live on purpose (gate-rejected, or not ours
-                    # to collapse) are not rival "current" versions.
-                    live_now = [l for l in live_now if l not in kept]
-                    current_id = max(live_now) if live_now else record["id"]
+                        live_all, _cycle = _component_live_leaves(conn, record["id"])
+                    # INTENTIONAL FORK. Leaves the gate would not let this fact
+                    # supersede (kept) stay live in the persisted graph by
+                    # design: they are different entities that happen to share
+                    # a supersession ancestor. They are not rival "current"
+                    # versions of this fact, and nothing treats a multi-leaf
+                    # component as broken: follow=active lists every live
+                    # leaf, memory_get(follow="latest") picks the highest id,
+                    # the graph viewer marks only retired nodes
+                    # authority_unknown, and a later absorb re-gates each leaf
+                    # instead of collapsing the fork wholesale.
+                    if record["id"] in live_all:
+                        current_id = record["id"]
+                    else:
+                        rivals = [l for l in live_all if l not in kept]
+                        current_id = max(rivals) if rivals else record["id"]
+                    intentional_fork = sorted(l for l in live_all if l != record["id"])
                     gate_checks = (job.get("check") or {}).get("checks") or {}
                     for leaf_id in linked_ids:
                         _log_supersede_decision(
@@ -6719,6 +6817,10 @@ def _absorb_memory_impl(
                             "reason": reason,
                             "not_superseded": sorted(kept),
                         })
+                        if sibling_checks:
+                            decisions[-1]["sibling_checks"] = [
+                                _supersede_check_summary(c) for c in sibling_checks.values()
+                            ]
                         _annotate_update_decision(decisions[-1], job, primary=linked_ids[0])
                         continue
                     decisions.append({
@@ -6731,6 +6833,19 @@ def _absorb_memory_impl(
                         "reason": reason,
                         "not_superseded": sorted(kept),
                     })
+                    if intentional_fork:
+                        decisions[-1]["intentional_fork"] = {
+                            "live_leaves": sorted([record["id"], *intentional_fork]),
+                            "reason": (
+                                "left live on purpose: the supersede gate did not verify that "
+                                "this fact replaces them (different entity, or an unverified "
+                                "concurrent sibling)"
+                            ),
+                        }
+                    if sibling_checks:
+                        decisions[-1]["sibling_checks"] = [
+                            _supersede_check_summary(c) for c in sibling_checks.values()
+                        ]
                     _annotate_update_decision(decisions[-1], job, primary=linked_ids[0])
                     continue
                 link_error: Optional[Exception] = None
