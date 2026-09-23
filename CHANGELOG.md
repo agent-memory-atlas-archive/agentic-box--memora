@@ -12,12 +12,22 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
-## Unreleased
+## 0.4.6
+
+A plain JSON API (Phase 0 of the clmux memora daemon), the absorb type
+boundary, and typed tags no longer taken as project evidence.
+
+**The API is OFF unless configured:** its routes are registered ONLY when
+`MEMORA_API_TOKENS_FILE` is set. memora-all does not set it in this release,
+so there the API is not registered at all (every `/api/v1/...` path is 404).
+The contract is frozen as `contracts/memora-api/v1` 1.0.0, tagged
+`memora-api-v1.0.0`. No configuration change is needed for this release.
 
 ### Plain JSON API `/api/v1/<store>/{health,search,absorb}` (Phase 0 of the clmux memora daemon)
 - New HTTP routes next to MCP on the streamable-http/sse transports, outside the MCP session machinery: `GET health` (200 ok, or a 503 health document: down `probe_error`/`store_missing`/`store_locked`/`integrity_fault`, degraded `unproven`/`stale`), `POST search` (hybrid-v1 with `follow="active"`, raw `cosine`, `fused` order, 1-based `rank`, `preview`, `project` and `tags_any` filters, `unscored` coverage count) and `POST absorb` (validated, then 501 `writes_unsupported`: no store is transactional yet). The versioned contract lives in `contracts/memora-api/v1` (1.0.0: schemas, fixtures, manifest; `scripts/memora_api_contract.py` validate / live), and `scripts/memora_api_smoke.py` is a live gate.
 - **Off unless configured:** the routes are registered only with `MEMORA_API_TOKENS_FILE` (sha256 token -> stores, re-read on change at most once a second, strict file and parent-directory checks); every request needs a token for the store. Request order: 401, 404, 403, 404, 413 (64 KiB body cap, counted at the ASGI receive boundary), 400, 429 (`MEMORA_API_MAX_INFLIGHT`, default 8), result. One error envelope for every non-2xx except health's 503.
 - **Reads never write, set up a schema or create files:** the API search is strictly read-only (no embedding rebuild on a model mismatch: 503 `store_degraded`; no vector repair: `unscored`), and the API and the readiness probe (`/health/db` too) connect without schema setup. A local SQLite store opens read-only under a new per-store in-process reader-writer lock that every local writer connection's open and close takes (so no in-process writer can open or close during a read); a missing store, schema or usable WAL sidecars answers 503 instead of being created. Writers in another process are out of scope. The read-only corpus snapshot is single-flight and shares the corpus cache's budget.
+- **Thread contract:** a local SQLite connection keeps stock sqlite3's `check_same_thread` behaviour exactly -- every public Connection and Cursor method, cursors returned by `execute`/`executemany`/`executescript`, blobs and `iterdump`, verified against native sqlite3 -- although the native connection underneath is opened with `check_same_thread=False` so a close by the garbage collector can happen under the store lock. GC closes never block; one that cannot take the lock at once is deferred and drained inside the next writer section.
 - `memora-server` now pins uvicorn to `http="h11"`, `loop="asyncio"`, `h11_max_incomplete_event_size=16384` (the stated body bound depends on it; `scripts/measure_asgi_body_messages.py`). A local SQLite store's directory is now created on its first writing connection rather than when the backend object is built.
 
 ### Typed tags are not project evidence

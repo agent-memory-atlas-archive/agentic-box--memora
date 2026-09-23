@@ -1,66 +1,45 @@
 #!/usr/bin/env bash
-# Full deploy of the live memora-all container (nuc8) to v0.4.5: fetch +
+# Full deploy of the live memora-all container (nuc8) to v0.4.6: fetch +
 # build the tagged image and recreate the container from it, then verify it.
 #
-# What v0.4.5 changes (see CHANGELOG.md "0.4.5"):
-#  - Project identity is explicit (issue #47): keyword-based project
-#    detection is gone. A memory's project comes from an explicit `project`
-#    argument, else metadata.project, else exactly one tag naming a project
-#    CONFIGURED for its store (MEMORA_PROJECTS). Typed tags are
-#    <project>/issues|todos|sections|documents, or bare without a project --
-#    no more memora/... default.
-#  - Import hardening: prepare-before-delete, D1 staged clear, per-row
-#    markers with verified cleanup, one fenced import lease per store,
-#    truthful partial results. A D1 replace is still NOT atomic (recover by
-#    re-running it from the export file). New admin tool
-#    memory_import_sweep (full profile only; this container runs `leader`,
-#    so it is not exposed here); memory_stats gains `import_pending`.
+# What v0.4.6 changes (see CHANGELOG.md "0.4.6"):
+#  - Absorb never supersedes across memory types (a plain fact can no longer
+#    retire an open todo or issue); a reused supersede verdict is re-checked
+#    when the leaf's type, project or stored vector changed.
+#  - Typed tags (<project>/issues, todos, ...) are no longer project
+#    evidence; they follow the memory's project once one is declared.
+#  - A plain JSON API /api/v1/<store>/{health,search,absorb} (Phase 0 of the
+#    clmux memora daemon; contract memora-api-v1.0.0). It is registered ONLY
+#    when MEMORA_API_TOKENS_FILE is set. THIS DEPLOY DOES NOT SET IT: the API
+#    stays unregistered on memora-all, and step 5 checks that it is (a 404, or
+#    a refused connection, on /api/v1/memora/health), so an accidental
+#    registration fails the deploy.
+#  - memora-server now pins uvicorn to http=h11, loop=asyncio (explicit
+#    instead of "auto"); readiness probes (/health/db) no longer run schema
+#    setup and never create a database.
 #
-# CONFIGURATION CHANGE -- this deploy ADDS one env var, MEMORA_PROJECTS,
-# keyed by registry store name:
-#   {"memora":["memora","clmux","acebar","pi"],"ob1":["ob1"],
-#    "bestation":["bestation"],"re":["re"]}
-# (acebar and pi write to the memora store, per their .mcp.json.) Why: with
-# the keyword heuristics removed, tags only imply a project the store
-# declares. WITHOUT this variable no project is inferred from tags at all,
-# so only callers that pass an explicit `project` would get sections and
-# project-prefixed tags, and memora/clmux-tagged content would lose its
-# section conventions. With it, a project outside a store's list is rejected
-# (invalid_input). It is set here, not in credentials.mcp.json (a copy there
-# is ignored so this value always wins). The value is validated with the NEW
-# image (memora's own parser, and its keys must equal MEMORA_DATABASES'
-# store names) before anything is stopped. MEMORA_LLM_MODEL is unchanged
-# (step 2 is a confirming no-op); MEMORA_CORPUS_CACHE_BUDGET_MB stays unset.
-#
-# SCHEMA: on first connect v0.4.5 creates one new, empty table per store,
-# import_lease (CREATE TABLE IF NOT EXISTS; nothing existing changes).
-#
-# STARTUP SWEEP: at startup v0.4.5 sweeps every store, on a daemon thread,
-# for rows whose metadata carries an `import_attempt` marker (an interrupted
-# import) and completes or REMOVES them. No released memora ever wrote that
-# key (it first appears in this release), so the live stores should have
-# none -- but before 0.4.5 a caller could put ANY key in metadata. So step 3
-# first counts, READ-ONLY, rows whose metadata contains "import_attempt" in
-# each live store (through the running v0.4.4 container, raw connection, no
-# schema pass) and ABORTS the deploy if any store has one, before anything
-# is stopped.
+# NO ENV CHANGE: MEMORA_PROJECTS is already set (v0.4.5) and re-set to the
+# same value below; MEMORA_API_TOKENS_FILE is NOT set; MEMORA_LLM_MODEL stays
+# openai/gpt-4o-mini (step 2 re-writes the same value, a confirming no-op);
+# MEMORA_CORPUS_CACHE_BUDGET_MB stays unset. No schema change.
 #
 # Steps, all on nuc8:
-#  1. git fetch + checkout the v0.4.5 tag in the nuc8 checkout, docker build.
+#  1. git fetch + checkout the v0.4.6 tag in the nuc8 checkout, docker build.
 #     The image currently tagged memora:latest is kept as memora:rollback-<ts>
 #     before the new one replaces it.
 #  2. Edit MEMORA_LLM_MODEL in ~/.config/memora/credentials.mcp.json (already
 #     openai/gpt-4o-mini -- a confirming no-op; backup kept).
-#  3. Preflight, before any destructive step: validate MEMORA_PROJECTS with
-#     the new image, and the read-only import_attempt count on the live
-#     stores (see above). Either failing aborts with the old container
-#     untouched and still serving.
+#  3. Preflight, before any destructive step (unchanged from v0.4.5): validate
+#     MEMORA_PROJECTS with the new image, and a read-only count of rows whose
+#     metadata contains "import_attempt" in each live store (the startup
+#     sweep would complete or remove them). Either failing aborts with the
+#     old container untouched and still serving.
 #  4. Recreate memora-all -- same image tag, mounts, ports, memory/cpu limits,
-#     restart policy and env as the v0.4.4 deploy, plus MEMORA_PROJECTS. Old
-#     container kept stopped as memora-all-grok-<ts> (the name predates the
-#     model switch being a no-op; it still means "the container before this
-#     deploy", and the rollback commands below depend on it).
-#  5. Wait for GET /health, check it reports version 0.4.5 (proves the new
+#     restart policy and env as the v0.4.5 deploy. Old container kept stopped
+#     as memora-all-grok-<ts> (the name predates the model switch being a
+#     no-op; it still means "the container before this deploy", and the
+#     rollback commands below depend on it).
+#  5. Wait for GET /health, check it reports version 0.4.6 (proves the new
 #     build is the one serving, not a stale image), then run one 3-fact
 #     dry-run memory_absorb call, one memory_semantic_search call and one
 #     memory_stats call, asserting no JSON-RPC error and a real session id at
@@ -76,7 +55,9 @@
 #     report that store as its bound database, with an integer
 #     import_pending. Any store failing is named and fails the deploy.
 #     ("pi" in the memora project list is a tag project inside the memora
-#     store, not a store; pi agents have no MCP config.)
+#     store, not a store; pi agents have no MCP config.) Finally, GET
+#     /api/v1/memora/health must be a 404 or a refused connection: the API
+#     is not registered without a tokens file.
 #
 # HARDENED (queue item 23 follow-up, sealed review msg 5698/5699): the
 # credentials-env parser used to stream straight into the while loop via
@@ -98,7 +79,7 @@
 #   restore ~/.config/memora/credentials.mcp.json.bak-llm-<ts> if MEMORA_LLM_MODEL itself needs reverting
 set -euo pipefail
 
-TAG="v0.4.5"
+TAG="v0.4.6"
 
 # MEMORA_DATABASES names a Cloudflare account + database ids — read from the
 # git-ignored instance config rather than written into this (public) script.
@@ -191,11 +172,11 @@ if not isinstance(projects, dict) or set(projects) != stores:
 print("MEMORA_PROJECTS ok:", json.dumps(projects, sort_keys=True))
 ' || { echo "MEMORA_PROJECTS preflight failed — aborting before touching the live container" >&2; exit 1; }
 
-# Preflight 2 (READ-ONLY): the startup sweep of v0.4.5 completes or removes
+# Preflight 2 (READ-ONLY): the startup sweep (since v0.4.5) completes or removes
 # rows whose metadata carries an import_attempt marker. None should exist
 # (no released memora wrote the key), but a caller could have set it. Count,
 # per live store, rows whose metadata contains the string at all (a superset
-# of real markers), through the running v0.4.4 container: a raw backend
+# of real markers), through the running (previous) container: a raw backend
 # connection, so no schema pass -- one SELECT per store. Any hit, or a
 # failed check, aborts before anything is stopped.
 docker exec -i memora-all python - <<'PY' || { echo "import_attempt preflight failed — aborting before touching the live container" >&2; exit 1; }
@@ -215,7 +196,7 @@ for name in json.loads(os.environ["MEMORA_DATABASES"]):
     if ids:
         bad[name] = ids
 if bad:
-    sys.exit(f"rows the v0.4.5 startup sweep could complete or remove: {bad} -- inspect them first")
+    sys.exit(f"rows the startup sweep could complete or remove: {bad} -- inspect them first")
 PY
 
 docker stop memora-all
@@ -363,9 +344,9 @@ def _require_profile(name, out):
 
 
 facts = [
-    "deploy-check fact one about the v0.4.5 project-identity rollout",
-    "deploy-check fact two about the v0.4.5 project-identity rollout",
-    "deploy-check fact three about the v0.4.5 project-identity rollout",
+    "deploy-check fact one about the v0.4.6 rollout",
+    "deploy-check fact two about the v0.4.6 rollout",
+    "deploy-check fact three about the v0.4.6 rollout",
 ]
 absorb, elapsed = _call_tool(2, "memory_absorb", {"facts": facts, "dry_run": True})
 # Not one decision per fact: near-identical facts may be consolidated.
@@ -447,5 +428,23 @@ if failed:
         print(f"STORE CHECK FAILED — {line}", file=sys.stderr)
     sys.exit(1)
 print(f"all {len(STORES)} stores verified: {', '.join(STORES)}")
+
+# The plain JSON API is registered ONLY with MEMORA_API_TOKENS_FILE, which
+# this deploy does not set: /api/v1/... must not exist. A 404 (route not
+# registered) or a refused connection passes; ANY other answer -- 401 from a
+# registered route, 200, 503 -- means the API got registered and fails.
+api_status = None
+try:
+    with urllib.request.urlopen(f"{ROOT}/api/v1/memora/health", timeout=10) as resp:
+        api_status = resp.status
+except urllib.error.HTTPError as exc:
+    api_status = exc.code
+except (urllib.error.URLError, ConnectionError) as exc:
+    api_status = f"connection refused ({exc})"
+if api_status != 404 and not str(api_status).startswith("connection refused"):
+    print(f"/api/v1/memora/health answered {api_status!r}: the API is registered, but this "
+          "deploy sets no MEMORA_API_TOKENS_FILE", file=sys.stderr)
+    sys.exit(1)
+print(f"/api/v1 not registered (/api/v1/memora/health: {api_status})")
 PY
 REMOTE
