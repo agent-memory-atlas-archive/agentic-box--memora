@@ -1,54 +1,75 @@
 #!/usr/bin/env bash
-# Full deploy of the live memora-all container (nuc8) to v0.4.4: fetch +
+# Full deploy of the live memora-all container (nuc8) to v0.4.5: fetch +
 # build the tagged image and recreate the container from it, then verify it.
 #
-# What v0.4.4 changes (see CHANGELOG.md "0.4.4"): memora's READ paths.
-#  - Why: from the Mac, memory_semantic_search took 10-14 s even warm,
-#    memory_get 2 s, memory_list 1.3 s, and clmux is to be memora's only
-#    client. Fake-D1 bench (modeled at 0.2 s per request, not measured
-#    live), warm D1 requests: semantic search 16 -> 3, hybrid 17 -> 4,
-#    memory_get 8 -> 1, memory_list 4 -> 2. The first search after a write
-#    still costs ~25 requests.
-#  - Searches score against the in-process corpus snapshot; follow,
-#    memory_get and memory_related need far fewer statements; D1 keeps one
-#    HTTPS connection per worker thread; query embeddings are cached.
-#  - Read tools return a "profile" field (per-phase seconds, D1 requests).
-#  - Behaviour changes: an EMPTY stored memory_related list is returned
-#    as-is until refresh=True; malformed tags JSON reads as untagged (plus
-#    "tags_invalid": true) instead of failing the read.
+# What v0.4.5 changes (see CHANGELOG.md "0.4.5"):
+#  - Project identity is explicit (issue #47): keyword-based project
+#    detection is gone. A memory's project comes from an explicit `project`
+#    argument, else metadata.project, else exactly one tag naming a project
+#    CONFIGURED for its store (MEMORA_PROJECTS). Typed tags are
+#    <project>/issues|todos|sections|documents, or bare without a project --
+#    no more memora/... default.
+#  - Import hardening: prepare-before-delete, D1 staged clear, per-row
+#    markers with verified cleanup, one fenced import lease per store,
+#    truthful partial results. A D1 replace is still NOT atomic (recover by
+#    re-running it from the export file). New admin tool
+#    memory_import_sweep (full profile only; this container runs `leader`,
+#    so it is not exposed here); memory_stats gains `import_pending`.
 #
-# NO MODEL OR ENV CHANGE: MEMORA_LLM_MODEL stays openai/gpt-4o-mini (step 2
-# re-writes the same value, a confirming no-op), and MEMORA_LOG_LEVEL=INFO
-# is already set by the v0.4.3 deploy. One new OPTIONAL env var exists,
-# MEMORA_CORPUS_CACHE_BUDGET_MB; this deploy deliberately does NOT set it,
-# so the 384 MB default applies. The corpus snapshot is ~93 KB per row;
-# live counts on 2026-09-23 (memora 968, ob1 615, bestation 66, re 237,
-# ~1.9k rows) come to ~175 MB if all four stores are cached, inside both
-# the 384 MB budget and the container's 768 MB limit (memora-all used
-# ~192 MB before this deploy). If the credentials env ever gained that
-# variable it would be forwarded like the rest of that env.
+# CONFIGURATION CHANGE -- this deploy ADDS one env var, MEMORA_PROJECTS,
+# keyed by registry store name:
+#   {"memora":["memora","clmux","acebar","pi"],"ob1":["ob1"],
+#    "bestation":["bestation"],"re":["re"]}
+# (acebar and pi write to the memora store, per their .mcp.json.) Why: with
+# the keyword heuristics removed, tags only imply a project the store
+# declares. WITHOUT this variable no project is inferred from tags at all,
+# so only callers that pass an explicit `project` would get sections and
+# project-prefixed tags, and memora/clmux-tagged content would lose its
+# section conventions. With it, a project outside a store's list is rejected
+# (invalid_input). It is set here, not in credentials.mcp.json (a copy there
+# is ignored so this value always wins). The value is validated with the NEW
+# image (memora's own parser, and its keys must equal MEMORA_DATABASES'
+# store names) before anything is stopped. MEMORA_LLM_MODEL is unchanged
+# (step 2 is a confirming no-op); MEMORA_CORPUS_CACHE_BUDGET_MB stays unset.
+#
+# SCHEMA: on first connect v0.4.5 creates one new, empty table per store,
+# import_lease (CREATE TABLE IF NOT EXISTS; nothing existing changes).
+#
+# STARTUP SWEEP: at startup v0.4.5 sweeps every store, on a daemon thread,
+# for rows whose metadata carries an `import_attempt` marker (an interrupted
+# import) and completes or REMOVES them. No released memora ever wrote that
+# key (it first appears in this release), so the live stores should have
+# none -- but before 0.4.5 a caller could put ANY key in metadata. So step 3
+# first counts, READ-ONLY, rows whose metadata contains "import_attempt" in
+# each live store (through the running v0.4.4 container, raw connection, no
+# schema pass) and ABORTS the deploy if any store has one, before anything
+# is stopped.
 #
 # Steps, all on nuc8:
-#  1. git fetch + checkout the v0.4.4 tag in the nuc8 checkout, docker build.
+#  1. git fetch + checkout the v0.4.5 tag in the nuc8 checkout, docker build.
 #     The image currently tagged memora:latest is kept as memora:rollback-<ts>
 #     before the new one replaces it.
 #  2. Edit MEMORA_LLM_MODEL in ~/.config/memora/credentials.mcp.json (already
-#     openai/gpt-4o-mini -- a confirming no-op, see above; backup kept).
-#  3. Recreate memora-all -- same image tag, mounts, ports, memory/cpu limits,
-#     restart policy and env (including MEMORA_LOG_LEVEL=INFO) as the v0.4.3
-#     deploy. Old container kept stopped as memora-all-grok-<ts> (the name
-#     predates the model switch being a no-op; it still means "the container
-#     before this deploy", and the rollback commands below depend on it).
-#  4. Wait for GET /health, check it reports version 0.4.4 (proves the new
+#     openai/gpt-4o-mini -- a confirming no-op; backup kept).
+#  3. Preflight, before any destructive step: validate MEMORA_PROJECTS with
+#     the new image, and the read-only import_attempt count on the live
+#     stores (see above). Either failing aborts with the old container
+#     untouched and still serving.
+#  4. Recreate memora-all -- same image tag, mounts, ports, memory/cpu limits,
+#     restart policy and env as the v0.4.4 deploy, plus MEMORA_PROJECTS. Old
+#     container kept stopped as memora-all-grok-<ts> (the name predates the
+#     model switch being a no-op; it still means "the container before this
+#     deploy", and the rollback commands below depend on it).
+#  5. Wait for GET /health, check it reports version 0.4.5 (proves the new
 #     build is the one serving, not a stale image), then run one 3-fact
-#     dry-run memory_absorb call and one memory_semantic_search call,
-#     asserting no JSON-RPC error and a real session id at initialize, no
-#     JSON-RPC error / isError at each tools/call (a JSON-RPC error rides
-#     HTTP 200 -- an HTTP-status-only check would print and exit zero on a
-#     server that answers but can't actually serve requests), an absorb
-#     result with a "decisions" list and a "profile" field, and a search
-#     result with a "results" list and a "profile" field, before calling
-#     this done.
+#     dry-run memory_absorb call, one memory_semantic_search call and one
+#     memory_stats call, asserting no JSON-RPC error and a real session id at
+#     initialize, no JSON-RPC error / isError at each tools/call (a JSON-RPC
+#     error rides HTTP 200 -- an HTTP-status-only check would print and exit
+#     zero on a server that answers but can't actually serve requests), an
+#     absorb result with a "decisions" list and a "profile" field, a search
+#     result with a "results" list and a "profile" field, and a stats result
+#     with an integer "import_pending" field, before calling this done.
 #
 # HARDENED (queue item 23 follow-up, sealed review msg 5698/5699): the
 # credentials-env parser used to stream straight into the while loop via
@@ -70,7 +91,7 @@
 #   restore ~/.config/memora/credentials.mcp.json.bak-llm-<ts> if MEMORA_LLM_MODEL itself needs reverting
 set -euo pipefail
 
-TAG="v0.4.4"
+TAG="v0.4.5"
 
 # MEMORA_DATABASES names a Cloudflare account + database ids — read from the
 # git-ignored instance config rather than written into this (public) script.
@@ -88,6 +109,8 @@ set -euo pipefail
 TAG="$1"
 MEMORA_DATABASES="$(printf '%s' "$2" | base64 -d)"
 TS=$(date +%s)
+# Keyed by registry store name (MEMORA_DATABASES); see the header for why.
+MEMORA_PROJECTS='{"memora":["memora","clmux","acebar","pi"],"ob1":["ob1"],"bestation":["bestation"],"re":["re"]}'
 
 REPO=~/repos/agentic-box/memora
 [ -d "$REPO" ] || { echo "missing $REPO checkout on nuc8" >&2; exit 1; }
@@ -142,10 +165,51 @@ ENV_ARGS=()
 while IFS='=' read -r key value; do
   [ -z "$key" ] && continue
   case "$key" in
-    MEMORA_STORAGE_URI|MEMORA_DB_PATH|MEMORA_DATABASES|MEMORA_DEFAULT_DB) continue ;;
+    MEMORA_STORAGE_URI|MEMORA_DB_PATH|MEMORA_DATABASES|MEMORA_DEFAULT_DB|MEMORA_PROJECTS) continue ;;
   esac
   ENV_ARGS+=(-e "$key=$value")
 done <<< "$ENV_LINES"
+
+# Preflight 1: MEMORA_PROJECTS parses with the NEW image's own validator
+# (the server refuses to start on a malformed value), and names exactly the
+# registry's stores.
+docker run --rm -e "MEMORA_PROJECTS=$MEMORA_PROJECTS" -e "MEMORA_DATABASES=$MEMORA_DATABASES" \
+  memora:latest python -c '
+import json, os, sys
+from memora.storage import load_projects_config
+projects = load_projects_config()
+stores = set(json.loads(os.environ["MEMORA_DATABASES"]))
+if not isinstance(projects, dict) or set(projects) != stores:
+    sys.exit(f"MEMORA_PROJECTS stores {sorted(projects or [])} != MEMORA_DATABASES stores {sorted(stores)}")
+print("MEMORA_PROJECTS ok:", json.dumps(projects, sort_keys=True))
+' || { echo "MEMORA_PROJECTS preflight failed — aborting before touching the live container" >&2; exit 1; }
+
+# Preflight 2 (READ-ONLY): the startup sweep of v0.4.5 completes or removes
+# rows whose metadata carries an import_attempt marker. None should exist
+# (no released memora wrote the key), but a caller could have set it. Count,
+# per live store, rows whose metadata contains the string at all (a superset
+# of real markers), through the running v0.4.4 container: a raw backend
+# connection, so no schema pass -- one SELECT per store. Any hit, or a
+# failed check, aborts before anything is stopped.
+docker exec -i memora-all python - <<'PY' || { echo "import_attempt preflight failed — aborting before touching the live container" >&2; exit 1; }
+import json, os, sys
+from memora import storage
+bad = {}
+for name in json.loads(os.environ["MEMORA_DATABASES"]):
+    conn = storage.backend_for(name).connect()
+    try:
+        rows = conn.execute(
+            "SELECT id FROM memories WHERE instr(metadata, ?) > 0 LIMIT 20", ('"import_attempt"',)
+        ).fetchall()
+    finally:
+        conn.close()
+    ids = [int(r[0]) for r in rows]
+    print(f"{name}: {len(ids)} row(s) with import_attempt in metadata")
+    if ids:
+        bad[name] = ids
+if bad:
+    sys.exit(f"rows the v0.4.5 startup sweep could complete or remove: {bad} -- inspect them first")
+PY
 
 docker stop memora-all
 docker rename memora-all "memora-all-grok-$TS"
@@ -164,10 +228,11 @@ docker run -d --name memora-all \
   -e "MEMORA_LOG_LEVEL=INFO" \
   -e "MEMORA_DATABASES=$MEMORA_DATABASES" \
   -e "MEMORA_DEFAULT_DB=memora" \
+  -e "MEMORA_PROJECTS=$MEMORA_PROJECTS" \
   "${ENV_ARGS[@]}" \
   memora:latest
 
-echo "memora-all recreated from $TAG (MEMORA_LLM_MODEL=openai/gpt-4o-mini unchanged, MEMORA_LOG_LEVEL=INFO, corpus cache budget default 384 MB)"
+echo "memora-all recreated from $TAG (MEMORA_PROJECTS set; MEMORA_LLM_MODEL=openai/gpt-4o-mini unchanged, MEMORA_LOG_LEVEL=INFO, corpus cache budget default 384 MB)"
 echo "old container kept stopped as memora-all-grok-$TS; old image kept as memora:rollback-$TS"
 echo "rollback: docker rm -f memora-all && docker rename memora-all-grok-$TS memora-all && docker start memora-all"
 
@@ -284,9 +349,9 @@ def _require_profile(name, out):
 
 
 facts = [
-    "deploy-check fact one about the v0.4.4 read rollout",
-    "deploy-check fact two about the v0.4.4 read rollout",
-    "deploy-check fact three about the v0.4.4 read rollout",
+    "deploy-check fact one about the v0.4.5 project-identity rollout",
+    "deploy-check fact two about the v0.4.5 project-identity rollout",
+    "deploy-check fact three about the v0.4.5 project-identity rollout",
 ]
 absorb, elapsed = _call_tool(2, "memory_absorb", {"facts": facts, "dry_run": True})
 # Not one decision per fact: near-identical facts may be consolidated.
@@ -307,5 +372,13 @@ profile = _require_profile("memory_semantic_search", search)
 print(f"semantic search via memory store: {elapsed:.1f}s, {len(search['results'])} results "
       f"({profile['total_requests']} {profile.get('request_unit', 'requests')}, "
       f"server-side {profile['total_seconds']}s)")
+
+stats, elapsed = _call_tool(4, "memory_stats", {})
+pending = stats.get("import_pending")
+if not isinstance(pending, int) or isinstance(pending, bool):
+    print(f"memory_stats has no integer import_pending field: {json.dumps(stats)[:2000]}", file=sys.stderr)
+    sys.exit(1)
+print(f"memory_stats via memory store: {elapsed:.1f}s, {stats.get('total_memories')} memories, "
+      f"import_pending={pending}")
 PY
 REMOTE
