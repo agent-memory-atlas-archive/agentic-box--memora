@@ -18,6 +18,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 - Absorb could let a plain narrative fact supersede an open todo when the verifier judged the fact to "reiterate and confirm" it, so the task vanished from `follow="active"` lists (memora issue memory 1126: #1122 superseded open todo #1118). The per-leaf supersede gate now checks the **type boundary first**, before the similarity floor and without an LLM call: a leaf whose `metadata.type` (`todo`, `issue`, `section`, `document_root`, `document_fragment`, or none for a plain memory) differs from the new fact's (the absorb call's `metadata.type`) is downgraded to a related link. The decision's `supersede_check` and `leaf_checks` report `gate: "type"`, `type_mismatch: true`, `old_type` and `new_type`.
 - The same rule applies to the concurrent-sibling (fork heal) pair check: siblings of different types never collapse.
 - For a same-type pair the supersede verifier now sees both sides' type.
+- A leaf check is reused at the write boundary only while the leaf's fingerprint is unchanged, and the fingerprint now covers its type and `metadata.project` as well as text and tags: a metadata-only patch between classification and the write (e.g. to `type: "todo"`) forces a re-gate.
 
 ## 0.4.5
 

@@ -6106,10 +6106,19 @@ def _absorb_update_candidate(
     return None
 
 
-def _leaf_fingerprint(content: str, tags: Any) -> str:
-    """Identity of exactly what a gate check judged: text + tags. A check is
-    only reusable while the leaf still has this fingerprint."""
-    payload = (content or "") + "\0" + json.dumps(sorted(tags or []), ensure_ascii=False)
+def _leaf_fingerprint(content: str, tags: Any, meta_type: Optional[str] = None,
+                      project: Optional[str] = None) -> str:
+    """Identity of exactly what a gate check judged: text, tags, and the
+    gate-relevant metadata -- the normalised type (the type boundary) and
+    metadata.project. A check is only reusable while the leaf still has this
+    fingerprint, so e.g. a metadata-only patch to type=todo between
+    classification and the write boundary forces a re-gate."""
+    payload = "\0".join([
+        content or "",
+        json.dumps(sorted(tags or []), ensure_ascii=False),
+        meta_type or "",
+        project if isinstance(project, str) else "",
+    ])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -6147,6 +6156,8 @@ def _absorb_leaf_infos(
     out: Dict[int, Dict[str, Any]] = {}
     for mid, row in rows.items():
         mem = _serialise_row(row)
+        meta = mem.get("metadata")
+        leaf_type = _memory_type(meta.get("type") if isinstance(meta, dict) else None)
         vec = vectors.get(mid)
         score = _cosine_similarity(fact_vector, vec) if (fact_vector and vec) else 0.0
         out[mid] = {
@@ -6154,11 +6165,13 @@ def _absorb_leaf_infos(
             "content": mem.get("content", ""),
             "tags": mem.get("tags", []),
             "created_at": mem.get("created_at"),
-            "type": _memory_type((mem.get("metadata") or {}).get("type")
-                                 if isinstance(mem.get("metadata"), dict) else None),
+            "type": leaf_type,
             "score": float(score),
             "vector": vec,
-            "fingerprint": _leaf_fingerprint(mem.get("content", ""), mem.get("tags", [])),
+            "fingerprint": _leaf_fingerprint(
+                mem.get("content", ""), mem.get("tags", []), leaf_type,
+                meta.get("project") if isinstance(meta, dict) else None,
+            ),
         }
     return out
 

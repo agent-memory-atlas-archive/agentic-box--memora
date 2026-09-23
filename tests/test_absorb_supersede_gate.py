@@ -610,3 +610,52 @@ def test_the_gate_refuses_every_cross_type_pair_without_an_llm_call(monkeypatch,
     leaf = {"id": 7, "content": "x", "tags": [], "score": 0.99, "type": old_type}
     check = storage._absorb_check_supersede("y", leaf, [], fact_type=new_type)
     assert check["verdict"] == "related" and check["gate"] == "type" and check["type_mismatch"] is True
+
+
+def _absorb_with_boundary_patch(monkeypatch, patch):
+    """A plain leaf passes the gate at classification; between that and the
+    write boundary another writer patches ONLY its metadata (`patch`)."""
+    with storage.connect() as conn:
+        leaf = _mem(conn, PARKED_DESIGN)
+
+    def after_resolve(plan):
+        monkeypatch.setattr(storage, "_after_absorb_resolve", None)
+        with storage.connect() as other:
+            storage.update_memory(other, leaf["id"], metadata=patch)
+
+    monkeypatch.setattr(storage, "_after_absorb_resolve", after_resolve)
+    llm = FakeLLM(classify=_update(leaf["id"]), verify=_verdict(True, True, True))
+    fact = PARKED_DESIGN.replace("Parked until the plugin API stabilises.", "Unparked: work started.")
+    result, active, crossrefs = _absorb(monkeypatch, llm, leaf, fact)
+    return leaf, result["decisions"][0], result, active, crossrefs, llm
+
+
+def test_a_type_change_at_the_write_boundary_forces_a_regate(fake_d1_backend, monkeypatch):
+    leaf, decision, result, active, crossrefs, llm = _absorb_with_boundary_patch(
+        monkeypatch, {"type": "todo"},
+    )
+    assert leaf["id"] in active  # the (now) todo stays live
+    assert decision["action"] == "linked" and decision["downgraded_from"] == "UPDATE"
+    assert all(r.get("edge_type") != "superseded_by" for r in crossrefs)
+    assert any(r["id"] == decision["memory_id"] and r.get("edge_type") == "related_to" for r in crossrefs)
+    (check,) = decision["leaf_checks"]
+    assert check["gate"] == "type" and check["type_mismatch"] is True and check["old_type"] == "todo"
+    assert result["profile"]["counters"]["regated_supersede_checks"] == 1
+    assert len(llm.verify_prompts()) == 1  # the re-gate needed no LLM call
+
+
+def test_a_project_change_at_the_write_boundary_forces_a_regate(fake_d1_backend, monkeypatch):
+    _leaf, decision, result, _active, _c, llm = _absorb_with_boundary_patch(
+        monkeypatch, {"project": "pi"},
+    )
+    assert result["profile"]["counters"]["regated_supersede_checks"] == 1
+    assert len(llm.verify_prompts()) == 2  # re-judged by the verifier
+
+
+def test_an_unrelated_metadata_patch_reuses_the_verdict(fake_d1_backend, monkeypatch):
+    leaf, decision, result, active, _c, llm = _absorb_with_boundary_patch(
+        monkeypatch, {"priority": "high"},
+    )
+    assert decision["action"] == "superseded" and leaf["id"] not in active
+    assert "regated_supersede_checks" not in result["profile"]["counters"]
+    assert len(llm.verify_prompts()) == 1
