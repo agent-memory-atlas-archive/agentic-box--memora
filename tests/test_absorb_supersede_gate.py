@@ -612,14 +612,18 @@ def test_the_gate_refuses_every_cross_type_pair_without_an_llm_call(monkeypatch,
     assert check["verdict"] == "related" and check["gate"] == "type" and check["type_mismatch"] is True
 
 
-def _absorb_with_boundary_patch(monkeypatch, patch):
+def _absorb_with_boundary_patch(monkeypatch, patch, leaf_vector=None):
     """A plain leaf passes the gate at classification; between that and the
-    write boundary another writer patches ONLY its metadata (`patch`)."""
+    write boundary another writer patches ONLY its metadata (`patch`).
+    update_memory re-embeds the leaf on any metadata change; leaf_vector is
+    the vector that re-embedding produces (default: unchanged)."""
     with storage.connect() as conn:
         leaf = _mem(conn, PARKED_DESIGN)
 
     def after_resolve(plan):
         monkeypatch.setattr(storage, "_after_absorb_resolve", None)
+        if leaf_vector is not None:
+            VECS[PARKED_DESIGN] = leaf_vector
         with storage.connect() as other:
             storage.update_memory(other, leaf["id"], metadata=patch)
 
@@ -653,9 +657,46 @@ def test_a_project_change_at_the_write_boundary_forces_a_regate(fake_d1_backend,
 
 
 def test_an_unrelated_metadata_patch_reuses_the_verdict(fake_d1_backend, monkeypatch):
+    """Reuse only while the vector (hence the score) is unchanged and above the floor."""
     leaf, decision, result, active, _c, llm = _absorb_with_boundary_patch(
         monkeypatch, {"priority": "high"},
     )
     assert decision["action"] == "superseded" and leaf["id"] not in active
+    assert decision["score"] >= storage._ABSORB_SUPERSEDE_MIN_SCORE
     assert "regated_supersede_checks" not in result["profile"]["counters"]
     assert len(llm.verify_prompts()) == 1
+
+
+
+def test_a_metadata_patch_that_drops_the_score_below_the_floor_keeps_the_leaf(fake_d1_backend, monkeypatch):
+    leaf, decision, result, active, crossrefs, llm = _absorb_with_boundary_patch(
+        monkeypatch, {"notes": "a long unrelated operational note " * 40}, leaf_vector={"z": 1.0},
+    )
+    assert leaf["id"] in active
+    assert decision["action"] == "linked" and decision["downgraded_from"] == "UPDATE"
+    assert all(r.get("edge_type") != "superseded_by" for r in crossrefs)
+    (check,) = decision["leaf_checks"]
+    assert check["gate"] == "score" and check["score"] < storage._ABSORB_SUPERSEDE_MIN_SCORE
+    assert len(llm.verify_prompts()) == 1
+
+
+def test_a_re_embedded_leaf_above_the_floor_is_regated(fake_d1_backend, monkeypatch):
+    """The vector is part of the fingerprint: a changed embedding is re-judged
+    even when the new score still passes the floor."""
+    _leaf, decision, result, _a, _c, llm = _absorb_with_boundary_patch(
+        monkeypatch, {"notes": "minor"}, leaf_vector={"x": 0.9, "y": 0.1, "w": 0.1},
+    )
+    assert result["profile"]["counters"]["regated_supersede_checks"] == 1
+    assert len(llm.verify_prompts()) == 2
+
+
+def test_the_floor_is_enforced_on_reuse_even_with_an_unchanged_fingerprint(fake_d1_backend, monkeypatch):
+    """Belt and braces: with the fingerprint forced equal, a reused verdict is
+    still refused when the fresh score is below the floor."""
+    monkeypatch.setattr(storage, "_leaf_fingerprint", lambda *a, **k: "same")
+    leaf, decision, result, active, _c, llm = _absorb_with_boundary_patch(
+        monkeypatch, {"notes": "x"}, leaf_vector={"z": 1.0},
+    )
+    assert leaf["id"] in active and decision["action"] == "linked"
+    assert "regated_supersede_checks" not in result["profile"]["counters"]  # reused, then refused
+    assert decision["leaf_checks"][0]["gate"] == "score"

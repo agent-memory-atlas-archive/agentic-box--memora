@@ -6107,17 +6107,25 @@ def _absorb_update_candidate(
 
 
 def _leaf_fingerprint(content: str, tags: Any, meta_type: Optional[str] = None,
-                      project: Optional[str] = None) -> str:
-    """Identity of exactly what a gate check judged: text, tags, and the
+                      project: Optional[str] = None, vector: Any = None) -> str:
+    """Identity of exactly what a gate check judged: text, tags, the
     gate-relevant metadata -- the normalised type (the type boundary) and
-    metadata.project. A check is only reusable while the leaf still has this
-    fingerprint, so e.g. a metadata-only patch to type=todo between
-    classification and the write boundary forces a re-gate."""
+    metadata.project -- and the leaf's stored vector (its score). A check is
+    only reusable while the leaf still has this fingerprint, so e.g. a
+    metadata-only patch to type=todo, or one that re-embeds the leaf (every
+    metadata change re-embeds it), forces a re-gate."""
+    if isinstance(vector, dict):
+        vector_id = hashlib.sha256(
+            json.dumps(sorted(vector.items()), separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    else:
+        vector_id = "none"
     payload = "\0".join([
         content or "",
         json.dumps(sorted(tags or []), ensure_ascii=False),
         meta_type or "",
         project if isinstance(project, str) else "",
+        vector_id,
     ])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -6170,7 +6178,7 @@ def _absorb_leaf_infos(
             "vector": vec,
             "fingerprint": _leaf_fingerprint(
                 mem.get("content", ""), mem.get("tags", []), leaf_type,
-                meta.get("project") if isinstance(meta, dict) else None,
+                meta.get("project") if isinstance(meta, dict) else None, vec,
             ),
         }
     return out
@@ -6319,6 +6327,14 @@ def _absorb_partition_targets(
                          "old_text": "", "reason": "leaf row not found at write boundary"}
             continue
         if prior is not None and prior.get("fingerprint") == info["fingerprint"]:
+            # Reuse only above the floor on the FRESH score (fail closed; with
+            # the vector in the fingerprint this is belt and braces).
+            if (prior.get("verdict") == "supersede"
+                    and float(info.get("score") or 0.0) < _ABSORB_SUPERSEDE_MIN_SCORE):
+                checks[t] = {**prior, "verdict": "related", "gate": "score",
+                             "score": float(info.get("score") or 0.0),
+                             "reason": (f"similarity {float(info.get('score') or 0.0):.2f} below supersede "
+                                        f"minimum {_ABSORB_SUPERSEDE_MIN_SCORE:.2f} at the write boundary")}
             continue
         if prior is None:
             absorb_count("late_supersede_checks")
