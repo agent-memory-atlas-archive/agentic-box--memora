@@ -903,32 +903,35 @@ class D1Connection:
         if self._session_token:
             headers["cf-d1-session-token"] = self._session_token
 
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers=headers,
-            method="POST",
-        )
+        if not _proxy_configured():
+            transport = (
+                self._backend._transport(self.base_url)
+                if self._backend is not None
+                else self._own_transport()
+            )
+            status, getheader, raw = transport.post(
+                "/query", data, headers, retry_safe=_is_read_statement(sql),
+            )
+            if status >= 400:
+                raise RuntimeError(f"D1 API error ({status}): {raw.decode(errors='replace')}")
+            result = json.loads(raw.decode())
+            self._absorb_session_token(getheader("cf-d1-session-token"))
+        else:
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers=headers,
+                method="POST",
+            )
 
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read().decode())
+            try:
+                with urllib.request.urlopen(req, timeout=_D1_TIMEOUT_SECONDS) as resp:
+                    result = json.loads(resp.read().decode())
+                    self._absorb_session_token(resp.headers.get("cf-d1-session-token"))
 
-                # Extract session token from response for subsequent requests.
-                # D1 returns the updated bookmark after writes so the next
-                # query on this connection can see its own writes. We also
-                # mirror it up to the owning D1Backend so the *next*
-                # connection (next tool call) inherits the latest bookmark
-                # and preserves read-your-writes across calls.
-                response_token = resp.headers.get("cf-d1-session-token")
-                if response_token:
-                    self._session_token = response_token
-                    if self._backend is not None:
-                        self._backend.update_bookmark(response_token)
-
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode() if e.fp else str(e)
-            raise RuntimeError(f"D1 API error ({e.code}): {error_body}")
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode() if e.fp else str(e)
+                raise RuntimeError(f"D1 API error ({e.code}): {error_body}")
 
         if not result.get("success"):
             errors = result.get("errors", [])
@@ -936,6 +939,26 @@ class D1Connection:
             raise RuntimeError(f"D1 query failed: {error_msg}")
 
         return result
+
+    def _absorb_session_token(self, response_token: Optional[str]) -> None:
+        # Extract session token from response for subsequent requests.
+        # D1 returns the updated bookmark after writes so the next
+        # query on this connection can see its own writes. We also
+        # mirror it up to the owning D1Backend so the *next*
+        # connection (next tool call) inherits the latest bookmark
+        # and preserves read-your-writes across calls.
+        if response_token:
+            self._session_token = response_token
+            if self._backend is not None:
+                self._backend.update_bookmark(response_token)
+
+    def _own_transport(self) -> "_D1Transport":
+        # Connections built without a backend (tools, tests) keep their own.
+        t = getattr(self, "_transport_obj", None)
+        if t is None:
+            t = _D1Transport(self.base_url)
+            self._transport_obj = t
+        return t
 
     def execute(self, sql: str, params: tuple = None) -> D1Cursor:
         """Execute a single SQL statement."""
@@ -1000,14 +1023,105 @@ class D1Connection:
         pass
 
     def close(self):
-        """No-op - HTTP connections are stateless."""
-        pass
+        """Close this connection's own transport, if it has one. Transports
+        owned by a D1Backend are per-thread and outlive the connection on
+        purpose (keep-alive across tool calls)."""
+        t = getattr(self, "_transport_obj", None)
+        if t is not None:
+            t.close()
+            self._transport_obj = None
 
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
         self.close()
+
+
+# Reconnect proactively after this much idle time rather than discover a
+# keep-alive socket the server already closed.
+_D1_KEEPALIVE_IDLE_SECONDS = 25.0
+_D1_TIMEOUT_SECONDS = 30
+
+
+def _proxy_configured() -> bool:
+    # http.client ignores proxy env vars; urllib honours them. Keep urllib
+    # whenever a proxy is configured so behaviour there is unchanged.
+    return any(os.environ.get(k) for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"))
+
+
+def _is_read_statement(sql: str) -> bool:
+    return sql.lstrip().upper().startswith("SELECT")
+
+
+class _D1Transport:
+    """One persistent HTTP(S) connection to the D1 query endpoint.
+
+    Owned by exactly one thread (see D1Backend._transport), so no socket is
+    ever shared. Saves a TCP + TLS handshake per statement.
+
+    Retry policy, deliberately narrow: only when a REUSED connection fails
+    before any response (the server closed an idle keep-alive socket), and
+    only for a SELECT. A write is never re-sent: D1 may have executed it
+    with the response lost, and a blind resend could insert twice.
+    """
+
+    def __init__(self, base_url: str):
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(base_url)
+        self._scheme = parts.scheme
+        self._host = parts.hostname
+        self._port = parts.port
+        self._path = parts.path
+        self._conn = None
+        self._last_used = 0.0
+
+    def _new(self):
+        import http.client
+
+        cls = http.client.HTTPSConnection if self._scheme == "https" else http.client.HTTPConnection
+        return cls(self._host, self._port, timeout=_D1_TIMEOUT_SECONDS)
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def post(self, suffix: str, body: bytes, headers: dict, *, retry_safe: bool):
+        """POST and return (status, response header getter, body bytes)."""
+        import http.client
+
+        now = time.monotonic()
+        if self._conn is not None and now - self._last_used > _D1_KEEPALIVE_IDLE_SECONDS:
+            self.close()
+        reused = self._conn is not None
+        if self._conn is None:
+            self._conn = self._new()
+        try:
+            self._conn.request("POST", self._path + suffix, body=body, headers=headers)
+            resp = self._conn.getresponse()
+            data = resp.read()
+        except (http.client.RemoteDisconnected, http.client.CannotSendRequest,
+                ConnectionResetError, BrokenPipeError) as exc:
+            self.close()
+            if not (reused and retry_safe):
+                raise
+            logger.debug("D1 keep-alive connection was stale (%s); retrying read once", exc)
+            self._conn = self._new()
+            self._conn.request("POST", self._path + suffix, body=body, headers=headers)
+            resp = self._conn.getresponse()
+            data = resp.read()
+        except Exception:
+            self.close()
+            raise
+        self._last_used = time.monotonic()
+        if (resp.getheader("connection") or "").lower() == "close":
+            self.close()
+        return resp.status, resp.getheader, data
 
 
 class D1Backend(StorageBackend):
@@ -1039,8 +1153,18 @@ class D1Backend(StorageBackend):
         self.api_token = api_token
         self._latest_bookmark: Optional[str] = None
         self._bookmark_lock = threading.Lock()
+        self._transports = threading.local()
 
         logger.info(f"Initialized D1Backend: database={database_id}")
+
+    def _transport(self, base_url: str) -> "_D1Transport":
+        """This thread's persistent connection to D1 (created on first use).
+        Worker threads are reused across tool calls, so the connection is too."""
+        t = getattr(self._transports, "d1", None)
+        if t is None:
+            t = _D1Transport(base_url)
+            self._transports.d1 = t
+        return t
 
     def get_latest_bookmark(self) -> Optional[str]:
         with self._bookmark_lock:

@@ -6,6 +6,7 @@ import hashlib
 import io
 import contextvars
 import threading
+from collections import OrderedDict
 import json
 import logging
 import math
@@ -2362,7 +2363,78 @@ def _search_by_vector(
     tags_any: Optional[List[str]] = None,
     tags_all: Optional[List[str]] = None,
     tags_none: Optional[List[str]] = None,
+    corpus: Optional["_CorpusSnapshot"] = None,
+    meta: Optional[Dict[str, Optional[str]]] = None,
 ) -> List[Dict[str, Any]]:
+    """Exhaustive vector search scored against the corpus snapshot.
+
+    Same result as _search_by_vector_scan (the full-row paginated scan it
+    replaces): every filter runs before top-k truncation, ties break on
+    (score, created_at) then ascending id, and only the ranked ids are
+    hydrated (one IN query per 100). The snapshot is the epoch-validated
+    process cache (_corpus_base): a warm call costs one memories_meta read
+    instead of a full download. Its load-time repair pass computes and
+    stores any missing embedding, replacing the scan's inline backfill.
+    """
+    base = corpus if corpus is not None else _corpus_base(conn, meta=meta)
+    exclude_set = set(exclude_ids or [])
+    validated_filters = _validate_metadata_filters(metadata_filters) if metadata_filters else None
+    parsed_date_from = _parse_date_filter(date_from) if date_from else None
+    parsed_date_to = _parse_date_filter(date_to) if date_to else None
+    filtering_tags_dates = bool(parsed_date_from or parsed_date_to or tags_any or tags_all or tags_none)
+
+    scored: List[Tuple[float, str, int]] = []
+    for entry in base.entries_in_id_order():
+        if entry.id in exclude_set or entry.vector is _CERTIFIED_EMPTY_EMBEDDING:
+            continue
+        if validated_filters:
+            present = (
+                _present_metadata(json.loads(entry.metadata_json)) if entry.metadata_json else None
+            )
+            if not _metadata_matches_filters(present, validated_filters):
+                continue
+        if filtering_tags_dates and not _record_passes_date_tag_filters(
+            {"created_at": entry.created_at, "tags": entry.tags or []},
+            parsed_date_from=parsed_date_from,
+            parsed_date_to=parsed_date_to,
+            tags_any=tags_any,
+            tags_all=tags_all,
+            tags_none=tags_none,
+        ):
+            continue
+        score = _cosine_similarity(vector_query, entry.vector)
+        if min_score is not None and score < min_score:
+            continue
+        scored.append((score, entry.created_at or "", entry.id))
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    if top_k is not None:
+        scored = scored[:top_k]
+    with absorb_phase("hydrate"):
+        rows = _hydrate_memories_by_ids(conn, [mid for _, _, mid in scored])
+    return [
+        {"score": score, "memory": _serialise_row(rows[mid])}
+        for score, _, mid in scored
+        if mid in rows
+    ]
+
+
+def _search_by_vector_scan(
+    conn: sqlite3.Connection,
+    vector_query: Dict[str, float],
+    *,
+    metadata_filters: Optional[Dict[str, Any]] = None,
+    top_k: Optional[int] = 5,
+    min_score: Optional[float] = None,
+    exclude_ids: Optional[Iterable[int]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    tags_any: Optional[List[str]] = None,
+    tags_all: Optional[List[str]] = None,
+    tags_none: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """The pre-snapshot search: page every row with content and embedding.
+    Kept as the reference _search_by_vector must equal (tests) and for
+    callers that need a scan independent of the process cache."""
     exclude_set = set(exclude_ids or [])
     validated_filters = _validate_metadata_filters(metadata_filters) if metadata_filters else None
     parsed_date_from = _parse_date_filter(date_from) if date_from else None
@@ -2499,14 +2571,22 @@ _CORPUS_REPAIR_BATCH = 256
 
 
 class _CorpusEntry:
-    __slots__ = ("id", "vector", "created_at", "metadata_type", "encoding_source")
+    # metadata_json / tags carry what semantic_search's metadata, tag and date
+    # filters read, so filtering happens against the snapshot before top-k
+    # truncation exactly as the old full-row scan did. None on entries absorb
+    # appends to its private fork (absorb never filters).
+    __slots__ = ("id", "vector", "created_at", "metadata_type", "encoding_source",
+                 "metadata_json", "tags")
 
-    def __init__(self, id, vector, created_at, metadata_type, encoding_source):
+    def __init__(self, id, vector, created_at, metadata_type, encoding_source,
+                 metadata_json=None, tags=None):
         self.id = id
         self.vector = vector
         self.created_at = created_at
         self.metadata_type = metadata_type
         self.encoding_source = encoding_source
+        self.metadata_json = metadata_json
+        self.tags = tags
 
 
 class _CorpusSnapshot:
@@ -2537,8 +2617,20 @@ class _CorpusSnapshot:
         new._cache_key = self._cache_key
         return new
 
-    def append(self, id, vector, created_at, metadata_type, encoding_source: str = "python") -> None:
-        self._by_id[id] = _CorpusEntry(id, vector, created_at, metadata_type, encoding_source)
+    def append(self, id, vector, created_at, metadata_type, encoding_source: str = "python",
+               metadata_json: Optional[str] = None, tags: Optional[List[str]] = None) -> None:
+        self._by_id[id] = _CorpusEntry(
+            id, vector, created_at, metadata_type, encoding_source, metadata_json, tags,
+        )
+
+    def ids(self) -> set:
+        """Every memory id the snapshot holds (live at the snapshot's epoch)."""
+        return set(self._by_id)
+
+    def entries_in_id_order(self):
+        """Entries by ascending id: the order the old paginated scan visited
+        rows in, which a stable sort needs to break exact ties the same way."""
+        return [self._by_id[i] for i in sorted(self._by_id)]
 
     def metadata_type(self, id: int) -> Optional[str]:
         entry = self._by_id.get(id)
@@ -2560,7 +2652,9 @@ class _CorpusSnapshot:
     def search(self, vector, *, top_k: int = 5, min_score: Optional[float] = None, exclude_ids=()) -> List[Tuple[int, float]]:
         exclude = set(exclude_ids or ())
         results: List[Tuple[float, str, int]] = []
-        for entry in self._by_id.values():
+        # Ascending id, like the paginated scan: exact (score, created_at)
+        # ties then resolve identically (repaired rows are appended last).
+        for entry in self.entries_in_id_order():
             if entry.id in exclude:
                 continue
             if entry.vector is _CERTIFIED_EMPTY_EMBEDDING:
@@ -2573,6 +2667,11 @@ class _CorpusSnapshot:
         # created_at desc for ties (newest first).
         results.sort(key=lambda t: (t[0], t[1]), reverse=True)
         return [(entry_id, score) for score, _, entry_id in results[:top_k]]
+
+
+def _tags_from_json(tags_json: Optional[str]) -> List[str]:
+    # Same parse as _serialise_row's "tags".
+    return json.loads(tags_json) if tags_json else []
 
 
 def _metadata_type_from_metadata(metadata_json: Optional[str]) -> Optional[str]:
@@ -2612,7 +2711,7 @@ def _load_corpus_snapshot(conn: sqlite3.Connection, *, page_size: int = _VECTOR_
     while True:
         rows = conn.execute(
             """
-            SELECT m.id, m.created_at, m.metadata,
+            SELECT m.id, m.created_at, m.metadata, m.tags,
                    e.embedding AS embedding,
                    e.representation AS embedding_representation,
                    e.encoding_source AS embedding_encoding_source
@@ -2644,6 +2743,7 @@ def _load_corpus_snapshot(conn: sqlite3.Connection, *, page_size: int = _VECTOR_
                 snapshot.append(
                     row["id"], vector, row["created_at"], meta_type,
                     row["embedding_encoding_source"],
+                    metadata_json=row["metadata"], tags=_tags_from_json(row["tags"]),
                 )
             last_id = row["id"]
         if len(rows) < page_size:
@@ -2699,6 +2799,7 @@ def _repair_corpus_embeddings(
             snapshot.append(
                 row["id"], vector, created_by_id.get(row["id"]),
                 _metadata_type_from_metadata(meta_by_id.get(row["id"])), "python",
+                metadata_json=row["metadata"], tags=tags,
             )
 
 
@@ -2767,6 +2868,35 @@ class _CorpusCacheEntry:
         self.epoch = epoch
 
 
+# memories_meta keys a search needs at call start, read in ONE statement and
+# shared by the integrity check and the corpus-cache freshness check.
+_SEARCH_META_KEYS = ("embedding_model", "embedding_change_epoch", "embedding_integrity")
+
+
+def _read_meta_keys(conn: sqlite3.Connection, keys: Iterable[str]) -> Dict[str, Optional[str]]:
+    """{key: value or None} for keys, from one memories_meta IN select."""
+    keys = list(dict.fromkeys(keys))
+    placeholders = ",".join("?" for _ in keys)
+    out: Dict[str, Optional[str]] = {k: None for k in keys}
+    for r in conn.execute(
+        f"SELECT key, value FROM memories_meta WHERE key IN ({placeholders})", keys,
+    ).fetchall():
+        out[_row_field(r, 0, "key")] = _row_field(r, 1, "value")
+    return out
+
+
+def _corpus_meta_from(meta: Mapping[str, Optional[str]]) -> Tuple[Optional[str], Optional[int]]:
+    """(model_stamp, epoch) from already-read meta values; see _corpus_meta."""
+    model = meta.get("embedding_model")
+    epoch_raw = meta.get(_EPOCH_KEY)
+    if epoch_raw is None or isinstance(epoch_raw, bool):
+        return model, None
+    try:
+        return model, int(epoch_raw)
+    except (TypeError, ValueError):
+        return model, None
+
+
 def _corpus_meta(conn: sqlite3.Connection) -> Tuple[Optional[str], Optional[int]]:
     """Read (model_stamp, epoch) from memories_meta in ONE SELECT.
 
@@ -2807,7 +2937,11 @@ def _corpus_cache_key_for(store: str, model: Optional[str]) -> str:
     return f"{store}|{model or ''}"
 
 
-def _corpus_base(conn: sqlite3.Connection) -> _CorpusSnapshot:
+def _corpus_base(
+    conn: sqlite3.Connection,
+    *,
+    meta: Optional[Mapping[str, Optional[str]]] = None,
+) -> _CorpusSnapshot:
     """Return the immutable shared base snapshot for this store, loading and
     caching it under a STABLE epoch. Callers must fork() before mutating.
 
@@ -2815,10 +2949,14 @@ def _corpus_base(conn: sqlite3.Connection) -> _CorpusSnapshot:
     malformed, exact-load and DO NOT cache. An unavailable proof must never
     be treated as a valid stable epoch, or a deleted epoch row would let a
     stale cache be reused forever (the triggers update zero rows).
+
+    meta: memories_meta values this call already read (_read_meta_keys with
+    at least the model and epoch keys), so the warm path needs no statement
+    of its own. The cold path still re-reads the epoch around its load.
     """
     from .embeddings import _store_cache_key
     store = _store_cache_key(conn)
-    model, epoch = _corpus_meta(conn)
+    model, epoch = _corpus_meta_from(meta) if meta is not None else _corpus_meta(conn)
     if epoch is None:
         loaded = _load_corpus_snapshot(conn)
         loaded._cache_key = None
@@ -3816,10 +3954,19 @@ def _load_supersession_view(
         nxt: List[int] = []
         for mid in frontier:
             for ref in crossrefs.get(mid, []):
-                if not isinstance(ref, dict) or ref.get("edge_type") not in _SUPERSESSION_EDGE_TYPES:
+                # The per-row walks read ref["id"] of EVERY entry (a non-dict
+                # crashes them) and compare ids with SQL affinity ("7" and 7.0
+                # both match memory 7). Rather than re-implement those quirks,
+                # decline: the caller falls back to the per-row reads, so such
+                # data behaves exactly as before, just without the speed-up.
+                if not isinstance(ref, dict):
+                    return None
+                if ref.get("edge_type") not in _SUPERSESSION_EDGE_TYPES:
                     continue
                 rid = ref.get("id")
-                if isinstance(rid, int) and rid not in checked:
+                if type(rid) is not int:
+                    return None
+                if rid not in checked:
                     nxt.append(rid)
         frontier = list(dict.fromkeys(nxt))
     retired = _retired_ids_among(conn, list(checked))
@@ -3875,6 +4022,8 @@ def _resolve_latest(
     conn: sqlite3.Connection,
     memory_id: int,
     retired_ids: Optional[set[int]] = None,
+    *,
+    view: Optional["_SupersessionView"] = None,
 ) -> List[int]:
     """Walk forward along superseded_by edges to find all leaf versions.
 
@@ -3885,18 +4034,19 @@ def _resolve_latest(
     """
     if _is_tombstoned_id(conn, memory_id, retired_ids):
         return []
-    all_ids = _walk_chain(conn, memory_id, "superseded_by")
+    crossrefs, exists = _graph_readers(conn, view)
+    all_ids = _walk_chain(conn, memory_id, "superseded_by", view=view)
     # Leaves are nodes with no outgoing superseded_by edge to a node in our set
     # (edges to nodes outside the walked set don't count as successors within the chain)
     all_ids_set = set(all_ids)
     leaves = []
     for mid in all_ids:
-        refs = get_crossrefs(conn, mid)
+        refs = crossrefs(mid)
         has_successor = any(
             ref.get("edge_type") == "superseded_by"
             and ref["id"] in all_ids_set
             and ref["id"] != mid
-            and _memory_exists(conn, ref["id"])
+            and exists(ref["id"])
             for ref in refs
         )
         if not has_successor:
@@ -4166,6 +4316,136 @@ def _superseded_ids_batch(conn: sqlite3.Connection, memory_ids: List[int]) -> se
     return {mid for mid, refs in claims.items() if any(r in existing for r in refs)}
 
 
+_fast_path_warned: set = set()
+
+
+def _warn_fast_path_fallback(name: str, exc: BaseException) -> None:
+    """A read fast path fell back to its legacy reads. Results stay correct;
+    only speed is lost -- so say so once per process, loudly enough to see
+    (e.g. if a D1 build lacked a JSON function the single queries rely on)."""
+    level = logging.WARNING if name not in _fast_path_warned else logging.DEBUG
+    _fast_path_warned.add(name)
+    logger.log(level, "%s fast path unavailable, using legacy reads: %s: %s",
+               name, type(exc).__name__, exc)
+
+
+def _refs_walk_unsafe(refs: List[Any]) -> bool:
+    """Would the per-row chain walks read this crossref list differently from
+    the batched readers? They read ref["id"] of every entry (a non-dict or a
+    missing "id" raises) and step onto supersession ids with SQL affinity
+    ("7" and 7.0 reach memory 7). Such lists take the verbatim legacy path."""
+    for ref in refs:
+        if not isinstance(ref, dict) or "id" not in ref:
+            return True
+        if ref.get("edge_type") in _SUPERSESSION_EDGE_TYPES and type(ref.get("id")) is not int:
+            return True
+    return False
+
+
+def _follow_status_legacy(conn: sqlite3.Connection, ids: List[int]) -> Tuple[set, set, set]:
+    retired = retired_memory_ids(conn)
+    unsafe = {i for i in ids if _refs_walk_unsafe(get_crossrefs(conn, i))}
+    return _superseded_ids_batch(conn, ids), {i for i in ids if i in retired}, unsafe
+
+
+def _follow_status(conn: sqlite3.Connection, ids: List[int]) -> Tuple[set, set, set]:
+    """(superseded, retired, walk_unsafe) among ids, in ONE statement for any
+    page size. walk_unsafe: ids whose crossref list _refs_walk_unsafe flags.
+
+    Equal to (_superseded_ids_batch(ids), ids & retired_memory_ids()): a
+    memory is superseded when its crossref blob (a JSON array) holds an
+    object with edge_type "superseded_by" and a numeric id of a memory that
+    exists (Python's `5.0 in {5}` is True, and SQLite's m.id = 5.0 matches);
+    retired when either tombstone table names it. json_valid / json_type
+    guard exactly the blobs the Python parser skips (malformed, non-array,
+    non-object entries, non-numeric ids).
+
+    The ids travel as ONE JSON-array parameter expanded by json_each, so the
+    statement stays under D1's 100-bound-parameter cap at any size.
+    Replaces four round trips (both tombstone tables in full, the crossref
+    blobs, the superseders' existence). Any SQL failure -- including an
+    unmigrated tombstone table -- falls back to the legacy path, which owns
+    the missing-table and RetirementIntegrityError semantics.
+    """
+    unique = list(dict.fromkeys(int(i) for i in ids))
+    if not unique:
+        return set(), set(), set()
+    found: Dict[str, set] = {"superseded": set(), "retired": set(), "unsafe": set()}
+    try:
+        rows = conn.execute(
+            """
+            WITH ids(id) AS (SELECT value FROM json_each(?))
+            SELECT c.memory_id AS id, 'superseded' AS kind
+              FROM memories_crossrefs c, json_each(c.related) j
+             WHERE c.memory_id IN (SELECT id FROM ids)
+               AND json_valid(c.related) AND json_type(c.related) = 'array'
+               AND j.type = 'object'
+               AND json_extract(j.value, '$.edge_type') = 'superseded_by'
+               AND json_type(j.value, '$.id') IN ('integer', 'real')
+               AND EXISTS (SELECT 1 FROM memories m
+                            WHERE m.id = json_extract(j.value, '$.id'))
+            UNION
+            SELECT memory_id, 'retired' FROM tombstone_components
+             WHERE memory_id IN (SELECT id FROM ids)
+            UNION
+            SELECT memory_id, 'retired' FROM tombstones
+             WHERE memory_id IN (SELECT id FROM ids)
+            UNION
+            SELECT c.memory_id, 'unsafe' FROM memories_crossrefs c
+             WHERE c.memory_id IN (SELECT id FROM ids)
+               AND json_valid(c.related) AND json_type(c.related) = 'array'
+               AND EXISTS (
+                   SELECT 1 FROM json_each(c.related) u
+                    WHERE u.type != 'object'
+                       OR json_type(u.value, '$.id') IS NULL
+                       OR (json_extract(u.value, '$.edge_type') IN ('supersedes', 'superseded_by')
+                           AND json_type(u.value, '$.id') != 'integer'))
+            """,
+            (json.dumps(unique),),
+        ).fetchall()
+        for r in rows:
+            found[_row_field(r, 1, "kind")].add(int(_row_field(r, 0, "id")))
+    except Exception as exc:
+        _warn_fast_path_fallback("follow status", exc)
+        return _follow_status_legacy(conn, unique)
+    return found["superseded"], found["retired"], found["unsafe"]
+
+
+def _hydrate_for_follow(conn: sqlite3.Connection, ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    """_serialise_memory_for_follow for many ids: one IN query per 100."""
+    unique = list(dict.fromkeys(ids))
+    out: Dict[int, Dict[str, Any]] = {}
+    for chunk in _chunked(unique):
+        ph = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"""SELECT id, content, metadata, tags, created_at, updated_at,
+                       importance, last_accessed, access_count
+                  FROM memories WHERE id IN ({ph})""",
+            chunk,
+        ).fetchall():
+            out[row["id"]] = _serialise_row(row)
+    return out
+
+
+def _apply_follow_latest_legacy(conn, results, _get_id, _wrap, is_search, seen_ids):
+    """The pre-batching follow="latest" loop, verbatim (per-row reads)."""
+    retired_ids = retired_memory_ids(conn)
+    out: List[Dict[str, Any]] = []
+    for item in results:
+        leaf_ids = _resolve_latest(conn, _get_id(item), retired_ids)
+        for latest_id in leaf_ids:
+            if latest_id in seen_ids:
+                continue
+            seen_ids.add(latest_id)
+            if latest_id == _get_id(item):
+                out.append(item)
+            else:
+                latest_mem = _serialise_memory_for_follow(conn, latest_id)
+                if latest_mem:
+                    out.append(_wrap(latest_mem, item.get("score", 0) if is_search else 0))
+    return out
+
+
 def apply_follow(
     conn: sqlite3.Connection,
     results: List[Dict[str, Any]],
@@ -4208,8 +4488,7 @@ def apply_follow(
         # surfaces EVERY live leaf until the next absorb UPDATE collapses
         # them. Graph-only quarantine (authority_unknown on multi-leaf tips)
         # is the approved middle scope; storage-side quarantine is a follow-up.
-        retired_ids = retired_memory_ids(conn)
-        superseded = _superseded_ids_batch(conn, [_get_id(item) for item in results])
+        superseded, retired_ids, _unsafe = _follow_status(conn, [_get_id(item) for item in results])
         return [
             item for item in results
             if _get_id(item) not in superseded
@@ -4219,20 +4498,46 @@ def apply_follow(
     if follow == "latest":
         if seen_ids is None:
             seen_ids = set()
-        retired_ids = retired_memory_ids(conn)
-        out: List[Dict[str, Any]] = []
+        # An item with no live superseded_by edge IS its own latest version
+        # (or has none, if retired) -- exactly what _resolve_latest returns
+        # for it -- so only superseded items need a chain walk, and those
+        # walks share one bounded supersession view. Latest versions other
+        # than the items themselves are hydrated in one query at the end.
+        item_ids = [_get_id(item) for item in results]
+        superseded, retired_here, unsafe = _follow_status(conn, item_ids)
+        walk = [i for i in dict.fromkeys(item_ids) if i in superseded and i not in retired_here]
+        view = _load_supersession_view(conn, walk) if walk and not unsafe else None
+        if unsafe or (walk and view is None):
+            # Malformed crossrefs somewhere the walks go (or a neighborhood
+            # past the view's bounds): the verbatim per-row algorithm.
+            return _apply_follow_latest_legacy(conn, results, _get_id, _wrap, is_search, seen_ids)
+        walk_retired = view.retired if view is not None else set()
+        leaves_by_id: Dict[int, List[int]] = {}
+        for mid in dict.fromkeys(item_ids):
+            if mid in retired_here:
+                leaves_by_id[mid] = []
+            elif mid not in superseded:
+                leaves_by_id[mid] = [mid]
+            else:
+                leaves_by_id[mid] = _resolve_latest(conn, mid, walk_retired, view=view)
+        plan: List[Tuple[Dict[str, Any], int]] = []
         for item in results:
-            leaf_ids = _resolve_latest(conn, _get_id(item), retired_ids)
-            for latest_id in leaf_ids:
+            for latest_id in leaves_by_id[_get_id(item)]:
                 if latest_id in seen_ids:
                     continue
                 seen_ids.add(latest_id)
-                if latest_id == _get_id(item):
-                    out.append(item)
-                else:
-                    latest_mem = _serialise_memory_for_follow(conn, latest_id)
-                    if latest_mem:
-                        out.append(_wrap(latest_mem, item.get("score", 0) if is_search else 0))
+                plan.append((item, latest_id))
+        others = _hydrate_for_follow(
+            conn, [lid for item, lid in plan if lid != _get_id(item)],
+        )
+        out: List[Dict[str, Any]] = []
+        for item, latest_id in plan:
+            if latest_id == _get_id(item):
+                out.append(item)
+            else:
+                latest_mem = others.get(latest_id)
+                if latest_mem:
+                    out.append(_wrap(latest_mem, item.get("score", 0) if is_search else 0))
         return out
 
     if follow == "full_history":
@@ -4519,13 +4824,26 @@ def detect_clusters(
     return result
 
 
-def _update_crossrefs(conn: sqlite3.Connection, memory_id: int) -> None:
+def _update_crossrefs(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    *,
+    corpus: Optional[_CorpusSnapshot] = None,
+) -> None:
+    """Recompute memory_id's related_to crossrefs.
+
+    corpus: score against this snapshot (read-only; e.g. the epoch-validated
+    _corpus_base) instead of a full-store scan, and take memory_id's own
+    vector from it. Same result as the scan: same top-k, same document
+    exclusion, ties broken by ascending id.
+    """
     # Skip cross-reference computation for section memories
     record = get_memory(conn, memory_id)
     metadata = record.get("metadata") if record else None
     if metadata and metadata.get("type") == "section":
         return
-    _update_crossrefs_for_memory(conn, memory_id)
+    vector = corpus.vector(memory_id) if corpus is not None else None
+    _update_crossrefs_for_memory(conn, memory_id, vector=vector, corpus=corpus)
     # Cascade (updating related memories' crossrefs) intentionally skipped.
     # Related memories' crossrefs become eventually consistent via
     # memory_rebuild_crossrefs or memory_related(refresh=True).
@@ -4644,6 +4962,26 @@ def rebuild_crossrefs(conn: sqlite3.Connection) -> int:
 
 def update_crossrefs(conn: sqlite3.Connection, memory_id: int) -> None:
     _update_crossrefs(conn, memory_id)
+
+
+def get_related(conn: sqlite3.Connection, memory_id: int, refresh: bool = False) -> List[Dict[str, Any]]:
+    """memory_related: stored crossrefs, computed when asked or never computed.
+
+    A crossref ROW that exists holds a computed answer even when its list is
+    empty (e.g. every neighbour is a document fragment); only a missing row
+    means "never computed". The old rule recomputed on every call whenever
+    the list was empty -- a full-store scan per call for those memories.
+    Recomputes score against the corpus snapshot, not a store scan.
+
+    A list stored empty stays empty until refresh=True, like any other
+    stored list (crossrefs are not cascaded on later writes).
+    """
+    if not refresh:
+        exists, _raw, refs = _load_crossrefs_raw(conn, memory_id)
+        if exists:
+            return refs
+    _update_crossrefs(conn, memory_id, corpus=_corpus_base(conn))
+    return get_crossrefs(conn, memory_id)
 
 
 def _remove_memory_from_crossrefs(conn: sqlite3.Connection, memory_id: int) -> None:
@@ -7137,7 +7475,118 @@ def get_hierarchy_paths(conn: sqlite3.Connection) -> List[List[str]]:
     return sorted([list(p) for p in paths_set], key=lambda p: (len(p), p))
 
 
+def _get_bundles(conn: sqlite3.Connection, ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    """For each existing id: its memory row, its crossref list and whether
+    it is retired -- ONE statement per 100 ids (LEFT JOIN crossrefs, EXISTS
+    against both tombstone tables). Raises on any SQL error (e.g. an
+    unmigrated tombstone table); get_memory then takes the legacy path."""
+    out: Dict[int, Dict[str, Any]] = {}
+    for chunk in _chunked(list(dict.fromkeys(ids))):
+        ph = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"""SELECT m.id, m.content, m.metadata, m.tags, m.created_at, m.updated_at,
+                       m.importance, m.last_accessed, m.access_count,
+                       c.related AS related,
+                       EXISTS (SELECT 1 FROM tombstone_components t WHERE t.memory_id = m.id)
+                           AS retired_component,
+                       EXISTS (SELECT 1 FROM tombstones t2 WHERE t2.memory_id = m.id)
+                           AS retired_legacy
+                  FROM memories m
+                  LEFT JOIN memories_crossrefs c ON c.memory_id = m.id
+                 WHERE m.id IN ({ph})""",
+            chunk,
+        ).fetchall():
+            out[row["id"]] = {
+                "row": row,
+                "related": _parse_crossrefs_blob(row["related"]),
+                "retired": bool(row["retired_component"]) or bool(row["retired_legacy"]),
+            }
+    return out
+
+
+def _bundle_record(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    record = _serialise_row(bundle["row"])
+    record["related"] = bundle["related"]
+    return record
+
+
 def get_memory(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    track_access: bool = False,
+    follow: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Retrieve a single memory by ID.
+
+    Same contract as _get_memory_legacy (see its docstring), in fewer round
+    trips: one statement fetches the row, its crossrefs and its retirement
+    state. A chain is walked only when the memory has a superseded_by edge
+    (follow="latest") or history is asked for, through one bounded
+    supersession view; the versions a result needs are fetched together.
+    Any SQL failure, or an id with no row, takes the legacy path, which owns
+    those edge cases (e.g. a deleted id whose crossref row lingers).
+    """
+    if follow:
+        validate_follow(follow, for_get=True)
+    try:
+        bundles = _get_bundles(conn, [memory_id])
+    except Exception as exc:
+        _warn_fast_path_fallback("get_memory", exc)
+        return _get_memory_legacy(conn, memory_id, track_access=track_access, follow=follow)
+    bundle = bundles.get(memory_id)
+    if bundle is None:
+        return _get_memory_legacy(conn, memory_id, track_access=track_access, follow=follow)
+
+    if follow in ("latest", "full_history") and _refs_walk_unsafe(bundle["related"]):
+        return _get_memory_legacy(conn, memory_id, track_access=track_access, follow=follow)
+
+    if follow == "latest":
+        if bundle["retired"]:
+            return None
+        if any(ref.get("edge_type") == "superseded_by" for ref in bundle["related"]):
+            view = _load_supersession_view(conn, [memory_id])
+            if view is None:
+                return _get_memory_legacy(conn, memory_id, track_access=track_access, follow=follow)
+            retired = view.retired
+            leaf_ids = _resolve_latest(conn, memory_id, retired, view=view)
+            if not leaf_ids:
+                return None
+            latest_id = max(leaf_ids)
+            if latest_id != memory_id:
+                # Same as the legacy recursion: the leaf, fetched plain.
+                return get_memory(conn, latest_id, track_access=track_access)
+
+    history_view = None
+    if follow == "full_history":
+        # Decided before track_access: the legacy fallback must see the row
+        # exactly as legacy would (read first, then tracked).
+        history_view = _load_supersession_view(conn, [memory_id])
+        if history_view is None:
+            return _get_memory_legacy(conn, memory_id, track_access=track_access, follow=follow)
+
+    if track_access:
+        _track_access(conn, memory_id)
+        conn.commit()
+
+    record = _bundle_record(bundle)
+
+    if follow == "full_history":
+        chain_ids = _get_full_history(conn, memory_id, view=history_view)
+        if len(chain_ids) > 1:
+            others = _get_bundles(conn, [cid for cid in chain_ids if cid != memory_id])
+            chain = []
+            for cid in chain_ids:
+                if cid == memory_id:
+                    # Copy to avoid circular reference (record["history"] containing record itself)
+                    chain.append(dict(record))
+                elif cid in others:
+                    chain.append(_bundle_record(others[cid]))
+            record["history"] = chain
+
+    return record
+
+
+def _get_memory_legacy(
     conn: sqlite3.Connection,
     memory_id: int,
     track_access: bool = False,
@@ -7175,7 +7624,7 @@ def get_memory(
             return None
         latest_id = max(leaf_ids)
         if latest_id != memory_id:
-            return get_memory(conn, latest_id, track_access=track_access)
+            return _get_memory_legacy(conn, latest_id, track_access=track_access)
 
     row = conn.execute(
         """SELECT id, content, metadata, tags, created_at, updated_at,
@@ -7202,7 +7651,7 @@ def get_memory(
                     # Copy to avoid circular reference (record["history"] containing record itself)
                     chain.append(dict(record))
                 else:
-                    mem = get_memory(conn, cid)
+                    mem = _get_memory_legacy(conn, cid)
                     if mem:
                         chain.append(mem)
             record["history"] = chain
@@ -7868,6 +8317,40 @@ def find_invalid_tag_entries(
     return invalid
 
 
+_QUERY_EMBEDDING_CACHE_SIZE = 256
+_query_embedding_cache: "OrderedDict[Tuple[str, ...], Dict[str, float]]" = OrderedDict()
+_query_embedding_lock = threading.Lock()
+
+
+def _query_embedding(query: str) -> Dict[str, float]:
+    """_compute_embedding(query, None, []) with a small process-local LRU.
+
+    Keyed by the query text AND everything that selects the embedding
+    (backend, model, endpoint), so a config change never serves a vector from
+    another model. Empty results and failures are never cached.
+    """
+    key = (
+        EMBEDDING_MODEL,
+        os.getenv("OPENAI_EMBEDDING_MODEL", ""),
+        os.getenv("MEMORA_EMBEDDING_BASE_URL", "") or os.getenv("OPENAI_BASE_URL", ""),
+        query,
+    )
+    with _query_embedding_lock:
+        hit = _query_embedding_cache.get(key)
+        if hit is not None:
+            _query_embedding_cache.move_to_end(key)
+            absorb_count("query_embedding_cache_hits")
+            return hit
+    vector = _compute_embedding(query, None, [])
+    if vector:
+        with _query_embedding_lock:
+            _query_embedding_cache[key] = vector
+            _query_embedding_cache.move_to_end(key)
+            while len(_query_embedding_cache) > _QUERY_EMBEDDING_CACHE_SIZE:
+                _query_embedding_cache.popitem(last=False)
+    return vector
+
+
 def semantic_search(
     conn: sqlite3.Connection,
     query: str,
@@ -7903,9 +8386,14 @@ def semantic_search(
     Returns:
         List of results with score and memory
     """
+    # One memories_meta read feeds both the integrity check and the corpus
+    # cache's freshness check (previously 3-4 separate statements).
+    with absorb_phase("meta"):
+        meta = _read_meta_keys(conn, _SEARCH_META_KEYS)
     # Audit once per process.  A non-repairable external encoding fault must
     # be surfaced instead of entering an auto-rebuild loop.
-    integrity = _get_embedding_integrity_status(conn, EMBEDDING_MODEL)
+    with absorb_phase("integrity"):
+        integrity = _get_embedding_integrity_status(conn, EMBEDDING_MODEL, meta=meta)
     if integrity["mismatch"] and not integrity["repairable"]:
         raise EmbeddingIntegrityFault(integrity["reason"], integrity["fault_ids"])
     if auto_rebuild and integrity["mismatch"]:
@@ -7918,14 +8406,19 @@ def semantic_search(
         integrity = _get_embedding_integrity_status(conn, EMBEDDING_MODEL)
         if integrity["mismatch"]:
             raise EmbeddingIntegrityFault(integrity["reason"], integrity["fault_ids"])
+        meta = None  # the rebuild wrote; let the corpus check read fresh
 
-    vector_query = _compute_embedding(query, None, [])
+    with absorb_phase("query_embedding"):
+        vector_query = _query_embedding(query)
     if not vector_query:
         return []
     candidate_top_k = _follow_candidate_limit(top_k, follow)
+    with absorb_phase("corpus"):
+        corpus = _corpus_base(conn, meta=meta)
     results = _search_by_vector(
         conn,
         vector_query,
+        corpus=corpus,
         metadata_filters=metadata_filters,
         top_k=candidate_top_k,
         min_score=min_score,
@@ -7946,7 +8439,8 @@ def semantic_search(
         )
 
     if follow:
-        results = apply_follow(conn, results, follow, is_search=True)
+        with absorb_phase("follow"):
+            results = apply_follow(conn, results, follow, is_search=True)
         if top_k is not None:
             cap = top_k * 3 if follow == "full_history" else top_k
             results = results[:cap]

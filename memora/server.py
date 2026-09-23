@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import contextvars
 import functools
+import json
 import logging
 import os
 import re
@@ -14,6 +15,7 @@ from typing import Any, Dict, List, Literal, Mapping, Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from .absorb_profile import absorb_profile
 from .cloud_sync import schedule_sync as _schedule_cloud_graph_sync
 from .hierarchy import (
     build_hierarchy_tree,
@@ -42,6 +44,7 @@ from .storage import (
     find_invalid_tag_entries,
     generate_insights,
     get_crossrefs,
+    get_related,
     get_hierarchy_paths,
     get_memories_metadata_batch,
     get_memory,
@@ -236,7 +239,18 @@ def _sanitize_tool_schemas(server: FastMCP) -> None:
             _collapse_nullable_anyof(params)
 
 
-def _with_connection(func=None, *, writes=False):
+# The profile of the last profiled storage call made from this async task
+# (see _with_connection(profile=True)); read by the tool that awaited it.
+_LAST_CALL_PROFILE: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "memora_last_call_profile", default=None
+)
+
+
+def _last_call_profile() -> Optional[Dict[str, Any]]:
+    return _LAST_CALL_PROFILE.get()
+
+
+def _with_connection(func=None, *, writes=False, profile=False):
     """Decorator that manages database connections and cloud sync.
 
     Opens a connection, runs the function, closes the connection,
@@ -246,6 +260,9 @@ def _with_connection(func=None, *, writes=False):
 
     Args:
         writes: If True, syncs to cloud after operation. If False, skips sync (read-only).
+        profile: If True, run inside a request profile (per-phase seconds and
+            D1 request counts, memora.absorb_profile), log it at INFO and make
+            it available to the awaiting tool via _last_call_profile().
     """
     def decorator(func):
         def _run(*args, **kwargs):
@@ -258,9 +275,32 @@ def _with_connection(func=None, *, writes=False):
             finally:
                 conn.close()
 
+        def _run_profiled(holder, *args, **kwargs):
+            conn = connect()
+            try:
+                with absorb_profile(conn) as prof:
+                    try:
+                        result = func(conn, *args, **kwargs)
+                        if writes:
+                            sync_to_cloud()
+                    finally:
+                        summary = prof.finish()
+                        holder["profile"] = summary
+                        logger.info("%s profile: %s", func.__name__.lstrip("_"),
+                                    json.dumps(summary, sort_keys=True))
+                return result
+            finally:
+                conn.close()
+
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            return await _in_worker(_run, *args, **kwargs)
+            if not profile:
+                return await _in_worker(_run, *args, **kwargs)
+            holder: Dict[str, Any] = {}
+            try:
+                return await _in_worker(_run_profiled, holder, *args, **kwargs)
+            finally:
+                _LAST_CALL_PROFILE.set(holder.get("profile"))
 
         wrapper.__memora_blocking__ = _run  # type: ignore[attr-defined]
         return wrapper
@@ -329,7 +369,7 @@ def _create_memory(
     return add_memory(conn, content=content.strip(), metadata=metadata, tags=tags or [])
 
 
-@_with_connection
+@_with_connection(profile=True)
 def _get_memory(conn, memory_id: int, follow: Optional[str] = None):
     return get_memory(conn, memory_id, follow=follow)
 
@@ -368,7 +408,7 @@ def _get_memories_metadata_batch(conn, memory_ids: List[int]):
     return get_memories_metadata_batch(conn, memory_ids)
 
 
-@_with_connection
+@_with_connection(profile=True)
 def _list_memories(
     conn,
     query: Optional[str],
@@ -461,15 +501,9 @@ def _find_invalid_tags(conn):
     return find_invalid_tag_entries(conn, TAG_WHITELIST)
 
 
-@_with_connection(writes=True)  # May write crossrefs if refresh=True
+@_with_connection(writes=True, profile=True)  # May write crossrefs if refresh=True
 def _get_related(conn, memory_id: int, refresh: bool) -> List[Dict[str, Any]]:
-    if refresh:
-        update_crossrefs(conn, memory_id)
-    refs = get_crossrefs(conn, memory_id)
-    if not refs and not refresh:
-        update_crossrefs(conn, memory_id)
-        refs = get_crossrefs(conn, memory_id)
-    return refs
+    return get_related(conn, memory_id, refresh)
 
 
 @_with_connection(writes=True)
@@ -477,7 +511,7 @@ def _rebuild_crossrefs(conn):
     return rebuild_crossrefs(conn)
 
 
-@_with_connection
+@_with_connection(profile=True)
 def _semantic_search(
     conn,
     query: str,
@@ -510,7 +544,7 @@ def _resolve_search_cap(
     return max(1, int(requested))
 
 
-@_with_connection
+@_with_connection(profile=True)
 def _hybrid_search(
     conn,
     query: str,
@@ -1414,6 +1448,7 @@ async def memory_list(
         if warnings:
             response["warning"] = "; ".join(sorted(warnings))
     response["memories"] = items
+    response["profile"] = _last_call_profile()
     return response
 
 
@@ -1464,7 +1499,7 @@ async def memory_list_compact(
             "created_at": item.get("created_at"),
         })
 
-    return {"count": len(compact_items), "memories": compact_items}
+    return {"count": len(compact_items), "memories": compact_items, "profile": _last_call_profile()}
 
 
 @mcp.tool()
@@ -1934,6 +1969,7 @@ async def memory_get(
     w = record.pop("_field_warning", None) if isinstance(record, dict) else None
     if w:
         response["warning"] = w
+    response["profile"] = _last_call_profile()
     return response
 
 
@@ -2156,6 +2192,7 @@ async def memory_semantic_search(
         if warning:
             response["warning"] = warning
     response["results"] = results
+    response["profile"] = _last_call_profile()
     return response
 
 
@@ -2249,6 +2286,7 @@ async def memory_hybrid_search(
         if warning:
             response["warning"] = warning
     response["results"] = results
+    response["profile"] = _last_call_profile()
     return response
 
 
@@ -2384,7 +2422,7 @@ async def memory_related(memory_id: int, refresh: bool = False) -> Dict[str, Any
     """
 
     related = await _get_related(memory_id, refresh)
-    return {"id": memory_id, "related": related}
+    return {"id": memory_id, "related": related, "profile": _last_call_profile()}
 
 
 @mcp.tool()

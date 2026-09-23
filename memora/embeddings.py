@@ -1375,14 +1375,38 @@ def _model_mismatch_for_reps(reps: Dict[str, int], stored: Optional[str], curren
     return current_model == "tfidf" and any(k.startswith("dense") for k in reps) or stored != current_embedding_fingerprint(current_model)
 
 
-def get_embedding_integrity_status(conn: sqlite3.Connection, current_model: str) -> Dict[str, Any]:
-    """Read one DB-owned epoch per search; re-derive indexed SQL only on change."""
+def _integrity_from_raw(raw: Optional[str]) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def get_embedding_integrity_status(
+    conn: sqlite3.Connection,
+    current_model: str,
+    *,
+    meta: Optional[Dict[str, Optional[str]]] = None,
+) -> Dict[str, Any]:
+    """Read one DB-owned epoch per search; re-derive indexed SQL only on change.
+
+    meta: memories_meta values the caller already read in one statement
+    (embedding_change_epoch, embedding_integrity); saves this check's own
+    two reads. Omitted, both are read here as before.
+    """
     key = _store_cache_key(conn)
-    epoch = _meta_get(conn, "embedding_change_epoch") or "0"
-    # Publishing a build state changes metadata rather than an embedding row,
-    # so it does not advance the embedding epoch. Read this small stamp before
-    # accepting a healthy cached result from another connection/process.
-    stamp = get_embedding_integrity(conn)
+    if meta is not None:
+        epoch = meta.get("embedding_change_epoch") or "0"
+        stamp = _integrity_from_raw(meta.get(_INTEGRITY_KEY))
+    else:
+        epoch = _meta_get(conn, "embedding_change_epoch") or "0"
+        # Publishing a build state changes metadata rather than an embedding row,
+        # so it does not advance the embedding epoch. Read this small stamp before
+        # accepting a healthy cached result from another connection/process.
+        stamp = get_embedding_integrity(conn)
     cached = _integrity_check_cache.get(key)
     if (
         cached is not None

@@ -248,3 +248,13 @@ def supersede_gate_open(monkeypatch):
                 "reason": "gate open in test", "score": 1.0, "old_text": leaf.get("content", "")}
 
     monkeypatch.setattr(storage, "_absorb_check_supersede", confirm)
+
+
+@pytest.fixture(autouse=True)
+def _clear_query_embedding_cache():
+    """semantic_search's query-embedding LRU is process-global; tests fake
+    _compute_embedding in different ways, so never let one test's vector
+    serve another's query."""
+    storage._query_embedding_cache.clear()
+    yield
+    storage._query_embedding_cache.clear()
