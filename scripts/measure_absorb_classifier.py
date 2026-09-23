@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Measure absorb relationship classification against labeled local fixtures."""
+"""Measure absorb relationship classification against labeled local fixtures.
+
+Live mode measures the whole decision absorb takes, including the supersede
+gate: a classifier UPDATE only counts as "update" if the gate's LLM check
+confirms it. Every pair is presented at similarity 0.7 — above the gate's
+minimum score, below the auto-duplicate threshold — so the LLM steps decide,
+not the fixed score. Stub mode stubs both steps to the fixture's label.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +41,7 @@ ACTION_CLASSES = {
     "create_and_link": "related",
     "create": "new",
 }
+FIXTURE_SIMILARITY = 0.7
 DEFAULT_FIXTURES = ROOT / "tests" / "fixtures" / "absorb_classifier_pairs.json"
 
 
@@ -60,6 +68,7 @@ def _predict_case(case: Dict[str, Any], mode: str, db_path: Path) -> Dict[str, A
     original_compute = storage._compute_embedding
     original_search = storage._search_snapshot_full
     original_classifier = storage._classify_fact_against_matches
+    original_check = storage._absorb_check_supersede
     storage.STORAGE_BACKEND = LocalSQLiteBackend(db_path)
     storage.EMBEDDING_MODEL = "tfidf"
     storage._compute_embedding = lambda *args, **kwargs: {"fixture": 1.0}
@@ -68,7 +77,7 @@ def _predict_case(case: Dict[str, Any], mode: str, db_path: Path) -> Dict[str, A
         with storage.connect() as conn:
             existing = storage.add_memory(conn, content=case["memory"])
             storage._search_snapshot_full = lambda *args, **kwargs: [{
-                "score": 0.5,
+                "score": FIXTURE_SIMILARITY,
                 "memory": existing,
             }]
 
@@ -85,6 +94,14 @@ def _predict_case(case: Dict[str, Any], mode: str, db_path: Path) -> Dict[str, A
                     }], [])
 
                 storage._classify_fact_against_matches = stub_classifier
+
+                def stub_check(fact, match_data, classifications, suggested_tags, **_kw):
+                    if storage._absorb_update_candidate(classifications) is None:
+                        return None
+                    return {"verdict": "supersede", "gate": "stub", "reason": "measurement stub",
+                            "score": FIXTURE_SIMILARITY, "old_text": ""}
+
+                storage._absorb_check_supersede = stub_check
             else:
                 live_classifier = original_classifier
 
@@ -130,6 +147,7 @@ def _predict_case(case: Dict[str, Any], mode: str, db_path: Path) -> Dict[str, A
         storage._compute_embedding = original_compute
         storage._search_snapshot_full = original_search
         storage._classify_fact_against_matches = original_classifier
+        storage._absorb_check_supersede = original_check
 
 
 def evaluate(

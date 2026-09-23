@@ -824,7 +824,8 @@ def test_semantic_search_basic(local_db):
 
 @pytest.mark.parametrize("matched_version", ["stale", "leaf"])
 def test_absorb_update_supersedes_current_leaf(
-    local_db, monkeypatch, caplog, matched_version
+    local_db, monkeypatch, caplog, matched_version,
+    supersede_gate_open,
 ):
     """Absorb UPDATEs must extend the leaf, even when retrieval matched history."""
     with storage.connect() as conn:
@@ -874,7 +875,7 @@ def _seed_fork(conn):
     return orig, left, right
 
 
-def test_absorb_update_collapses_fork_to_one_leaf(local_db, monkeypatch):
+def test_absorb_update_collapses_fork_to_one_leaf(local_db, monkeypatch, supersede_gate_open):
     with storage.connect() as conn:
         orig, left, right = _seed_fork(conn)
         monkeypatch.setattr(
@@ -946,7 +947,7 @@ def test_absorb_contradict_does_not_collapse_fork(local_db, monkeypatch):
         assert left["id"] in active and right["id"] in active
 
 
-def test_absorb_write_boundary_reresolve_prevents_refork(local_db, monkeypatch):
+def test_absorb_write_boundary_reresolve_prevents_refork(local_db, monkeypatch, supersede_gate_open):
     with storage.connect() as conn:
         orig, left, right = _seed_fork(conn)
         real_add = storage.add_memory
@@ -1105,7 +1106,7 @@ def test_absorb_new_content_after_tombstone_creates_root(local_db, monkeypatch):
         assert not any(r.get("edge_type") == "supersedes" for r in refs)
 
 
-def test_absorb_write_boundary_tombstone_wins(local_db, monkeypatch):
+def test_absorb_write_boundary_tombstone_wins(local_db, monkeypatch, supersede_gate_open):
     with storage.connect() as conn:
         target = storage.add_memory(conn, content="Race tombstone target extra words")
         real_add = storage.add_memory
@@ -1385,7 +1386,7 @@ def test_delete_absorb_interleave_new_leaf_not_current(fake_d1_backend):
         assert new["id"] in retired or still is None
 
 
-def test_absorb_postlink_recheck_compensates_after_delete_markers(fake_d1_backend, monkeypatch):
+def test_absorb_postlink_recheck_compensates_after_delete_markers(fake_d1_backend, monkeypatch, supersede_gate_open):
     """Delete marks+rewalks complete BEFORE absorb links (target row still there).
 
     D1 commits the marker statement before edge-clear. Resolve-time and
@@ -1465,7 +1466,7 @@ def test_retired_memory_ids_fail_closed_on_operational_error(fake_d1_backend):
         conn.fail_when = None
 
 
-def test_losing_absorb_reports_winner_current_id(fake_d1_backend, monkeypatch):
+def test_losing_absorb_reports_winner_current_id(fake_d1_backend, monkeypatch, supersede_gate_open):
     backend = fake_d1_backend
     with storage.connect() as setup:
         leaf = storage.add_memory(setup, content="Concurrent absorb leaf extra words")
@@ -1525,7 +1526,7 @@ def test_losing_absorb_reports_winner_current_id(fake_d1_backend, monkeypatch):
     c2.close()
 
 
-def test_absorb_second_link_failure_compensates(fake_d1_backend, monkeypatch):
+def test_absorb_second_link_failure_compensates(fake_d1_backend, monkeypatch, supersede_gate_open):
     """Nth add_link failure on a 3-leaf fork must not leave a partial collapse."""
     with storage.connect() as conn:
         orig = storage.add_memory(conn, content="Compensate root extra words")

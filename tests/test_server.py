@@ -170,7 +170,7 @@ def test_memory_digest_synthesize_is_warning_only(local_db):
     assert digest["parameters"]["synthesize"] is True
 
 
-def test_uniform_current_after_fork_collapse(local_db, monkeypatch):
+def test_uniform_current_after_fork_collapse(local_db, monkeypatch, supersede_gate_open):
     import memora.storage as st
 
     with st.connect() as conn:

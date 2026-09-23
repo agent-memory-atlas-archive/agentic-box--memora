@@ -376,7 +376,7 @@ def test_repair_certified_empty_not_recomputed(local_db, monkeypatch):
         )
 
 
-def test_absorb_discard_removes_compensated_memory_from_later_crossref(local_db, monkeypatch):
+def test_absorb_discard_removes_compensated_memory_from_later_crossref(local_db, monkeypatch, supersede_gate_open):
     """A compensated (deleted) created memory is discarded from the snapshot, so a
     LATER phase-3 job's crossref scan must not list it.
 

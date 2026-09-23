@@ -232,3 +232,21 @@ def memory_factory(local_db):
             return storage.add_memory(conn, **payload)
 
     return _create_memory
+
+
+@pytest.fixture()
+def supersede_gate_open(monkeypatch):
+    """Confirm every classifier UPDATE without the supersede gate.
+
+    For tests of supersede MECHANICS (leaf resolution, fork collapse,
+    write-boundary races, compensation) that stub the classifier's UPDATE and
+    are not about whether it should have been accepted. The gate itself is
+    covered in tests/test_absorb_supersede_gate.py.
+    """
+    def confirm(fact, match_data, classifications, suggested_tags, **_kw):
+        if storage._absorb_update_candidate(classifications) is None:
+            return None
+        return {"verdict": "supersede", "gate": "test", "reason": "gate open in test",
+                "score": 1.0, "old_text": ""}
+
+    monkeypatch.setattr(storage, "_absorb_check_supersede", confirm)
