@@ -3158,6 +3158,8 @@ def _migrate_images_to_r2(conn, dry_run: bool = False) -> Dict[str, Any]:
     """Migrate all base64 images to R2 storage."""
     import json as json_lib
 
+    from .embeddings import not_import_pending_sql
+
     from .image_storage import get_image_storage_instance, parse_data_uri
     from .storage import update_memory
 
@@ -3171,6 +3173,8 @@ def _migrate_images_to_r2(conn, dry_run: bool = False) -> Dict[str, Any]:
     # Find memories with base64 images
     rows = conn.execute(
         "SELECT id, metadata FROM memories WHERE metadata LIKE '%data:image%'"
+        # Never rewrite a row an unfinished import still marks.
+        + not_import_pending_sql("metadata")
     ).fetchall()
 
     if not rows:
@@ -3313,12 +3317,12 @@ async def memory_import_sweep(older_than_minutes: int = 10) -> Dict[str, Any]:
 
     A D1 import marks each row it writes (metadata.import_attempt) until the
     row is complete. A crash, or a cleanup that failed, can leave a marked
-    row; reads hide it. This completes each marked row older than
+    row; reads hide it. A row whose import still holds a live lease is never
+    touched. Otherwise this completes each marked row older than
     `older_than_minutes` that has its embedding (the marker is stripped) and
-    removes each one that has none. Younger markers may belong to an import
-    still running and are left alone. Also runs at the start of every import
+    removes each one that has none; younger markers are left alone. Also runs at the start of every import
     and at server startup. Returns counts: scanned, completed, removed,
-    pending, failed (ids).
+    pending (of which live_lease), failed (ids).
     """
     if not isinstance(older_than_minutes, int) or isinstance(older_than_minutes, bool) \
             or not 1 <= older_than_minutes <= 10080:

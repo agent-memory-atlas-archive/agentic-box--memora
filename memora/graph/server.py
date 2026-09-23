@@ -322,7 +322,9 @@ def start_graph_server(host: str, port: int) -> None:
 
             # Build WHERE clauses — each wrapped in parentheses; joined with AND.
             # Without grouping, SQL precedence (AND > OR) leaks rows.
-            clauses = []
+            # Rows an unfinished import still marks are not memories yet.
+            from ..embeddings import not_import_pending_sql
+            clauses = ["(1=1" + not_import_pending_sql("metadata") + ")"]
             binds = []
 
             if favorites_only:

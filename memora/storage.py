@@ -16,7 +16,7 @@ import os
 import re
 import sqlite3
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from typing import Sequence as TypingSequence
@@ -2145,7 +2145,7 @@ def find_duplicate_pairs(
     """
     existing_ids: set[int] = set()
     excluded_ids: set[int] = set()
-    for row in conn.execute("SELECT id, metadata FROM memories"):
+    for row in conn.execute("SELECT id, metadata FROM memories WHERE 1=1" + _not_import_pending_sql("metadata")):
         try:
             memory_id = int(_row_value(row, "id", 0))
         except (ValueError, TypeError):
@@ -3848,8 +3848,11 @@ def resolve_follow(
 
 
 def _memory_exists(conn: sqlite3.Connection, memory_id: int) -> bool:
-    """Check if a memory exists without fetching full record."""
-    row = conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    """Check if a memory exists without fetching full record. An
+    import-pending row does not count (it is not a memory yet)."""
+    row = conn.execute(
+        "SELECT 1 FROM memories WHERE id = ?" + _not_import_pending_sql("metadata"), (memory_id,)
+    ).fetchone()
     return row is not None
 
 
@@ -7777,7 +7780,9 @@ def backfill_tags(
     Returns:
         Dict with processed count, changed count, and list of changes.
     """
-    rows = conn.execute("SELECT id, content, metadata, tags FROM memories").fetchall()
+    rows = conn.execute(
+        "SELECT id, content, metadata, tags FROM memories WHERE 1=1" + _not_import_pending_sql("metadata")
+    ).fetchall()
 
     processed = 0
     changed = 0
@@ -7869,7 +7874,7 @@ def get_memories_metadata_batch(
         return {}
     placeholders = ",".join("?" for _ in memory_ids)
     rows = conn.execute(
-        f"SELECT id, metadata FROM memories WHERE id IN ({placeholders})",
+        f"SELECT id, metadata FROM memories WHERE id IN ({placeholders})" + _not_import_pending_sql("metadata"),
         memory_ids,
     ).fetchall()
     result: Dict[int, Optional[Dict[str, Any]]] = {}
@@ -7884,7 +7889,7 @@ def get_hierarchy_paths(conn: sqlite3.Connection) -> List[List[str]]:
     from .hierarchy import extract_hierarchy_path
 
     rows = conn.execute(
-        "SELECT metadata FROM memories WHERE metadata IS NOT NULL"
+        "SELECT metadata FROM memories WHERE metadata IS NOT NULL" + _not_import_pending_sql("metadata")
     ).fetchall()
     paths_set: set[tuple[str, ...]] = set()
     for row in rows:
@@ -8746,7 +8751,7 @@ def list_memories(
 
 def collect_all_tags(conn: sqlite3.Connection) -> List[str]:
     tags: set[str] = set()
-    rows = conn.execute("SELECT tags FROM memories")
+    rows = conn.execute("SELECT tags FROM memories WHERE 1=1" + _not_import_pending_sql("metadata"))
     for (tags_json,) in rows:
         if not tags_json:
             continue
@@ -8772,7 +8777,7 @@ def find_invalid_tag_entries(
     # Matching uses tag_matches_policy (dot and slash namespace wildcards).
 
     invalid: List[Dict[str, Any]] = []
-    rows = conn.execute("SELECT id, tags FROM memories")
+    rows = conn.execute("SELECT id, tags FROM memories WHERE 1=1" + _not_import_pending_sql("metadata"))
     for memory_id, tags_json in rows:
         if not tags_json:
             continue
@@ -9145,7 +9150,7 @@ def boost_memory(
     """
     # First check if memory exists
     row = conn.execute(
-        "SELECT importance FROM memories WHERE id = ?",
+        "SELECT importance FROM memories WHERE id = ?" + _not_import_pending_sql("metadata"),
         (memory_id,),
     ).fetchone()
 
@@ -9186,14 +9191,21 @@ def get_action_history(conn: sqlite3.Connection, limit: int = 200) -> List[Dict[
 def get_statistics(conn: sqlite3.Connection) -> Dict[str, Any]:
     """Gather statistics about stored memories."""
     stats: Dict[str, Any] = {}
+    # Import-pending rows (an unfinished import) are not memories yet.
+    _LIVE = _not_import_pending_sql("metadata")
 
     # Total count
-    total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    total = conn.execute("SELECT COUNT(*) FROM memories WHERE 1=1" + _LIVE).fetchone()[0]
     stats["total_memories"] = total
+    # Rows an unfinished import still marks (not counted above): swept by
+    # sweep_import_markers / memory_import_sweep.
+    stats["import_pending"] = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE metadata IS NOT NULL AND NOT (1=1" + _LIVE + ")"
+    ).fetchone()[0]
 
     # Tag statistics
     tag_counts: Dict[str, int] = {}
-    rows = conn.execute("SELECT tags FROM memories").fetchall()
+    rows = conn.execute("SELECT tags FROM memories WHERE 1=1" + _LIVE).fetchall()
     for (tags_json,) in rows:
         if tags_json:
             try:
@@ -9211,7 +9223,7 @@ def get_statistics(conn: sqlite3.Connection) -> Dict[str, Any]:
     # Section statistics
     section_counts: Dict[str, int] = {}
     subsection_counts: Dict[str, int] = {}
-    rows = conn.execute("SELECT metadata FROM memories").fetchall()
+    rows = conn.execute("SELECT metadata FROM memories WHERE 1=1" + _LIVE).fetchall()
     for (metadata_json,) in rows:
         if metadata_json:
             try:
@@ -9231,7 +9243,7 @@ def get_statistics(conn: sqlite3.Connection) -> Dict[str, Any]:
 
     # Date-based statistics (memories per month)
     monthly_counts: Dict[str, int] = {}
-    rows = conn.execute("SELECT created_at FROM memories").fetchall()
+    rows = conn.execute("SELECT created_at FROM memories WHERE 1=1" + _LIVE).fetchall()
     for (created_at,) in rows:
         if created_at:
             try:
@@ -9271,7 +9283,7 @@ def get_statistics(conn: sqlite3.Connection) -> Dict[str, Any]:
 
     # Date range
     date_range = conn.execute(
-        "SELECT MIN(created_at), MAX(created_at) FROM memories"
+        "SELECT MIN(created_at), MAX(created_at) FROM memories WHERE 1=1" + _LIVE
     ).fetchone()
     if date_range and date_range[0]:
         stats["date_range"] = {
@@ -9442,9 +9454,11 @@ Respond with JSON only (no markdown):
 
 
 def export_memories(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    """Export all memories to a JSON-serializable list."""
+    """Export all memories to a JSON-serializable list. Rows an unfinished
+    import still marks are not memories yet and are not exported."""
     rows = conn.execute(
-        "SELECT id, content, metadata, tags, created_at FROM memories ORDER BY id"
+        "SELECT id, content, metadata, tags, created_at FROM memories WHERE 1=1"
+        + _not_import_pending_sql("metadata") + " ORDER BY id"
     ).fetchall()
 
     exported: List[Dict[str, Any]] = []
@@ -9519,7 +9533,9 @@ def import_memories(
     # Get existing content hashes for merge strategy
     existing_contents: set[str] = set()
     if strategy == "merge":
-        rows = conn.execute("SELECT content FROM memories").fetchall()
+        rows = conn.execute(
+            "SELECT content FROM memories WHERE 1=1" + _not_import_pending_sql("metadata")
+        ).fetchall()
         existing_contents = {row["content"] for row in rows}
 
     prepared_rows: List[Tuple[str, Optional[str], str, Optional[str], Dict[str, float]]] = []
@@ -9619,7 +9635,9 @@ def import_memories(
             if key in outcome:
                 result[key] = outcome[key]
     else:
-        for key in ("failed", "written_ids", "message", "orphan_ids"):
+        if "written_ids" in outcome:
+            result["written_ids"] = outcome["written_ids"]
+        for key in ("failed", "message", "orphan_ids"):
             if key in outcome and outcome.get("errors"):
                 result[key] = outcome[key]
     if sweep.get("scanned") or sweep.get("error"):
@@ -9705,6 +9723,33 @@ def _with_attempts(fn):
 
 
 def _import_write_d1(conn, prepared_rows, strategy) -> Dict[str, Any]:
+    """D1 import under a live lease (import_inflight), taken BEFORE anything
+    is cleared or written and released at the end. While it is heartbeated,
+    the import-marker sweep leaves this import's rows alone, however long the
+    import runs. If the lease cannot be taken, nothing is written."""
+    import uuid as _uuid
+
+    import_id = _uuid.uuid4().hex
+    _result, error = _with_attempts(lambda: _begin_import_lease(conn, import_id))
+    if error is not None:
+        return {
+            "imported": 0,
+            "replaced": False,
+            "failed": len(prepared_rows),
+            "written_ids": [],
+            "errors": [{"index": None, "error": f"could not take the import lease: {error}"}],
+            "message": "import not started: the import lease could not be taken; the store is unchanged",
+        }
+    try:
+        return _import_write_d1_leased(conn, prepared_rows, strategy, import_id)
+    finally:
+        try:
+            _end_import_lease(conn, import_id)
+        except Exception as exc:  # the lease simply expires
+            logger.error("import: could not release lease %s: %s", import_id, exc)
+
+
+def _import_write_d1_leased(conn, prepared_rows, strategy, import_id: str) -> Dict[str, Any]:
     """D1 (no transactions: every statement autocommits). NOT ATOMIC.
 
     replace clears the store in stages (_REPLACE_CLEAR_STAGES: crossrefs,
@@ -9714,9 +9759,13 @@ def _import_write_d1(conn, prepared_rows, strategy) -> Dict[str, Any]:
     re-running the same replace simply repeats the idempotent DELETEs.
 
     Rows are then written in order, each up to _IMPORT_WRITE_ATTEMPTS times.
-    Every INSERT carries a random per-import marker in metadata
-    (import_attempt = "<import id>:<row>"), stripped once the row is
-    complete. Only after an INSERT attempt failed is a row carrying THAT
+    Every INSERT carries a marker in metadata (import_attempt =
+    "<import id>:<row start time>:<row>", the time taken once per row just
+    before its first INSERT), stripped once the row is complete -- by a
+    compare-and-set on the marker, then read back: a row found removed (e.g.
+    by a sweep) is inserted again, and never counted until it is verified
+    complete. The lease is heartbeated at least every _IMPORT_HEARTBEAT_S;
+    a heartbeat that fails stops the import like a failing row. Only after an INSERT attempt failed is a row carrying THAT
     marker adopted (its commit landed, its response was lost) instead of
     inserted again; a pre-existing memory can never be adopted, because it
     cannot carry this import's marker. A row that still fails is removed only
@@ -9727,8 +9776,6 @@ def _import_write_d1(conn, prepared_rows, strategy) -> Dict[str, Any]:
     the previous contents are gone; recover by re-running the import from
     the export file). A replace is never reported as done with errors.
     """
-    import uuid as _uuid
-
     if strategy == "replace":
         fts = _fts_enabled(conn)
         for index, (stage, sql) in enumerate(_REPLACE_CLEAR_STAGES):
@@ -9752,11 +9799,28 @@ def _import_write_d1(conn, prepared_rows, strategy) -> Dict[str, Any]:
                     ),
                 }
 
-    import_id = _uuid.uuid4().hex
-    started = int(time.time())
     written: List[int] = []
+    heartbeat_at = time.monotonic()
     for index, (content, metadata_json, tags_json, created_at, vector) in enumerate(prepared_rows):
-        marker = _import_marker(import_id, started, index)
+        if time.monotonic() - heartbeat_at >= _IMPORT_HEARTBEAT_S:
+            _result, error = _with_attempts(lambda: _touch_import_lease(conn, import_id))
+            if error is not None:
+                return {
+                    "imported": len(written),
+                    "replaced": "partial" if strategy == "replace" else False,
+                    "failed": len(prepared_rows) - index,
+                    "written_ids": written,
+                    "errors": [{"index": index, "error": f"import lease lost: {error}"}],
+                    "message": (
+                        "D1 import is not atomic: stopped because its lease could not be renewed; "
+                        "this import added exactly the rows in written_ids" + (
+                            " (the previous contents were already deleted). Recover by re-running "
+                            "the import from the export file." if strategy == "replace" else "."
+                        )
+                    ),
+                }
+            heartbeat_at = time.monotonic()
+        marker = _import_marker(import_id, int(time.time()), index)
         meta = json.loads(metadata_json) if metadata_json else {}
         meta[_IMPORT_MARKER_KEY] = marker
         marked_json = json.dumps(meta, ensure_ascii=False)
@@ -9780,7 +9844,17 @@ def _import_write_d1(conn, prepared_rows, strategy) -> Dict[str, Any]:
                     memory_id = int(cur.lastrowid)
                 _fts_upsert(conn, memory_id, content, metadata_json, tags_json)
                 _upsert_embedding(conn, memory_id, vector)
-                conn.execute("UPDATE memories SET metadata = ? WHERE id = ?", (metadata_json, memory_id))
+                conn.execute(
+                    f"UPDATE memories SET metadata = ? WHERE id = ? "
+                    f"AND json_extract(metadata, '$.{_IMPORT_MARKER_KEY}') = ?",
+                    (metadata_json, memory_id, marker),
+                )
+                check = conn.execute("SELECT metadata FROM memories WHERE id = ?", (memory_id,)).fetchone()
+                if check is None:
+                    memory_id = None  # removed under us: the next attempt inserts it again
+                    raise RuntimeError("the row was removed before the import completed it")
+                if _import_pending(_row_field(check, 0, "metadata")):
+                    raise RuntimeError("the marker strip did not apply")
                 written.append(memory_id)
                 last_error = None
                 break
@@ -9875,9 +9949,54 @@ def _import_delete_marked_row(conn, memory_id: int, marker: str) -> None:
     conn.execute("DELETE FROM memories_embeddings WHERE memory_id = ?", (memory_id,))
 
 
-# A marked row older than this belongs to an import that is no longer running
-# (a crash, or a cleanup that failed): the sweep completes or removes it.
+# A marked row is stale -- its import is no longer running (a crash, or a
+# cleanup that failed) -- when its import holds no live lease AND the marker
+# is at least this old; the sweep then completes or removes it. The age bound
+# is a second guard (clock skew; an import by a memora without leases).
 _IMPORT_MARKER_STALE_S = 600
+# The import lease: heartbeated at least every _IMPORT_HEARTBEAT_S, valid for
+# IMPORT_LEASE_SECONDS -- far above the sweep bound, so a slow heartbeat never
+# exposes a live import's rows.
+IMPORT_LEASE_SECONDS = 1800
+_IMPORT_HEARTBEAT_S = 30
+
+
+class ImportLeaseLostError(RuntimeError):
+    """The import no longer holds its import_inflight row."""
+
+
+def _begin_import_lease(conn, import_id: str) -> None:
+    now = _absorb_now()
+    conn.execute(
+        "INSERT OR IGNORE INTO import_inflight (import_id, started_at, lease_until, owner) VALUES (?, ?, ?, ?)",
+        (import_id, _absorb_format_ts(now),
+         _absorb_format_ts(now + timedelta(seconds=IMPORT_LEASE_SECONDS)), f"pid:{os.getpid()}"),
+    )
+    conn.commit()
+    if conn.execute("SELECT 1 FROM import_inflight WHERE import_id = ?", (import_id,)).fetchone() is None:
+        raise ImportLeaseLostError(f"import lease {import_id} was not recorded")
+
+
+def _touch_import_lease(conn, import_id: str) -> None:
+    """Extend the lease; verified by read-back (D1 rowcount is not relied on)."""
+    lease = _absorb_format_ts(_absorb_now() + timedelta(seconds=IMPORT_LEASE_SECONDS))
+    conn.execute("UPDATE import_inflight SET lease_until = ? WHERE import_id = ?", (lease, import_id))
+    conn.commit()
+    row = conn.execute("SELECT lease_until FROM import_inflight WHERE import_id = ?", (import_id,)).fetchone()
+    if row is None or str(_row_field(row, 0, "lease_until")) != lease:
+        raise ImportLeaseLostError(f"import lease {import_id} lost")
+
+
+def _end_import_lease(conn, import_id: str) -> None:
+    conn.execute("DELETE FROM import_inflight WHERE import_id = ?", (import_id,))
+    conn.commit()
+
+
+def _live_import_ids(conn, now: datetime) -> set:
+    rows = conn.execute(
+        "SELECT import_id FROM import_inflight WHERE lease_until >= ?", (_absorb_format_ts(now),)
+    ).fetchall()
+    return {str(_row_field(row, 0, "import_id")) for row in rows}
 
 
 def _import_marker(import_id: str, started: int, index: int) -> str:
@@ -9940,15 +10059,20 @@ def sweep_import_markers(
     running, independent of its import id (a crash between INSERT, embedding
     and marker strip, or a failed cleanup).
 
-    A row whose marker is older than `older_than_s` (or malformed) is
-    COMPLETED when it has its vector -- the marker is stripped, compare-and-
-    set on the exact stored metadata -- and REMOVED when it has none. Younger
-    markers belong to an import that may still be running and are left
-    alone (pending). Runs at the start of every import and at server startup,
+    A row whose import holds a live lease (import_inflight) is never
+    touched, however old its marker. Otherwise a row whose marker is older
+    than `older_than_s` (or malformed) is COMPLETED when it has its vector --
+    the marker is stripped, compare-and-set on the exact stored metadata --
+    and REMOVED when it has none. Younger markers are left alone (pending). Runs at the start of every import and at server startup,
     and as the memory_import_sweep admin tool.
     """
     now = time.time() if now is None else now
-    counts: Dict[str, Any] = {"scanned": 0, "completed": 0, "removed": 0, "pending": 0, "failed": []}
+    now_utc = datetime.fromtimestamp(now, tz=timezone.utc).replace(tzinfo=None)
+    counts: Dict[str, Any] = {"scanned": 0, "completed": 0, "removed": 0, "pending": 0,
+                              "live_lease": 0, "failed": []}
+    # Read the leases first: an import holds its lease before its first row,
+    # so every marked row seen below belongs to an import listed here if live.
+    live = _live_import_ids(conn, now_utc)
     rows = conn.execute(
         "SELECT id, metadata FROM memories WHERE instr(metadata, ?) > 0",
         (f'"{_IMPORT_MARKER_KEY}"',),
@@ -9964,6 +10088,10 @@ def sweep_import_markers(
             continue
         counts["scanned"] += 1
         marker = meta[_IMPORT_MARKER_KEY]
+        if isinstance(marker, str) and marker.split(":", 1)[0] in live:
+            counts["pending"] += 1
+            counts["live_lease"] += 1
+            continue
         started = _import_marker_time(marker)
         if started is not None and now - started < older_than_s:
             counts["pending"] += 1
@@ -9993,6 +10121,11 @@ def sweep_import_markers(
         except Exception as exc:
             logger.error("import sweep: row %s (marker %r) not resolved: %s", memory_id, marker, exc)
             counts["failed"].append(memory_id)
+    try:  # expired leases: their rows were just resolved (or are failed, logged)
+        conn.execute("DELETE FROM import_inflight WHERE lease_until < ?", (_absorb_format_ts(now_utc),))
+        conn.commit()
+    except Exception as exc:
+        logger.warning("import sweep: could not drop expired leases: %s", exc)
     if counts["completed"] or counts["removed"]:
         conn.commit()
         invalidate_corpus_cache(conn)

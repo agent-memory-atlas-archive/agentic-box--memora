@@ -910,7 +910,8 @@ def test_interrupted_import_rows_are_completed_or_removed_by_the_next_import(fak
 
         result = storage.import_memories(conn, [{"content": "unrelated import", "tags": ["plan"]}])
         assert result["imported"] == 1
-        assert result["sweep"] == {"scanned": 3, "completed": 1, "removed": 1, "pending": 1, "failed": []}
+        assert result["sweep"] == {"scanned": 3, "completed": 1, "removed": 1, "pending": 1,
+                                   "live_lease": 0, "failed": []}
         # Completed: marker stripped, other metadata kept, visible again.
         assert json.loads(_raw_row(conn, embedded)[1]) == {"k": 1}
         assert storage.get_memory(conn, embedded)["content"] == "stale embedded row"
@@ -982,3 +983,229 @@ def test_startup_sweep_covers_every_configured_store(tmp_path, monkeypatch):
                         lambda conn: swept.append(storage.CURRENT_DB.get()))
     server._startup_import_sweep()
     assert swept == ["a", "b"] and storage.CURRENT_DB.get() is None
+
+
+# --- round 8: import lease, per-row marker time, verified completion; every read site (7100) ---
+
+def test_live_import_rows_survive_a_sweep_past_the_age_bound(fake_d1_backend, monkeypatch):
+    """A sweep at +601 s (and at +1700 s) during a live import leaves its rows alone."""
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        real_upsert = storage._upsert_embedding
+        sweeps = []
+
+        def upsert_with_concurrent_sweep(c, mid, vec):
+            # Between INSERT and embedding: the row is marked and has no vector yet.
+            sweeps.append(storage.sweep_import_markers(conn, now=time.time() + 601))
+            sweeps.append(storage.sweep_import_markers(conn, now=time.time() + 1700))
+            return real_upsert(c, mid, vec)
+
+        monkeypatch.setattr(storage, "_upsert_embedding", upsert_with_concurrent_sweep)
+        result = storage.import_memories(conn, NEW)
+        monkeypatch.undo()
+        assert result["imported"] == 3 and result["total_errors"] == 0
+        assert all(s["removed"] == 0 and s["completed"] == 0 for s in sweeps)
+        assert all(s["live_lease"] >= 1 for s in sweeps)
+        assert _contents(conn) == ["new row 0", "new row 1", "new row 2"]
+        assert set(result["written_ids"]) <= _embedded_ids(conn)
+        assert conn.execute("SELECT COUNT(*) FROM import_inflight").fetchone()[0] == 0  # released
+
+
+class _Crash(BaseException):
+    pass
+
+
+def test_rows_of_a_crashed_import_are_swept_once_its_lease_expires(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        real_upsert, calls = storage._upsert_embedding, {"n": 0}
+
+        def crash_on_second(c, mid, vec):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise _Crash()  # the process dies: no cleanup, no lease release
+            return real_upsert(c, mid, vec)
+
+        monkeypatch.setattr(storage, "_upsert_embedding", crash_on_second)
+        # A crash mid-import: row 0 complete, row 1 inserted without its vector.
+        # (The lease release in `finally` still runs on an exception; a real
+        # death does not, so drop the release for this simulation.)
+        monkeypatch.setattr(storage, "_end_import_lease", lambda c, i: None)
+        with pytest.raises(_Crash):
+            storage.import_memories(conn, NEW[:2])
+        monkeypatch.undo()
+        assert _contents(conn) == ["new row 0", "new row 1"]
+        # Lease still live: left alone even past the age bound.
+        held = storage.sweep_import_markers(conn, now=time.time() + 601)
+        assert held["removed"] == 0 and held["live_lease"] == 1
+        # Lease expired: the unembedded row is removed.
+        swept = storage.sweep_import_markers(conn, now=time.time() + storage.IMPORT_LEASE_SECONDS + 60)
+        assert swept["removed"] == 1 and swept["failed"] == []
+        assert _contents(conn) == ["new row 0"]
+        assert conn.execute("SELECT COUNT(*) FROM import_inflight").fetchone()[0] == 0
+
+
+def test_rows_marked_by_an_import_without_a_lease_are_stale_by_age(fake_d1_backend):
+    with storage.connect() as conn:
+        mid = _add(conn, "no lease row", tags=["plan"])["id"]
+        _mark(conn, mid, age_s=5, embedded=False, import_id="f" * 32)
+        assert storage.sweep_import_markers(conn)["pending"] == 1
+        assert storage.sweep_import_markers(conn, now=time.time() + 601)["removed"] == 1
+
+
+def test_a_row_removed_before_completion_is_never_counted_as_imported(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        real_upsert = storage._upsert_embedding
+        removed = []
+
+        def upsert_then_row_removed(c, mid, vec):
+            real_upsert(c, mid, vec)
+            c.execute("DELETE FROM memories WHERE id = ?", (mid,))  # e.g. a mistaken concurrent sweep
+            removed.append(mid)
+
+        monkeypatch.setattr(storage, "_upsert_embedding", upsert_then_row_removed)
+        result = storage.import_memories(conn, [{"content": "vanishing row", "tags": ["plan"]}])
+        monkeypatch.undo()
+        assert result["imported"] == 0 and result["written_ids"] == [] and result["total_errors"] == 1
+        assert "removed before the import completed it" in result["errors"][0]["error"]
+        assert not set(removed) & set(result["written_ids"])
+
+
+def test_a_row_removed_once_is_reinserted_and_counted_once(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        real_upsert = storage._upsert_embedding
+        removed = []
+
+        def remove_first(c, mid, vec):
+            real_upsert(c, mid, vec)
+            if not removed:
+                c.execute("DELETE FROM memories WHERE id = ?", (mid,))
+                removed.append(mid)
+
+        monkeypatch.setattr(storage, "_upsert_embedding", remove_first)
+        result = storage.import_memories(conn, [{"content": "reinserted row", "tags": ["plan"]}])
+        monkeypatch.undo()
+        assert result["imported"] == 1 and result["total_errors"] == 0
+        [written] = result["written_ids"]
+        assert written != removed[0] and _raw_row(conn, written) is not None
+        assert _contents(conn) == ["reinserted row"]
+
+
+def test_no_lease_no_write(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        before = _setup_previous(conn)
+        conn.fail_when = lambda sql, params: "import_inflight" in sql and sql.lstrip().startswith("INSERT")
+        result = storage.import_memories(conn, NEW, strategy="replace")
+        conn.fail_when = None
+        assert result["replaced"] is False and result["imported"] == 0
+        assert _contents(conn) == before  # nothing cleared, nothing written
+
+
+def test_heartbeat_failure_stops_the_import(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    monkeypatch.setattr(storage, "_IMPORT_HEARTBEAT_S", 0)
+    with storage.connect() as conn:
+        _fail_nth(conn, lambda sql: sql.lstrip().startswith("UPDATE import_inflight"), 2)
+        result = storage.import_memories(conn, NEW)
+        conn.fail_when = None
+        assert result["imported"] == 1 and "lease lost" in result["errors"][0]["error"]
+        assert _contents(conn) == ["new row 0"]
+
+
+def test_markers_carry_a_per_row_time(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(storage.time, "time", lambda: clock.__setitem__("t", clock["t"] + 700) or clock["t"])
+    markers = []
+    real = storage._import_find_marked
+
+    def spy(conn, marker):
+        markers.append(marker)
+        return real(conn, marker)
+
+    monkeypatch.setattr(storage, "_import_find_marked", spy)
+    with storage.connect() as conn:
+        storage.import_memories(conn, NEW[:2])
+    times = sorted({storage._import_marker_time(m) for m in markers})
+    assert len(times) == 2 and times[1] - times[0] >= 700
+
+
+def _pending_fixture(conn):
+    keep = _add(conn, "visible kiwi memory", tags=["plan"], metadata={"section": "A"})["id"]
+    mid = _add(conn, "pending kiwi memory", tags=["pendingonly"], metadata={"section": "Hidden"})["id"]
+    _mark(conn, mid, age_s=3600, embedded=False)
+    return keep, mid
+
+
+def test_export_skips_a_marked_row(local_db):
+    with storage.connect() as conn:
+        keep, mid = _pending_fixture(conn)
+        assert [e["content"] for e in storage.export_memories(conn)] == ["visible kiwi memory"]
+
+
+def test_graph_endpoints_skip_a_marked_row(graph_request, local_db):
+    with storage.connect() as conn:
+        keep, mid = _pending_fixture(conn)
+    status, body = graph_request("GET", "/api/memories")
+    assert status == 200 and body["total"] == 1 and [m["id"] for m in body["memories"]] == [keep]
+    assert "import_attempt" not in json.dumps(body)
+    status, graph = graph_request("GET", "/api/graph")
+    assert status == 200 and mid not in {n["id"] for n in graph["nodes"]}
+    status, _single = graph_request("GET", f"/api/memories/{mid}")
+    assert status == 404
+
+
+def test_every_other_read_site_skips_a_marked_row(local_db):
+    with storage.connect() as conn:
+        keep, mid = _pending_fixture(conn)
+        stats = storage.get_statistics(conn)
+        assert stats["total_memories"] == 1 and stats["import_pending"] == 1
+        assert "pendingonly" not in storage.collect_all_tags(conn)
+        assert ["Hidden"] not in storage.get_hierarchy_paths(conn)
+        assert storage.get_memories_metadata_batch(conn, [keep, mid]).keys() == {keep}
+        assert storage._memory_exists(conn, mid) is False
+        assert storage.boost_memory(conn, mid) is None
+        assert storage.update_memory(conn, mid, content="x") is None
+        with pytest.raises(ValueError):
+            storage.add_link(conn, keep, mid)
+        assert all(mid not in (e.get("memory_id"), e.get("id"))
+                   for e in storage.find_invalid_tag_entries(conn, ["plan"]))
+        conn.execute("INSERT OR REPLACE INTO memories_crossrefs (memory_id, related) VALUES (?, ?)",
+                     (keep, json.dumps([{"id": mid, "score": 0.95}])))
+        conn.commit()
+        pairs = storage.find_duplicate_pairs(conn, 0.5, 100)["pairs"]
+        assert all(mid not in (p["memory_a_id"], p["memory_b_id"]) for p in pairs)
+        backfill = storage.backfill_tags(conn, dry_run=True)
+        assert all(ch.get("id") != mid for ch in backfill.get("changes", []))
+        # merge dedupe ignores a pending row: its content is imported as a real memory
+        assert storage.import_memories(conn, [{"content": "pending kiwi memory", "tags": ["plan"]}],
+                                       strategy="merge")["imported"] == 1
+
+
+def test_merge_dedupe_ignores_a_live_pending_row(local_db):
+    with storage.connect() as conn:
+        mid = _add(conn, "young pending text", tags=["plan"])["id"]
+        _mark(conn, mid, age_s=5, embedded=False)  # young: the import's own sweep leaves it
+        result = storage.import_memories(conn, [{"content": "young pending text", "tags": ["plan"]}],
+                                         strategy="merge")
+        assert result["imported"] == 1 and result["skipped"] == 0
+
+
+def test_a_strip_that_does_not_apply_is_never_counted(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        real_execute = conn.execute
+
+        def execute(sql, params=None):
+            if sql.lstrip().startswith("UPDATE memories SET metadata = ? WHERE id = ? AND json_extract"):
+                return real_execute("SELECT 1 WHERE 0")  # "succeeds", changes nothing
+            return real_execute(sql, params)
+
+        monkeypatch.setattr(conn, "execute", execute)
+        result = storage.import_memories(conn, [{"content": "never stripped", "tags": ["plan"]}])
+        monkeypatch.undo()
+        assert result["imported"] == 0 and result["written_ids"] == []
+        assert "marker strip did not apply" in result["errors"][0]["error"]

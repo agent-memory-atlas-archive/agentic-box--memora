@@ -133,6 +133,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_updated_at_column(conn)
     _ensure_tombstones_table(conn)
     _ensure_absorb_inflight_table(conn)
+    _ensure_import_inflight_table(conn)
 
 
 def _ensure_fts(conn: sqlite3.Connection) -> None:
@@ -392,6 +393,23 @@ def _ensure_absorb_inflight_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_absorb_inflight_lease "
         "ON absorb_inflight(lease_until, status)"
+    )
+    conn.commit()
+
+
+def _ensure_import_inflight_table(conn: sqlite3.Connection) -> None:
+    """Live D1 imports (memora.storage._import_write_d1): one row per import
+    id, heartbeated while it runs. The import-marker sweep never touches a
+    row whose import holds a live lease, however old its marker."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS import_inflight (
+            import_id TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            lease_until TEXT NOT NULL,
+            owner TEXT
+        )
+        """
     )
     conn.commit()
 
