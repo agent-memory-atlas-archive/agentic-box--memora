@@ -9449,7 +9449,14 @@ def import_memories(
     then is anything written. With "replace", any entry that fails
     preparation fails the whole import and NOTHING is deleted -- a restore
     must never erase the store and then reject its own data. "merge" and
-    "append" keep per-entry errors.
+    "append" keep per-entry preparation errors.
+
+    Writing: on local SQLite the replace's DELETEs and all INSERTs are one
+    transaction; any write error rolls back (replaced=False, store
+    unchanged). On D1 there is no transaction: see _import_write_d1 -- rows
+    are retried, the loop stops at the first persistent failure and the
+    result says replaced="partial" with failed and written_ids. A replace is
+    never reported as done (replaced=True) with errors.
 
     An entry's "system_tags" (as export_memories writes them: the typed tags
     memora applied itself) are re-applied through _system_typed_tags -- bound
@@ -9529,7 +9536,7 @@ def import_memories(
             "message": "replace aborted before deleting anything: fix the failing entries",
         }
 
-    # Replace: clear database first
+    transactional = not isinstance(conn, D1Connection)
     replace_integrity_stamp = None
     if strategy == "replace":
         # Preserve the last complete audit stamp.  This bulk SQL path bypasses
@@ -9537,42 +9544,15 @@ def import_memories(
         # SQL audit detect replacement rather than certifying a new row alone.
         from .embeddings import get_embedding_integrity
         replace_integrity_stamp = get_embedding_integrity(conn)
-        conn.execute("DELETE FROM memories")
-        if _fts_enabled(conn):
-            conn.execute("DELETE FROM memories_fts")
-        conn.execute("DELETE FROM memories_embeddings")
-        conn.execute("DELETE FROM memories_crossrefs")
-        conn.commit()
 
-    imported = 0
-    for content, metadata_json, tags_json, created_at, vector in prepared_rows:
-        try:
-            # Insert with optional created_at preservation
-            if created_at:
-                cur = conn.execute(
-                    "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
-                    (content, metadata_json, tags_json, created_at),
-                )
-            else:
-                cur = conn.execute(
-                    "INSERT INTO memories (content, metadata, tags) VALUES (?, ?, ?)",
-                    (content, metadata_json, tags_json),
-                )
+    if transactional:
+        outcome = _import_write_transactional(conn, prepared_rows, strategy)
+    else:
+        outcome = _import_write_d1(conn, prepared_rows, strategy)
+    imported = outcome["imported"]
+    errors.extend(outcome["errors"])
 
-            memory_id = cur.lastrowid
-
-            # Update FTS and embeddings
-            _fts_upsert(conn, memory_id, content, metadata_json, tags_json)
-            _upsert_embedding(conn, memory_id, vector)
-
-            imported += 1
-
-        except Exception as exc:
-            errors.append({"index": None, "error": str(exc)})
-
-    conn.commit()
-
-    if replace_integrity_stamp:
+    if replace_integrity_stamp and outcome["replaced"] is True:
         from .embeddings import _write_embedding_integrity, invalidate_embedding_integrity_cache
         _write_embedding_integrity(conn, replace_integrity_stamp)
         invalidate_embedding_integrity_cache(conn)
@@ -9582,15 +9562,146 @@ def import_memories(
     if imported > 0:
         rebuild_crossrefs(conn)
 
-    result = {
+    result: Dict[str, Any] = {
         "imported": imported,
         "skipped": skipped,
         "errors": errors[:10],  # Limit error list to first 10
         "total_errors": len(errors),
     }
     if strategy == "replace":
-        result["replaced"] = True
+        result["replaced"] = outcome["replaced"]
+        for key in ("failed", "written_ids", "message"):
+            if key in outcome:
+                result[key] = outcome[key]
     return result
+
+
+_IMPORT_WRITE_ATTEMPTS = 3
+
+
+def _import_insert_row(conn, content, metadata_json, tags_json, created_at, vector) -> int:
+    """INSERT one prepared row plus its FTS entry and embedding; returns its id."""
+    if created_at:
+        cur = conn.execute(
+            "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
+            (content, metadata_json, tags_json, created_at),
+        )
+    else:
+        cur = conn.execute(
+            "INSERT INTO memories (content, metadata, tags) VALUES (?, ?, ?)",
+            (content, metadata_json, tags_json),
+        )
+    memory_id = cur.lastrowid
+    _fts_upsert(conn, memory_id, content, metadata_json, tags_json)
+    _upsert_embedding(conn, memory_id, vector)
+    return memory_id
+
+
+def _clear_store_for_replace(conn) -> None:
+    conn.execute("DELETE FROM memories")
+    if _fts_enabled(conn):
+        conn.execute("DELETE FROM memories_fts")
+    conn.execute("DELETE FROM memories_embeddings")
+    conn.execute("DELETE FROM memories_crossrefs")
+
+
+def _import_write_transactional(conn, prepared_rows, strategy) -> Dict[str, Any]:
+    """Local SQLite: the replace's DELETEs and every INSERT are ONE transaction.
+
+    Any write error rolls everything back -- the store is exactly as before
+    (replaced=False). merge/append keep their per-entry error reporting but
+    also roll back on a write error, since a half-written import is never
+    reported as success.
+    """
+    try:
+        if strategy == "replace":
+            _clear_store_for_replace(conn)
+        for row in prepared_rows:
+            _import_insert_row(conn, *row)
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        return {
+            "imported": 0,
+            "replaced": False,
+            "errors": [{"index": None, "error": f"write failed, nothing changed: {exc}"}],
+            "message": "import rolled back: the store is unchanged",
+        }
+    return {"imported": len(prepared_rows), "replaced": True, "errors": []}
+
+
+def _import_write_d1(conn, prepared_rows, strategy) -> Dict[str, Any]:
+    """D1 (no transactions: every statement autocommits). NOT ATOMIC.
+
+    A replace deletes the old rows first, then writes the prepared rows in
+    order. Each row is attempted up to _IMPORT_WRITE_ATTEMPTS times; before a
+    retry, a row with the same content that this import has not yet claimed
+    is adopted (the INSERT committed but its response was lost), and a row
+    whose embedding could not be written is removed rather than left without
+    its vector. The loop STOPS at the first row that still fails and
+    reports replaced="partial" with the counts and the ids written: the
+    store then holds exactly those rows. Recovery: re-run the import from
+    the export file (a replace starts by clearing the store again). A
+    replace is never reported as done with errors.
+    """
+    written: List[int] = []
+    if strategy == "replace":
+        _clear_store_for_replace(conn)
+    for index, row in enumerate(prepared_rows):
+        content = row[0]
+        last_error: Optional[Exception] = None
+        for _attempt in range(_IMPORT_WRITE_ATTEMPTS):
+            try:
+                memory_id = _import_adopt_lost_insert(conn, content, written)
+                if memory_id is None:
+                    memory_id = _import_insert_row(conn, *row)
+                else:
+                    _fts_upsert(conn, memory_id, content, row[1], row[2])
+                    _upsert_embedding(conn, memory_id, row[4])
+                written.append(int(memory_id))
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+        if last_error is not None:
+            # Never leave this row's memory without its embedding.
+            orphan = _import_adopt_lost_insert(conn, content, written)
+            if orphan is not None:
+                try:
+                    conn.execute("DELETE FROM memories WHERE id = ?", (orphan,))
+                except Exception:
+                    logger.error("import: could not remove unembedded row #%s", orphan)
+            failed = len(prepared_rows) - index
+            return {
+                "imported": len(written),
+                "replaced": "partial" if strategy == "replace" else False,
+                "failed": failed,
+                "written_ids": written,
+                "errors": [{"index": index, "error": f"write failed after "
+                                                     f"{_IMPORT_WRITE_ATTEMPTS} attempts: {last_error}"}],
+                "message": (
+                    "D1 import is not atomic: stopped at the first failing row; the store "
+                    "holds exactly the rows in written_ids" + (
+                        " (the previous contents were already deleted). Recover by "
+                        "re-running the import from the export file."
+                        if strategy == "replace" else "."
+                    )
+                ),
+            }
+    return {"imported": len(written), "replaced": True, "errors": [], "written_ids": written}
+
+
+def _import_adopt_lost_insert(conn, content: str, written: List[int]) -> Optional[int]:
+    """A row with this content that this import did not record as written:
+    an INSERT whose commit landed but whose response (or a later statement)
+    failed. Adopted instead of inserting a duplicate."""
+    for r in conn.execute(
+        "SELECT id FROM memories WHERE content = ? ORDER BY id DESC", (content,)
+    ).fetchall():
+        rid = int(_row_field(r, 0, "id"))
+        if rid not in written:
+            return rid
+    return None
 
 
 def poll_events(

@@ -618,3 +618,130 @@ def test_import_refuses_forged_system_tags(default_policy_db, projects):
         ])
         assert result["imported"] == 0 and result["total_errors"] == 1
         assert not storage.list_memories(conn)
+
+
+# --- round 5: a replace import is atomic on SQLite and truthful on D1 (review 7053) ---
+
+PREV = [{"content": f"previous row {i}", "tags": ["plan"]} for i in range(3)]
+NEW = [{"content": f"new row {i}", "tags": ["plan"]} for i in range(3)]
+
+
+def _contents(conn):
+    return sorted(m["content"] for m in storage.list_memories(conn, limit=-1))
+
+
+def _embedded_ids(conn):
+    return {int(r[0]) for r in conn.execute("SELECT memory_id FROM memories_embeddings").fetchall()}
+
+
+def _setup_previous(conn):
+    assert storage.import_memories(conn, PREV)["imported"] == 3
+    return _contents(conn)
+
+
+def test_sqlite_replace_rolls_back_on_an_insert_failure(local_db, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        before = _setup_previous(conn)
+        conn.execute(
+            "CREATE TRIGGER fail_row BEFORE INSERT ON memories WHEN NEW.content = 'new row 1' "
+            "BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END"
+        )
+        result = storage.import_memories(conn, NEW, strategy="replace")
+        assert result["replaced"] is False and result["imported"] == 0 and result["total_errors"] == 1
+        assert _contents(conn) == before  # untouched: the DELETEs rolled back too
+
+
+def test_sqlite_replace_rolls_back_on_an_embedding_failure(local_db, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        before = _setup_previous(conn)
+        real, calls = storage._upsert_embedding, {"n": 0}
+
+        def flaky(c, mid, vec):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("injected embedding failure")
+            return real(c, mid, vec)
+
+        monkeypatch.setattr(storage, "_upsert_embedding", flaky)
+        result = storage.import_memories(conn, NEW, strategy="replace")
+        assert result["replaced"] is False and result["imported"] == 0
+        assert _contents(conn) == before
+        assert {m["id"] for m in storage.list_memories(conn, limit=-1)} <= _embedded_ids(conn)
+
+
+def _fail_nth(conn, predicate, nth, *, transient=False):
+    seen = {"n": 0, "failed": 0}
+
+    def fail_when(sql, params):
+        if not predicate(sql):
+            return False
+        seen["n"] += 1
+        if seen["n"] < nth:
+            return False
+        if transient and seen["failed"] >= 1:
+            return False
+        seen["failed"] += 1
+        return True
+
+    conn.fail_when = fail_when
+    return seen
+
+
+def _is_memory_insert(sql):
+    return sql.lstrip().startswith("INSERT INTO memories (")
+
+
+def _is_embedding_write(sql):
+    return "memories_embeddings" in sql and sql.lstrip().upper().startswith(("INSERT", "UPDATE"))
+
+
+def test_d1_replace_insert_failure_is_reported_partial_with_ids(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        _setup_previous(conn)
+        _fail_nth(conn, _is_memory_insert, 2)  # the second new row never inserts
+        result = storage.import_memories(conn, NEW, strategy="replace")
+        conn.fail_when = None
+        assert result["replaced"] == "partial" and result["imported"] == 1
+        assert result["failed"] == 2 and len(result["written_ids"]) == 1 and result["total_errors"] == 1
+        assert "not atomic" in result["message"] and "export file" in result["message"]
+        # The documented state: exactly the written rows, each with its embedding.
+        assert _contents(conn) == ["new row 0"]
+        assert {m["id"] for m in storage.list_memories(conn, limit=-1)} == set(result["written_ids"])
+        assert set(result["written_ids"]) <= _embedded_ids(conn)
+
+
+def test_d1_replace_embedding_failure_leaves_no_unembedded_row(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        _setup_previous(conn)
+        _fail_nth(conn, _is_embedding_write, 2)  # row two's vector never lands
+        result = storage.import_memories(conn, NEW, strategy="replace")
+        conn.fail_when = None
+        assert result["replaced"] == "partial" and result["imported"] == 1 and result["failed"] == 2
+        assert _contents(conn) == ["new row 0"]  # row two's memory was removed, not left bare
+        assert {m["id"] for m in storage.list_memories(conn, limit=-1)} <= _embedded_ids(conn)
+
+
+def test_d1_replace_transient_failures_are_retried_to_success(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        _setup_previous(conn)
+        _fail_nth(conn, _is_embedding_write, 2, transient=True)
+        result = storage.import_memories(conn, NEW, strategy="replace")
+        conn.fail_when = None
+        assert result["replaced"] is True and result["imported"] == 3 and result["total_errors"] == 0
+        assert _contents(conn) == ["new row 0", "new row 1", "new row 2"]  # no duplicate from the retry
+        assert {m["id"] for m in storage.list_memories(conn, limit=-1)} <= _embedded_ids(conn)
+
+
+def test_replace_never_reports_done_with_errors(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        _setup_previous(conn)
+        _fail_nth(conn, _is_memory_insert, 1)
+        result = storage.import_memories(conn, NEW, strategy="replace")
+        conn.fail_when = None
+    assert not (result["replaced"] is True and result["total_errors"])
