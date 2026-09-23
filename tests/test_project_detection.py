@@ -745,3 +745,81 @@ def test_replace_never_reports_done_with_errors(fake_d1_backend, monkeypatch):
         result = storage.import_memories(conn, NEW, strategy="replace")
         conn.fail_when = None
     assert not (result["replaced"] is True and result["total_errors"])
+
+
+# --- round 6: D1 adoption only by this import's marker; staged replace clear (7063) ---
+
+def _row_by_id(conn, mid):
+    return conn.execute("SELECT content, metadata, tags FROM memories WHERE id = ?", (mid,)).fetchone()
+
+
+def test_d1_append_never_adopts_a_preexisting_same_content_row(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        original = _add(conn, "duplicate text", tags=["plan"], metadata={"k": 1})
+        before = _row_by_id(conn, original["id"])
+        result = storage.import_memories(conn, [{"content": "duplicate text", "tags": ["analysis"]}])
+        assert result["imported"] == 1 and result["total_errors"] == 0
+        rows = conn.execute("SELECT id, tags, metadata FROM memories WHERE content = 'duplicate text'").fetchall()
+        assert len(rows) == 2  # the requested new row exists
+        assert tuple(_row_by_id(conn, original["id"])) == tuple(before)  # original untouched
+        new = next(r for r in rows if r[0] != original["id"])
+        assert json.loads(new[1]) == ["analysis"] and "import_attempt" not in (new[2] or "")
+
+
+def test_d1_append_embedding_failure_preserves_the_preexisting_row(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        original = _add(conn, "duplicate text", tags=["plan"])
+        before = _row_by_id(conn, original["id"])
+        embedded_before = _embedded_ids(conn)
+        conn.fail_when = lambda sql, params: _is_embedding_write(sql)  # every new vector fails
+        result = storage.import_memories(conn, [{"content": "duplicate text", "tags": ["analysis"]}])
+        conn.fail_when = None
+        assert result["imported"] == 0 and result["total_errors"] == 1 and "replaced" not in result
+        rows = conn.execute("SELECT id FROM memories WHERE content = 'duplicate text'").fetchall()
+        assert [r[0] for r in rows] == [original["id"]]  # only the original, untouched
+        assert tuple(_row_by_id(conn, original["id"])) == tuple(before)
+        assert original["id"] in _embedded_ids(conn) and _embedded_ids(conn) == embedded_before
+
+
+def test_d1_genuinely_lost_insert_is_adopted_by_marker_without_duplicate(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        real_execute = conn.execute
+        state = {"lost": False}
+
+        def execute(sql, params=None):
+            cur = real_execute(sql, params)
+            if _is_memory_insert(sql) and not state["lost"]:
+                state["lost"] = True  # committed, but the response never arrives
+                raise RuntimeError("response lost after commit")
+            return cur
+
+        monkeypatch.setattr(conn, "execute", execute)
+        result = storage.import_memories(conn, [{"content": "lost insert text", "tags": ["plan"]}])
+        monkeypatch.undo()
+        assert result["imported"] == 1 and result["total_errors"] == 0
+        rows = conn.execute("SELECT id, metadata FROM memories WHERE content = 'lost insert text'").fetchall()
+        assert len(rows) == 1 and "import_attempt" not in (rows[0][1] or "")
+        assert rows[0][0] in _embedded_ids(conn)
+
+
+@pytest.mark.parametrize("stage,sql", [
+    ("embeddings", "DELETE FROM memories_embeddings"),
+    ("memories", "DELETE FROM memories"),
+])
+def test_d1_replace_clear_failure_is_reported_and_rerunnable(fake_d1_backend, monkeypatch, stage, sql):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        before = _setup_previous(conn)
+        conn.fail_when = lambda s, p: s.strip() == sql
+        result = storage.import_memories(conn, NEW, strategy="replace")
+        conn.fail_when = None
+        assert result["replaced"] == "partial" and result["clear_stage"] == stage
+        assert result["imported"] == 0 and result["written_ids"] == [] and result["failed"] == 3
+        assert "Re-run the same replace" in result["message"]
+        assert _contents(conn) == before  # memories are cleared last: all still present
+        rerun = storage.import_memories(conn, NEW, strategy="replace")
+        assert rerun["replaced"] is True and _contents(conn) == ["new row 0", "new row 1", "new row 2"]
+        assert {m["id"] for m in storage.list_memories(conn, limit=-1)} <= _embedded_ids(conn)

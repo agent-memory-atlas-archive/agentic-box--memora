@@ -9570,7 +9570,7 @@ def import_memories(
     }
     if strategy == "replace":
         result["replaced"] = outcome["replaced"]
-        for key in ("failed", "written_ids", "message"):
+        for key in ("failed", "written_ids", "clear_stage", "message"):
             if key in outcome:
                 result[key] = outcome[key]
     return result
@@ -9630,60 +9630,124 @@ def _import_write_transactional(conn, prepared_rows, strategy) -> Dict[str, Any]
     return {"imported": len(prepared_rows), "replaced": True, "errors": []}
 
 
+_REPLACE_CLEAR_STAGES = (
+    # Dependent tables first, memories last: a stop at any stage leaves every
+    # memory row it has not reached intact, and an interrupted re-run is just
+    # the same idempotent DELETEs again.
+    ("crossrefs", "DELETE FROM memories_crossrefs"),
+    ("embeddings", "DELETE FROM memories_embeddings"),
+    ("fts", "DELETE FROM memories_fts"),
+    ("memories", "DELETE FROM memories"),
+)
+_IMPORT_MARKER_KEY = "import_attempt"
+
+
+def _with_attempts(fn):
+    """Run fn up to _IMPORT_WRITE_ATTEMPTS times; return (result, last_error)."""
+    last_error: Optional[Exception] = None
+    for _ in range(_IMPORT_WRITE_ATTEMPTS):
+        try:
+            return fn(), None
+        except Exception as exc:
+            last_error = exc
+    return None, last_error
+
+
 def _import_write_d1(conn, prepared_rows, strategy) -> Dict[str, Any]:
     """D1 (no transactions: every statement autocommits). NOT ATOMIC.
 
-    A replace deletes the old rows first, then writes the prepared rows in
-    order. Each row is attempted up to _IMPORT_WRITE_ATTEMPTS times; before a
-    retry, a row with the same content that this import has not yet claimed
-    is adopted (the INSERT committed but its response was lost), and a row
-    whose embedding could not be written is removed rather than left without
-    its vector. The loop STOPS at the first row that still fails and
-    reports replaced="partial" with the counts and the ids written: the
-    store then holds exactly those rows. Recovery: re-run the import from
-    the export file (a replace starts by clearing the store again). A
-    replace is never reported as done with errors.
+    replace clears the store in stages (_REPLACE_CLEAR_STAGES: crossrefs,
+    embeddings, FTS, then memories), each retried; a stage that still fails
+    stops the import with replaced="partial" and clear_stage naming it --
+    memories are deleted last, so until that stage they are all intact, and
+    re-running the same replace simply repeats the idempotent DELETEs.
+
+    Rows are then written in order, each up to _IMPORT_WRITE_ATTEMPTS times.
+    Every INSERT carries a random per-import marker in metadata
+    (import_attempt = "<import id>:<row>"), stripped once the row is
+    complete. Only after an INSERT attempt failed is a row carrying THAT
+    marker adopted (its commit landed, its response was lost) instead of
+    inserted again; a pre-existing memory can never be adopted, because it
+    cannot carry this import's marker. A row that still fails is removed only
+    if it carries the marker (never an unrelated memory), so no row is left
+    without its vector. The loop STOPS at the first such row and reports
+    replaced="partial" (append/merge: replaced is not reported) with failed
+    and written_ids: the store then holds exactly those new rows (replace:
+    the previous contents are gone; recover by re-running the import from
+    the export file). A replace is never reported as done with errors.
     """
-    written: List[int] = []
+    import uuid as _uuid
+
     if strategy == "replace":
-        _clear_store_for_replace(conn)
-    for index, row in enumerate(prepared_rows):
-        content = row[0]
+        fts = _fts_enabled(conn)
+        for index, (stage, sql) in enumerate(_REPLACE_CLEAR_STAGES):
+            if stage == "fts" and not fts:
+                continue
+            _result, error = _with_attempts(lambda sql=sql: conn.execute(sql))
+            if error is not None:
+                remaining = [name for name, _sql in _REPLACE_CLEAR_STAGES[index:]]
+                return {
+                    "imported": 0,
+                    "replaced": "partial",
+                    "failed": len(prepared_rows),
+                    "written_ids": [],
+                    "clear_stage": stage,
+                    "errors": [{"index": None, "error": f"clear stage {stage} failed: {error}"}],
+                    "message": (
+                        f"D1 replace is not atomic: clearing stopped at stage {stage!r}; not yet "
+                        f"cleared: {', '.join(remaining)}"
+                        + ("; every previous memory row is still present" if "memories" in remaining else "")
+                        + ". Re-run the same replace to continue (clearing is idempotent)."
+                    ),
+                }
+
+    import_id = _uuid.uuid4().hex
+    written: List[int] = []
+    for index, (content, metadata_json, tags_json, created_at, vector) in enumerate(prepared_rows):
+        marker = f"{import_id}:{index}"
+        meta = json.loads(metadata_json) if metadata_json else {}
+        meta[_IMPORT_MARKER_KEY] = marker
+        marked_json = json.dumps(meta, ensure_ascii=False)
+        memory_id: Optional[int] = None
         last_error: Optional[Exception] = None
         for _attempt in range(_IMPORT_WRITE_ATTEMPTS):
             try:
-                memory_id = _import_adopt_lost_insert(conn, content, written)
                 if memory_id is None:
-                    memory_id = _import_insert_row(conn, *row)
-                else:
-                    _fts_upsert(conn, memory_id, content, row[1], row[2])
-                    _upsert_embedding(conn, memory_id, row[4])
-                written.append(int(memory_id))
+                    memory_id = _import_find_marked(conn, marker)  # lost response of a previous attempt
+                if memory_id is None:
+                    if created_at:
+                        cur = conn.execute(
+                            "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
+                            (content, marked_json, tags_json, created_at),
+                        )
+                    else:
+                        cur = conn.execute(
+                            "INSERT INTO memories (content, metadata, tags) VALUES (?, ?, ?)",
+                            (content, marked_json, tags_json),
+                        )
+                    memory_id = int(cur.lastrowid)
+                _fts_upsert(conn, memory_id, content, metadata_json, tags_json)
+                _upsert_embedding(conn, memory_id, vector)
+                conn.execute("UPDATE memories SET metadata = ? WHERE id = ?", (metadata_json, memory_id))
+                written.append(memory_id)
                 last_error = None
                 break
             except Exception as exc:
                 last_error = exc
         if last_error is not None:
-            # Never leave this row's memory without its embedding.
-            orphan = _import_adopt_lost_insert(conn, content, written)
-            if orphan is not None:
-                try:
-                    conn.execute("DELETE FROM memories WHERE id = ?", (orphan,))
-                except Exception:
-                    logger.error("import: could not remove unembedded row #%s", orphan)
-            failed = len(prepared_rows) - index
+            _import_remove_marked(conn, marker)
             return {
                 "imported": len(written),
                 "replaced": "partial" if strategy == "replace" else False,
-                "failed": failed,
+                "failed": len(prepared_rows) - index,
                 "written_ids": written,
                 "errors": [{"index": index, "error": f"write failed after "
                                                      f"{_IMPORT_WRITE_ATTEMPTS} attempts: {last_error}"}],
                 "message": (
-                    "D1 import is not atomic: stopped at the first failing row; the store "
-                    "holds exactly the rows in written_ids" + (
-                        " (the previous contents were already deleted). Recover by "
-                        "re-running the import from the export file."
+                    "D1 import is not atomic: stopped at the first failing row; this import added "
+                    "exactly the rows in written_ids" + (
+                        " (the previous contents were already deleted). Recover by re-running "
+                        "the import from the export file."
                         if strategy == "replace" else "."
                     )
                 ),
@@ -9691,17 +9755,30 @@ def _import_write_d1(conn, prepared_rows, strategy) -> Dict[str, Any]:
     return {"imported": len(written), "replaced": True, "errors": [], "written_ids": written}
 
 
-def _import_adopt_lost_insert(conn, content: str, written: List[int]) -> Optional[int]:
-    """A row with this content that this import did not record as written:
-    an INSERT whose commit landed but whose response (or a later statement)
-    failed. Adopted instead of inserting a duplicate."""
-    for r in conn.execute(
-        "SELECT id FROM memories WHERE content = ? ORDER BY id DESC", (content,)
-    ).fetchall():
-        rid = int(_row_field(r, 0, "id"))
-        if rid not in written:
-            return rid
-    return None
+def _import_find_marked(conn, marker: str) -> Optional[int]:
+    """The row THIS import attempt inserted for one entry, if its INSERT
+    committed (identified only by the attempt marker, never by content)."""
+    row = conn.execute(
+        f"SELECT id FROM memories WHERE json_extract(metadata, '$.{_IMPORT_MARKER_KEY}') = ?",
+        (marker,),
+    ).fetchone()
+    return int(_row_field(row, 0, "id")) if row is not None else None
+
+
+def _import_remove_marked(conn, marker: str) -> None:
+    """Remove an incomplete row of this import (and its embedding, if any);
+    rows without this attempt's marker are never touched."""
+    try:
+        memory_id = _import_find_marked(conn, marker)
+        if memory_id is None:
+            return
+        conn.execute("DELETE FROM memories_embeddings WHERE memory_id = ?", (memory_id,))
+        conn.execute(
+            f"DELETE FROM memories WHERE id = ? AND json_extract(metadata, '$.{_IMPORT_MARKER_KEY}') = ?",
+            (memory_id, marker),
+        )
+    except Exception as exc:
+        logger.error("import: could not remove the incomplete row with marker %s: %s", marker, exc)
 
 
 def poll_events(
