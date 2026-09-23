@@ -521,3 +521,100 @@ def test_digest_buckets_include_tag_only_typed_entries(db, projects):
     assert {entries["todos"]["id"], entries["pi/todos"]["id"]} <= todo_ids
     assert {entries["pi/issues"]["id"], entries["memora/issues"]["id"], entries["issues"]["id"]} <= issue_ids
     assert noise["id"] not in todo_ids | issue_ids
+
+
+# --- round 4: system tags are internal-only and round-trip (review 7044) ---------
+
+def test_public_batch_cannot_smuggle_system_tags(default_policy_db, projects):
+    from memora import server
+
+    projects(["pi"])
+    out = asyncio.run(server.memory_create_batch([
+        {"content": "hand-applied typed tag", "project": "pi",
+         "metadata": {"type": "issue"}, "system_tags": ["pi/issues"]},
+    ]))
+    assert out["error"] == "invalid_batch"
+    with storage.connect() as conn:
+        assert not storage.list_memories(conn)
+    # The internal typed tools still work under the default policy.
+    issue = asyncio.run(server.memory_create_issue("real issue", project="pi"))
+    assert issue["memory"]["tags"] == ["pi/issues"]
+
+
+def test_system_tags_are_bound_to_metadata_type(default_policy_db, projects):
+    projects(["pi"])
+    with storage.connect() as conn:
+        with pytest.raises(ValueError):
+            _add(conn, "a todo, not an issue", project="pi",
+                 metadata={"type": "todo"}, system_tags=["pi/issues"])
+        with pytest.raises(ValueError):
+            _add(conn, "a note", project="pi", system_tags=["pi/documents"])
+
+
+def test_update_keeps_a_typed_tag_but_rejects_a_foreign_one(default_policy_db, projects):
+    from memora import server
+
+    projects(["pi"])
+    issue = asyncio.run(server.memory_create_issue("editable issue", project="pi"))["memory"]
+    with storage.connect() as conn:
+        kept = storage.update_memory(conn, issue["id"], content="edited issue", tags=["pi/issues", "plan"])
+        assert set(kept["tags"]) == {"pi/issues", "plan"}
+        with pytest.raises(ValueError):  # a typed tag this issue never had
+            storage.update_memory(conn, issue["id"], tags=["pi/issues", "pi/todos"])
+        note = _add(conn, "plain note", project="pi", tags=["plan"])
+        with pytest.raises(ValueError):  # hand-applying a typed tag via update
+            storage.update_memory(conn, note["id"], tags=["plan", "pi/issues"])
+    via_tool = asyncio.run(server.memory_update(issue["id"], tags=["pi/issues", "note"]))
+    assert "error" not in via_tool, via_tool
+
+
+def _typed_fixture(server):
+    asyncio.run(server.memory_create_issue("rt issue", project="pi"))
+    asyncio.run(server.memory_create_todo("rt todo"))
+    asyncio.run(server.memory_create_section("rt section", project="pi"))
+    asyncio.run(server.memory_store_document("# RT\n\n1. one\n2. two\n", "rt-doc", project="pi"))
+    with storage.connect() as conn:
+        _add(conn, "rt plain", tags=["plan"])
+
+
+def _tags_by_content(conn):
+    return {m["content"]: sorted(m["tags"]) for m in storage.list_memories(conn, limit=-1)}
+
+
+def test_export_import_round_trips_typed_tags(default_policy_db, projects):
+    from memora import server
+
+    projects(["pi"])
+    _typed_fixture(server)
+    with storage.connect() as conn:
+        before = _tags_by_content(conn)
+        exported = storage.export_memories(conn)
+        assert any(r["system_tags"] == ["pi/issues"] for r in exported)
+        result = storage.import_memories(conn, exported, strategy="replace")
+        assert result["replaced"] is True and result["total_errors"] == 0, result
+        assert _tags_by_content(conn) == before
+
+
+def test_replace_import_with_one_bad_entry_deletes_nothing(default_policy_db, projects):
+    from memora import server
+
+    projects(["pi"])
+    _typed_fixture(server)
+    with storage.connect() as conn:
+        before = _tags_by_content(conn)
+        exported = storage.export_memories(conn)
+        bad = exported + [{"content": "bad entry", "tags": ["not-allowed"]}]
+        result = storage.import_memories(conn, bad, strategy="replace")
+        assert result["replaced"] is False and result["imported"] == 0 and result["total_errors"] == 1
+        assert _tags_by_content(conn) == before  # nothing deleted, nothing added
+
+
+def test_import_refuses_forged_system_tags(default_policy_db, projects):
+    projects(["pi"])
+    with storage.connect() as conn:
+        result = storage.import_memories(conn, [
+            {"content": "not really an issue", "metadata": {"type": "note"},
+             "tags": ["pi/issues"], "system_tags": ["pi/issues"], "project": "pi"},
+        ])
+        assert result["imported"] == 0 and result["total_errors"] == 1
+        assert not storage.list_memories(conn)

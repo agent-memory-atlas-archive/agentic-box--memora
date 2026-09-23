@@ -442,8 +442,10 @@ def _boost_memory(conn, memory_id: int, boost_amount: float):
 
 
 @_with_connection(writes=True)
-def _create_memories(conn, entries: List[Dict[str, Any]]):
-    return add_memories(conn, entries)
+def _create_memories(conn, entries: List[Dict[str, Any]], system_tags=None):
+    # system_tags: internal only (the document path). Public batch entries
+    # cannot carry them; add_memories rejects the key (issue #47).
+    return add_memories(conn, entries, system_tags=system_tags)
 
 
 @_with_connection(writes=True)
@@ -1686,7 +1688,6 @@ async def memory_store_document(
             "metadata": frag.metadata,
             "tags": list(plan.root_tags),
             "project": project,
-            "system_tags": list(plan.system_tags),
         }
         fragment_entries.append(entry)
 
@@ -1695,7 +1696,10 @@ async def memory_store_document(
 
     if fragment_entries:
         try:
-            records = await _create_memories(fragment_entries)
+            records = await _create_memories(
+                fragment_entries,
+                system_tags=[list(plan.system_tags)] * len(fragment_entries),
+            )
         except ValueError as exc:
             return {
                 "error": "fragment_error",

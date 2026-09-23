@@ -1384,28 +1384,67 @@ def configured_projects(store: Optional[str] = None) -> Tuple[str, ...]:
     return tuple(dict.fromkeys(data))
 
 
-# Typed tags memora generates itself (issue/todo/section/document tools,
-# create suggestions): "<kind>" or "<project>/<kind>".
+# Typed tags memora generates itself: "<kind>" or "<project>/<kind>" (the
+# create suggestions also offer "knowledge", but only as a suggestion).
 TYPED_TAG_KINDS = ("issues", "todos", "sections", "documents", "knowledge")
+# A SYSTEM typed tag is bound to the memory's metadata.type: memora writes
+# "<p>/issues" only on an issue, and so on. That binding is what keeps the
+# allowlist exemption from being a way to hand-apply these tags.
+_SYSTEM_KIND_TYPES: Dict[str, frozenset] = {
+    "issues": frozenset({"issue"}),
+    "todos": frozenset({"todo"}),
+    "sections": frozenset({"section"}),
+    "documents": frozenset({"document_root", "document_fragment"}),
+}
 
 
-def _system_typed_tags(system_tags: Optional[Iterable[str]], project: Optional[str]) -> List[str]:
-    """Validate typed tags a memora tool adds itself.
+def _system_typed_tags(
+    system_tags: Optional[Iterable[str]],
+    project: Optional[str],
+    metadata: Optional[Mapping[str, Any]],
+) -> List[str]:
+    """Validate the typed tags memora itself applies to a memory.
 
-    They are exempt from the tag allowlist (issue #47 review): memora
-    generates them from a fixed kind list and an already-validated project,
-    so they cannot be used as free-form tags -- unlike putting the kinds into
-    the global policy, which would also let callers hand-apply them. Each
-    must be exactly a kind, or "<project>/<kind>" for THIS memory's project.
+    Exempt from the tag allowlist (issue #47): memora generates them from a
+    fixed kind list, bound to the memory's metadata.type and to its already-
+    validated project, so they cannot serve as free-form tags -- unlike
+    widening the global policy, which would let callers hand-apply them.
+    Each must be exactly "<kind>" or "<project>/<kind>" for THIS memory's
+    project, of a kind that matches its metadata.type. Only internal paths
+    pass them (add_memory/add_memories parameters, the typed tools, an
+    import re-applying an export's system_tags field); public entry dicts
+    cannot carry them.
     """
+    mtype = metadata.get("type") if isinstance(metadata, Mapping) else None
     out: List[str] = []
     for tag in system_tags or []:
+        if not isinstance(tag, str):
+            raise ValueError(f"invalid system tag {tag!r}")
         kind = tag.split("/", 1)[1] if "/" in tag else tag
         expected = project_tag(project, kind)
-        if kind not in TYPED_TAG_KINDS or tag != expected:
+        if kind not in _SYSTEM_KIND_TYPES or tag != expected:
             raise ValueError(f"invalid system tag {tag!r} (expected {expected!r})")
+        if mtype not in _SYSTEM_KIND_TYPES[kind]:
+            raise ValueError(f"system tag {tag!r} does not match metadata.type {mtype!r}")
         if tag not in out:
             out.append(tag)
+    return out
+
+
+def _existing_system_tags(tags: Any, metadata: Optional[Mapping[str, Any]]) -> List[str]:
+    """The stored tags that ARE legitimate system typed tags for this memory
+    (its own project's or bare, matching its metadata.type) -- preserved and
+    exempt on update, exported as system_tags."""
+    if not isinstance(tags, list):
+        return []
+    project = _resolve_project(None, tags, metadata, strict=False)
+    out = []
+    for tag in tags:
+        try:
+            if _system_typed_tags([tag], project, metadata):
+                out.append(tag)
+        except ValueError:
+            continue
     return out
 
 
@@ -5367,7 +5406,7 @@ def add_memory(
     content = _validate_content(content)
 
     resolved_project, metadata = _project_metadata(project, metadata, tags)
-    typed = _system_typed_tags(system_tags, resolved_project)
+    typed = _system_typed_tags(system_tags, resolved_project, metadata)
     metadata = _auto_assign_section(metadata, list(tags or []) + typed, resolved_project)
 
     validated_tags = _validate_tags(tags)
@@ -5495,18 +5534,33 @@ def add_memory(
 def add_memories(
     conn: sqlite3.Connection,
     entries: Iterable[Dict[str, Any]],
+    *,
+    system_tags: Optional[List[Optional[List[str]]]] = None,
 ) -> List[Dict[str, Any]]:
+    """Create several memories.
+
+    system_tags: INTERNAL -- per-entry typed tags memora applies itself
+    (aligned with entries; see _system_typed_tags). An entry dict can never
+    carry them: a "system_tags" key in an entry is rejected, because entries
+    come straight from callers (memory_create_batch).
+    """
     rows: List[Dict[str, Any]] = []
     prepared: List[tuple[str, Optional[str], Optional[str]]] = []
 
-    for entry in entries:
+    entries = list(entries)
+    for index, entry in enumerate(entries):
         if "content" not in entry:
             raise ValueError("Each batch entry must include 'content'")
+        if "system_tags" in entry:
+            raise ValueError("system_tags cannot be supplied in a batch entry")
         content = str(entry["content"]).strip()
         metadata = entry.get("metadata")
         tags = entry.get("tags") or []
         resolved_project, metadata = _project_metadata(entry.get("project"), metadata, tags)
-        typed = _system_typed_tags(entry.get("system_tags"), resolved_project)
+        typed = _system_typed_tags(
+            (system_tags[index] if system_tags and index < len(system_tags) else None),
+            resolved_project, metadata,
+        )
         metadata = _auto_assign_section(metadata, list(tags) + typed, resolved_project)
         prepared_metadata = _prepare_metadata(metadata)
         validated_tags = _validate_tags(tags)
@@ -8070,7 +8124,10 @@ def update_memory(
         # A stored (possibly legacy) metadata.project is tolerated here; a
         # project supplied by THIS update was validated above.
         new_tags = _normalize_tags(new_tags, _resolve_project(None, new_tags, new_metadata, strict=False))
-        _enforce_tag_whitelist(new_tags)
+        # The memory's OWN legitimate typed tags (e.g. "pi/issues" on this
+        # issue) stay exempt when kept; anything new is a user tag.
+        kept_system = set(_existing_system_tags(existing.get("tags") or [], existing.get("metadata")))
+        _enforce_tag_whitelist(new_tags, exempt=kept_system)
 
     # Check what changed (affects whether we need to recompute indexes)
     content_changed = content is not None and new_content != existing["content"]
@@ -9359,11 +9416,17 @@ def export_memories(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     for row in rows:
         metadata = row["metadata"]
         tags = row["tags"]
+        parsed_meta = json.loads(metadata) if metadata else None
+        parsed_tags = json.loads(tags) if tags else []
         exported.append({
             "id": row["id"],
             "content": row["content"],
-            "metadata": json.loads(metadata) if metadata else None,
-            "tags": json.loads(tags) if tags else [],
+            "metadata": parsed_meta,
+            "tags": parsed_tags,
+            # The subset of tags memora applied itself (issue #47): import
+            # re-applies these through the typed-tag validation instead of
+            # the allowlist, so an export always restores.
+            "system_tags": _existing_system_tags(parsed_tags, parsed_meta),
             "created_at": row["created_at"],
         })
 
@@ -9382,30 +9445,26 @@ def import_memories(
         data: List of memory dictionaries
         strategy: "replace" (clear all first), "merge" (skip duplicates), "append" (add all)
 
+    Every entry is PREPARED first (content, project, tags, embedding); only
+    then is anything written. With "replace", any entry that fails
+    preparation fails the whole import and NOTHING is deleted -- a restore
+    must never erase the store and then reject its own data. "merge" and
+    "append" keep per-entry errors.
+
+    An entry's "system_tags" (as export_memories writes them: the typed tags
+    memora applied itself) are re-applied through _system_typed_tags -- bound
+    to the entry's project and metadata.type -- instead of the tag allowlist,
+    so an export restores under the default policy. All other tags are
+    enforced as usual.
+
     Returns:
         Dictionary with import statistics
     """
     if strategy not in ("replace", "merge", "append"):
         raise ValueError("strategy must be 'replace', 'merge', or 'append'")
 
-    # Replace: clear database first
-    replace_integrity_stamp = None
-    if strategy == "replace":
-        # Preserve the last complete audit stamp.  This bulk SQL path bypasses
-        # normal write helpers by design; restoring its baseline lets the next
-        # SQL audit detect replacement rather than certifying a new row alone.
-        from .embeddings import get_embedding_integrity
-        replace_integrity_stamp = get_embedding_integrity(conn)
-        conn.execute("DELETE FROM memories")
-        if _fts_enabled(conn):
-            conn.execute("DELETE FROM memories_fts")
-        conn.execute("DELETE FROM memories_embeddings")
-        conn.execute("DELETE FROM memories_crossrefs")
-        conn.commit()
-
-    imported = 0
     skipped = 0
-    errors = []
+    errors: List[Dict[str, Any]] = []
 
     # Get existing content hashes for merge strategy
     existing_contents: set[str] = set()
@@ -9413,6 +9472,7 @@ def import_memories(
         rows = conn.execute("SELECT content FROM memories").fetchall()
         existing_contents = {row["content"] for row in rows}
 
+    prepared_rows: List[Tuple[str, Optional[str], str, Optional[str], Dict[str, float]]] = []
     for idx, entry in enumerate(data):
         try:
             content = entry.get("content", "").strip()
@@ -9430,25 +9490,63 @@ def import_memories(
                 continue
 
             metadata = entry.get("metadata")
-            tags = entry.get("tags", [])
+            tags = entry.get("tags", []) or []
             created_at = entry.get("created_at")
+            system = entry.get("system_tags") or []
+            if not isinstance(system, list) or not isinstance(tags, list):
+                raise ValueError("tags and system_tags must be lists")
+            user_tags = [t for t in tags if t not in system]
 
             # Prepare data
-            resolved_project, metadata = _project_metadata(entry.get("project"), metadata, tags)
-            metadata = _auto_assign_section(metadata, tags, resolved_project)
+            resolved_project, metadata = _project_metadata(entry.get("project"), metadata, user_tags)
+            typed = _system_typed_tags(system, resolved_project, metadata)
+            metadata = _auto_assign_section(metadata, user_tags + typed, resolved_project)
             prepared_metadata = _prepare_metadata(metadata) if metadata else None
-            validated_tags = _validate_tags(tags)
+            validated_tags = _validate_tags(user_tags)
             validated_tags = _normalize_tags(validated_tags, resolved_project)
             _enforce_tag_whitelist(validated_tags)
+            validated_tags = validated_tags + [t for t in _validate_tags(typed) if t not in validated_tags]
 
             metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
             tags_json = json.dumps(validated_tags, ensure_ascii=False)
-            # Compute before INSERT so an unembeddable import never leaves a
-            # content row without its required vector.
+            # Compute before any write so an unembeddable import never leaves
+            # a content row without its required vector.
             vector = _compute_embedding(content, prepared_metadata, validated_tags)
             if not vector:
                 raise ValueError("embedding is empty; refusing durable import write")
+            prepared_rows.append((content, metadata_json, tags_json, created_at, vector))
 
+        except Exception as exc:
+            errors.append({"index": idx, "error": str(exc)})
+
+    if strategy == "replace" and errors:
+        return {
+            "imported": 0,
+            "skipped": skipped,
+            "errors": errors[:10],
+            "total_errors": len(errors),
+            "replaced": False,
+            "message": "replace aborted before deleting anything: fix the failing entries",
+        }
+
+    # Replace: clear database first
+    replace_integrity_stamp = None
+    if strategy == "replace":
+        # Preserve the last complete audit stamp.  This bulk SQL path bypasses
+        # normal write helpers by design; restoring its baseline lets the next
+        # SQL audit detect replacement rather than certifying a new row alone.
+        from .embeddings import get_embedding_integrity
+        replace_integrity_stamp = get_embedding_integrity(conn)
+        conn.execute("DELETE FROM memories")
+        if _fts_enabled(conn):
+            conn.execute("DELETE FROM memories_fts")
+        conn.execute("DELETE FROM memories_embeddings")
+        conn.execute("DELETE FROM memories_crossrefs")
+        conn.commit()
+
+    imported = 0
+    for content, metadata_json, tags_json, created_at, vector in prepared_rows:
+        try:
             # Insert with optional created_at preservation
             if created_at:
                 cur = conn.execute(
@@ -9470,7 +9568,7 @@ def import_memories(
             imported += 1
 
         except Exception as exc:
-            errors.append({"index": idx, "error": str(exc)})
+            errors.append({"index": None, "error": str(exc)})
 
     conn.commit()
 
@@ -9484,12 +9582,15 @@ def import_memories(
     if imported > 0:
         rebuild_crossrefs(conn)
 
-    return {
+    result = {
         "imported": imported,
         "skipped": skipped,
         "errors": errors[:10],  # Limit error list to first 10
         "total_errors": len(errors),
     }
+    if strategy == "replace":
+        result["replaced"] = True
+    return result
 
 
 def poll_events(
