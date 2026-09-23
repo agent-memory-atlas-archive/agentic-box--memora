@@ -51,11 +51,15 @@ created, used or held.
    which is one transport read whose size depends on the event loop.
    `memora-server` pins uvicorn to `http="h11"`, `loop="asyncio"`
    (`h11_max_incomplete_event_size=16384` bounds the request line and
-   headers, not body messages); with that loop the largest message measured
-   was 262144 bytes, on CPython 3.12.8 (the container's minor version) and
-   3.13.1 with uvicorn 0.42.0: `scripts/measure_asgi_body_messages.py` serves
-   a recording ASGI app with those exact options and sends it a 4 MiB
-   chunked body over loopback.
+   headers, not body messages). The v0.4.6 image runs CPython 3.12.14 and
+   uvicorn 0.53.0; the largest message was measured at 262144 bytes with
+   uvicorn 0.53.0 on CPython 3.12.8, the closest runtime the measuring
+   machine had (asyncio's transport read size is the same 262144 constant
+   there). Earlier data points: 262144 with uvicorn 0.42.0 on CPython 3.12.8
+   and 3.13.1. `scripts/measure_asgi_body_messages.py` serves a recording
+   ASGI app with those exact options and sends it a 4 MiB chunked body over
+   loopback; to measure in the image itself: `docker run --rm -i
+   memora:latest python - < scripts/measure_asgi_body_messages.py`.
 6. **400 `bad_request`** (search, absorb): invalid JSON, a missing or unknown
    field, a value out of range, or a `project` the store does not declare
    (message starts `unknown_project:`).

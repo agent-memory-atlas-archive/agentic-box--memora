@@ -11,9 +11,9 @@
 #  - A plain JSON API /api/v1/<store>/{health,search,absorb} (Phase 0 of the
 #    clmux memora daemon; contract memora-api-v1.0.0). It is registered ONLY
 #    when MEMORA_API_TOKENS_FILE is set. THIS DEPLOY DOES NOT SET IT: the API
-#    stays unregistered on memora-all, and step 5 checks that it is (a 404, or
-#    a refused connection, on /api/v1/memora/health), so an accidental
-#    registration fails the deploy.
+#    stays unregistered on memora-all, and step 5 checks that it is (an actual
+#    HTTP 404 on /api/v1/memora/health), so an accidental registration -- or
+#    a server that stopped answering -- fails the deploy.
 #  - memora-server now pins uvicorn to http=h11, loop=asyncio (explicit
 #    instead of "auto"); readiness probes (/health/db) no longer run schema
 #    setup and never create a database.
@@ -56,8 +56,9 @@
 #     import_pending. Any store failing is named and fails the deploy.
 #     ("pi" in the memora project list is a tag project inside the memora
 #     store, not a store; pi agents have no MCP config.) Finally, GET
-#     /api/v1/memora/health must be a 404 or a refused connection: the API
-#     is not registered without a tokens file.
+#     /api/v1/memora/health must be an actual HTTP 404 (the API is not
+#     registered without a tokens file); no HTTP answer within ~20 s, or any
+#     other status, fails the deploy.
 #
 # HARDENED (queue item 23 follow-up, sealed review msg 5698/5699): the
 # credentials-env parser used to stream straight into the while loop via
@@ -430,20 +431,30 @@ if failed:
 print(f"all {len(STORES)} stores verified: {', '.join(STORES)}")
 
 # The plain JSON API is registered ONLY with MEMORA_API_TOKENS_FILE, which
-# this deploy does not set: /api/v1/... must not exist. A 404 (route not
-# registered) or a refused connection passes; ANY other answer -- 401 from a
-# registered route, 200, 503 -- means the API got registered and fails.
-api_status = None
-try:
-    with urllib.request.urlopen(f"{ROOT}/api/v1/memora/health", timeout=10) as resp:
-        api_status = resp.status
-except urllib.error.HTTPError as exc:
-    api_status = exc.code
-except (urllib.error.URLError, ConnectionError) as exc:
-    api_status = f"connection refused ({exc})"
-if api_status != 404 and not str(api_status).startswith("connection refused"):
-    print(f"/api/v1/memora/health answered {api_status!r}: the API is registered, but this "
-          "deploy sets no MEMORA_API_TOKENS_FILE", file=sys.stderr)
+# this deploy does not set: /api/v1/... must not exist. REQUIRE an actual
+# HTTP 404 from the running server. A refused connection, a timeout or any
+# other transport error FAILS (8920 is the same port every check above used,
+# so a dead or restarting container here must not pass as "not registered");
+# transport errors are retried for at most ~20 s first. Any other status --
+# 401 from a registered route, 200, 503 -- means the API is registered.
+api_status, last_error = None, None
+api_deadline = time.time() + 20
+while api_status is None:
+    try:
+        with urllib.request.urlopen(f"{ROOT}/api/v1/memora/health", timeout=10) as resp:
+            api_status = resp.status
+    except urllib.error.HTTPError as exc:
+        api_status = exc.code
+    except (urllib.error.URLError, OSError) as exc:  # refused, reset, timeout
+        last_error = exc
+        if time.time() > api_deadline:
+            print(f"/api/v1/memora/health: no HTTP answer ({last_error}); the server did not respond "
+                  "on the port every check above used", file=sys.stderr)
+            sys.exit(1)
+        time.sleep(2)
+if api_status != 404:
+    print(f"/api/v1/memora/health answered {api_status}: the API is registered, but this deploy "
+          "sets no MEMORA_API_TOKENS_FILE", file=sys.stderr)
     sys.exit(1)
 print(f"/api/v1 not registered (/api/v1/memora/health: {api_status})")
 PY
