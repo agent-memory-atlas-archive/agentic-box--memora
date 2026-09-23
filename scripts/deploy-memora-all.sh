@@ -1,49 +1,54 @@
 #!/usr/bin/env bash
-# Full deploy of the live memora-all container (nuc8) to v0.4.3: fetch +
+# Full deploy of the live memora-all container (nuc8) to v0.4.4: fetch +
 # build the tagged image and recreate the container from it, then verify it.
 #
-# What v0.4.3 changes (see CHANGELOG.md "0.4.3"): memory_absorb only.
-#  - Far fewer D1 round trips: batched phase-1 reads, bounded supersession
-#    views, SELECT 1 existence checks, batched embeddings. Modeled on a
-#    9-fact update-heavy absorb: 550 D1 requests / ~120 s -> 204 / ~49 s.
-#    Why: live absorb calls were hitting the caller's 300 s timeout while
-#    the server kept committing.
-#  - A per-leaf supersede gate (similarity floor + a narrow LLM check on the
-#    exact memory being hidden, re-checked at the write boundary and for
-#    concurrent siblings). Why: #1082 was superseded by unrelated #1109.
-#    Each UPDATE now costs one extra LLM call per leaf it would supersede.
-#  - Every absorb result carries a "profile" field (per-phase time and D1
-#    request counts).
+# What v0.4.4 changes (see CHANGELOG.md "0.4.4"): memora's READ paths.
+#  - Why: from the Mac, memory_semantic_search took 10-14 s even warm,
+#    memory_get 2 s, memory_list 1.3 s, and clmux is to be memora's only
+#    client. Fake-D1 bench (modeled at 0.2 s per request, not measured
+#    live), warm D1 requests: semantic search 16 -> 3, hybrid 17 -> 4,
+#    memory_get 8 -> 1, memory_list 4 -> 2. The first search after a write
+#    still costs ~25 requests.
+#  - Searches score against the in-process corpus snapshot; follow,
+#    memory_get and memory_related need far fewer statements; D1 keeps one
+#    HTTPS connection per worker thread; query embeddings are cached.
+#  - Read tools return a "profile" field (per-phase seconds, D1 requests).
+#  - Behaviour changes: an EMPTY stored memory_related list is returned
+#    as-is until refresh=True; malformed tags JSON reads as untagged (plus
+#    "tags_invalid": true) instead of failing the read.
 #
-# NO MODEL CHANGE: MEMORA_LLM_MODEL stays openai/gpt-4o-mini (set by the
-# v0.4.1 deploy); step 2 below re-writes the same value, a confirming no-op.
-# No new required env vars. One new OPTIONAL one, set here:
-# MEMORA_LOG_LEVEL=INFO. Without it memora configures no logging and every
-# INFO line -- including absorb's per-call profile and its supersede /
-# downgrade audit lines -- is silently dropped. With it they go to the
-# container's stderr (docker logs memora-all). The audit lines carry up to
-# 500 characters of memory text each; that log stays on nuc8.
+# NO MODEL OR ENV CHANGE: MEMORA_LLM_MODEL stays openai/gpt-4o-mini (step 2
+# re-writes the same value, a confirming no-op), and MEMORA_LOG_LEVEL=INFO
+# is already set by the v0.4.3 deploy. One new OPTIONAL env var exists,
+# MEMORA_CORPUS_CACHE_BUDGET_MB; this deploy deliberately does NOT set it,
+# so the 384 MB default applies. The corpus snapshot is ~93 KB per row;
+# live counts on 2026-09-23 (memora 968, ob1 615, bestation 66, re 237,
+# ~1.9k rows) come to ~175 MB if all four stores are cached, inside both
+# the 384 MB budget and the container's 768 MB limit (memora-all used
+# ~192 MB before this deploy). If the credentials env ever gained that
+# variable it would be forwarded like the rest of that env.
 #
 # Steps, all on nuc8:
-#  1. git fetch + checkout the v0.4.3 tag in the nuc8 checkout, docker build.
+#  1. git fetch + checkout the v0.4.4 tag in the nuc8 checkout, docker build.
 #     The image currently tagged memora:latest is kept as memora:rollback-<ts>
 #     before the new one replaces it.
 #  2. Edit MEMORA_LLM_MODEL in ~/.config/memora/credentials.mcp.json (already
 #     openai/gpt-4o-mini -- a confirming no-op, see above; backup kept).
-#  3. Recreate memora-all -- same image tag, mounts, ports, memory/cpu limits
-#     and restart policy the live container already runs with (checked via
-#     docker inspect on 2026-09-14), plus MEMORA_LOG_LEVEL=INFO. Old
-#     container kept stopped as memora-all-grok-<ts> (the name predates the
-#     model switch being a no-op; it still means "the container before this
-#     deploy", and the rollback commands below depend on it).
-#  4. Wait for GET /health, check it reports version 0.4.3 (proves the new
+#  3. Recreate memora-all -- same image tag, mounts, ports, memory/cpu limits,
+#     restart policy and env (including MEMORA_LOG_LEVEL=INFO) as the v0.4.3
+#     deploy. Old container kept stopped as memora-all-grok-<ts> (the name
+#     predates the model switch being a no-op; it still means "the container
+#     before this deploy", and the rollback commands below depend on it).
+#  4. Wait for GET /health, check it reports version 0.4.4 (proves the new
 #     build is the one serving, not a stale image), then run one 3-fact
-#     dry-run memory_absorb call, asserting no JSON-RPC error and a real
-#     session id at initialize, no JSON-RPC error / isError at tools/call (a
-#     JSON-RPC error rides HTTP 200 -- an HTTP-status-only check would print
-#     and exit zero on a server that answers but can't actually serve
-#     requests), and a result with a "decisions" list and the new "profile"
-#     field, before calling this done.
+#     dry-run memory_absorb call and one memory_semantic_search call,
+#     asserting no JSON-RPC error and a real session id at initialize, no
+#     JSON-RPC error / isError at each tools/call (a JSON-RPC error rides
+#     HTTP 200 -- an HTTP-status-only check would print and exit zero on a
+#     server that answers but can't actually serve requests), an absorb
+#     result with a "decisions" list and a "profile" field, and a search
+#     result with a "results" list and a "profile" field, before calling
+#     this done.
 #
 # HARDENED (queue item 23 follow-up, sealed review msg 5698/5699): the
 # credentials-env parser used to stream straight into the while loop via
@@ -65,7 +70,7 @@
 #   restore ~/.config/memora/credentials.mcp.json.bak-llm-<ts> if MEMORA_LLM_MODEL itself needs reverting
 set -euo pipefail
 
-TAG="v0.4.3"
+TAG="v0.4.4"
 
 # MEMORA_DATABASES names a Cloudflare account + database ids — read from the
 # git-ignored instance config rather than written into this (public) script.
@@ -162,7 +167,7 @@ docker run -d --name memora-all \
   "${ENV_ARGS[@]}" \
   memora:latest
 
-echo "memora-all recreated from $TAG (MEMORA_LLM_MODEL=openai/gpt-4o-mini unchanged, MEMORA_LOG_LEVEL=INFO)"
+echo "memora-all recreated from $TAG (MEMORA_LLM_MODEL=openai/gpt-4o-mini unchanged, MEMORA_LOG_LEVEL=INFO, corpus cache budget default 384 MB)"
 echo "old container kept stopped as memora-all-grok-$TS; old image kept as memora:rollback-$TS"
 echo "rollback: docker rm -f memora-all && docker rename memora-all-grok-$TS memora-all && docker start memora-all"
 
@@ -233,52 +238,74 @@ if not sid:
 
 _post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id=sid)
 
+def _tool_dict(tool_result, name):
+    """The tool's result dict: FastMCP sends it as JSON text content (and as
+    structuredContent["result"]). Exits on a missing dict or an error key."""
+    out = None
+    for item in tool_result.get("content") or []:
+        if item.get("type") == "text":
+            try:
+                out = json.loads(item["text"])
+            except ValueError:
+                pass
+            break
+    if out is None:
+        out = (tool_result.get("structuredContent") or {}).get("result")
+    if not isinstance(out, dict) or "error" in out:
+        print(f"{name} returned no result dict or an error: {json.dumps(tool_result)[:2000]}", file=sys.stderr)
+        sys.exit(1)
+    return out
+
+
+def _call_tool(req_id, name, arguments):
+    t0 = time.time()
+    _, raw = _post({
+        "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    }, session_id=sid)
+    elapsed = time.time() - t0
+    result = _parse_sse(raw)
+    if "error" in result:
+        print(f"{name} tools/call returned a JSON-RPC error: {result['error']}", file=sys.stderr)
+        sys.exit(1)
+    tool_result = result.get("result", {})
+    if tool_result.get("isError"):
+        print(f"{name} reported isError=true: {json.dumps(tool_result)[:2000]}", file=sys.stderr)
+        sys.exit(1)
+    return _tool_dict(tool_result, name), elapsed
+
+
+def _require_profile(name, out):
+    profile = out.get("profile")
+    if not isinstance(profile, dict) or "total_requests" not in profile:
+        print(f"{name} result lacks the profile field: {json.dumps(out)[:2000]}", file=sys.stderr)
+        sys.exit(1)
+    return profile
+
+
 facts = [
-    "deploy-check fact one about the v0.4.3 absorb rollout",
-    "deploy-check fact two about the v0.4.3 absorb rollout",
-    "deploy-check fact three about the v0.4.3 absorb rollout",
+    "deploy-check fact one about the v0.4.4 read rollout",
+    "deploy-check fact two about the v0.4.4 read rollout",
+    "deploy-check fact three about the v0.4.4 read rollout",
 ]
-t0 = time.time()
-_, raw = _post({
-    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-    "params": {"name": "memory_absorb", "arguments": {"facts": facts, "dry_run": True}},
-}, session_id=sid)
-elapsed = time.time() - t0
-result = _parse_sse(raw)
-if "error" in result:
-    print(f"tools/call returned a JSON-RPC error: {result['error']}", file=sys.stderr)
-    sys.exit(1)
-tool_result = result.get("result", {})
-if tool_result.get("isError"):
-    print(f"memory_absorb reported isError=true: {json.dumps(tool_result)[:2000]}", file=sys.stderr)
-    sys.exit(1)
-# The absorb result dict: FastMCP sends it as JSON text content (and as
-# structuredContent["result"]). Check its shape, not just the absence of an
-# error: v0.4.3 must return "decisions" and the new "profile" field.
-absorb = None
-for item in tool_result.get("content") or []:
-    if item.get("type") == "text":
-        try:
-            absorb = json.loads(item["text"])
-        except ValueError:
-            pass
-        break
-if absorb is None:
-    absorb = (tool_result.get("structuredContent") or {}).get("result")
-if not isinstance(absorb, dict) or "error" in absorb:
-    print(f"memory_absorb returned no result dict or an error: {json.dumps(tool_result)[:2000]}", file=sys.stderr)
-    sys.exit(1)
+absorb, elapsed = _call_tool(2, "memory_absorb", {"facts": facts, "dry_run": True})
 # Not one decision per fact: near-identical facts may be consolidated.
 if not isinstance(absorb.get("decisions"), list) or not absorb["decisions"]:
     print(f"memory_absorb result has no decisions: {json.dumps(absorb)[:2000]}", file=sys.stderr)
     sys.exit(1)
-profile = absorb.get("profile")
-if not isinstance(profile, dict) or "total_requests" not in profile:
-    print(f"memory_absorb result lacks the v0.4.3 profile field: {json.dumps(absorb)[:2000]}", file=sys.stderr)
-    sys.exit(1)
+profile = _require_profile("memory_absorb", absorb)
 print(f"3-fact dry-run absorb via memory store: {elapsed:.1f}s "
       f"({profile['total_requests']} {profile.get('request_unit', 'requests')}, "
       f"server-side {profile['total_seconds']}s)")
 print("actions:", [d.get("action") for d in absorb["decisions"]])
+
+search, elapsed = _call_tool(3, "memory_semantic_search", {"query": "memora deploy", "top_k": 3})
+if not isinstance(search.get("results"), list):
+    print(f"memory_semantic_search result has no results list: {json.dumps(search)[:2000]}", file=sys.stderr)
+    sys.exit(1)
+profile = _require_profile("memory_semantic_search", search)
+print(f"semantic search via memory store: {elapsed:.1f}s, {len(search['results'])} results "
+      f"({profile['total_requests']} {profile.get('request_unit', 'requests')}, "
+      f"server-side {profile['total_seconds']}s)")
 PY
 REMOTE
