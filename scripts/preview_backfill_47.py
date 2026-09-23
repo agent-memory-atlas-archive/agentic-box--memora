@@ -5,7 +5,8 @@ Writes NOTHING and creates nothing; it may REFUSE. A local SQLite store opens
 read-only (mode=ro, or immutable for a WAL file with no sidecars); a local
 WAL store WITH sidecars is in use by a writer process and is refused (exit
 non-zero: stop the server, or use --db against D1). D1 opens through a raw
-connection with no schema pass. SELECTs only. Its
+connection with no schema pass. S3 cloud stores are refused (their connect
+can sync the local cache). SELECTs only. Its
 output is a preview FILE the user reviews: every row carries
 "approved": false, and a later apply step (a separate item) may act only on
 rows the user flipped to true.
@@ -56,7 +57,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import _legacy_project_detection as legacy  # noqa: E402
 from memora import storage  # noqa: E402
-from memora.backends import LocalSQLiteBackend  # noqa: E402
+from memora.backends import CloudSQLiteBackend, LocalSQLiteBackend  # noqa: E402
 
 
 class StoreInUse(SystemExit):
@@ -75,6 +76,11 @@ def open_read_only():
     Guarantee: creates nothing, may refuse.
     """
     backend = storage.current_backend()
+    if isinstance(backend, CloudSQLiteBackend):
+        # Its connect() can sync (download to / upload from) its local cache.
+        raise SystemExit(
+            "the preview supports local SQLite and D1 stores only: an S3 cloud store's "
+            "connect can sync its cache, so it is refused (nothing opened)")
     if isinstance(backend, LocalSQLiteBackend):
         path = backend.db_path
         if not path.is_file():

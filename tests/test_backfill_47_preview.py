@@ -139,3 +139,25 @@ def test_preview_reads_only_the_header(store, tmp_path, monkeypatch):
     out = tmp_path / "out"
     out.mkdir()
     assert preview.main(["--out", str(out / "p.json")]) == 0
+
+
+def test_preview_refuses_an_s3_cloud_store_without_connecting(tmp_path, monkeypatch):
+    pytest.importorskip("boto3")
+    from memora.backends import CloudSQLiteBackend
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"cloudy": "s3://some-bucket/memora/memories.db"}))
+    monkeypatch.setenv("MEMORA_DEFAULT_DB", "cloudy")
+    monkeypatch.setenv("MEMORA_PROJECTS", json.dumps(PROJECTS))
+    storage._registry_cache = None
+    calls = []
+    for name in ("connect", "sync_before_use"):
+        monkeypatch.setattr(CloudSQLiteBackend, name, lambda self, *a, **k: calls.append(1))
+    assert isinstance(storage.backend_for("cloudy"), CloudSQLiteBackend)
+    out = tmp_path / "p.json"
+    with pytest.raises(SystemExit) as exc:
+        preview.main(["--out", str(out), "--db", "cloudy"])
+    assert exc.value.code != 0 and "local SQLite and D1 stores only" in str(exc.value.code)
+    assert calls == [] and not out.exists()
+    storage._registry_cache = None
