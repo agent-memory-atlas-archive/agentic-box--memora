@@ -627,7 +627,9 @@ NEW = [{"content": f"new row {i}", "tags": ["plan"]} for i in range(3)]
 
 
 def _contents(conn):
-    return sorted(m["content"] for m in storage.list_memories(conn, limit=-1))
+    # What the STORE holds (raw rows): reads hide import-pending rows, and
+    # these tests are about what is really left behind.
+    return sorted(r[0] for r in conn.execute("SELECT content FROM memories").fetchall())
 
 
 def _embedded_ids(conn):
@@ -823,3 +825,160 @@ def test_d1_replace_clear_failure_is_reported_and_rerunnable(fake_d1_backend, mo
         rerun = storage.import_memories(conn, NEW, strategy="replace")
         assert rerun["replaced"] is True and _contents(conn) == ["new row 0", "new row 1", "new row 2"]
         assert {m["id"] for m in storage.list_memories(conn, limit=-1)} <= _embedded_ids(conn)
+
+
+# --- round 7: verified cleanup, stale-marker sweep, pending rows hidden (7073) ---
+
+import time  # noqa: E402
+
+
+def _is_cleanup_delete(sql):
+    return sql.lstrip().startswith("DELETE FROM memories WHERE id = ? AND json_extract")
+
+
+def _raw_row(conn, mid):
+    return conn.execute("SELECT id, metadata FROM memories WHERE id = ?", (mid,)).fetchone()
+
+
+def _mark(conn, mid, *, age_s, embedded=True, import_id="0" * 32):
+    """Leave `mid` as an interrupted import would: marked, with or without its vector."""
+    raw = conn.execute("SELECT metadata FROM memories WHERE id = ?", (mid,)).fetchone()[0]
+    meta = json.loads(raw) if raw else {}
+    meta["import_attempt"] = storage._import_marker(import_id, int(time.time() - age_s), 0)
+    conn.execute("UPDATE memories SET metadata = ? WHERE id = ?", (json.dumps(meta), mid))
+    if not embedded:
+        conn.execute("DELETE FROM memories_embeddings WHERE memory_id = ?", (mid,))
+    conn.commit()
+    storage.invalidate_corpus_cache(conn)
+
+
+def test_d1_failed_cleanup_is_reported_as_orphan_and_swept(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        # Every vector write fails persistently, and so does the cleanup DELETE.
+        conn.fail_when = lambda sql, params: _is_embedding_write(sql) or _is_cleanup_delete(sql)
+        result = storage.import_memories(conn, [{"content": "orphaned import row", "tags": ["plan"]}])
+        conn.fail_when = None
+        assert result["imported"] == 0 and result["written_ids"] == []
+        [orphan] = result["orphan_ids"]
+        assert orphan["marker"].count(":") == 2
+        assert "WITHOUT an embedding" in result["message"] and "must be cleaned" in result["message"]
+        assert "exactly" not in result["message"]  # no exactness claim
+        # The row IS present, without its vector...
+        assert _raw_row(conn, orphan["id"]) is not None and orphan["id"] not in _embedded_ids(conn)
+        # ...and hidden from reads until swept.
+        assert storage.get_memory(conn, orphan["id"]) is None
+        assert storage.list_memories(conn, limit=-1) == []
+        assert storage.list_memories(conn, query="orphaned") == []
+        assert storage.hybrid_search(conn, "orphaned import row") == []
+        # A sweep while the marker is young leaves it (its import may still run)...
+        assert storage.sweep_import_markers(conn)["pending"] == 1
+        # ...and removes it once stale.
+        swept = storage.sweep_import_markers(conn, now=time.time() + 601)
+        assert swept["removed"] == 1 and swept["failed"] == []
+        assert _raw_row(conn, orphan["id"]) is None
+
+
+def test_d1_cleanup_deletes_the_memory_before_its_vector(fake_d1_backend, monkeypatch):
+    """Memory row first: a failing vector DELETE after it leaves no unembedded memory."""
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        real_upsert = storage._upsert_embedding
+
+        def upsert_then_fail(c, mid, vec):
+            real_upsert(c, mid, vec)  # the vector lands, the response is an error
+            raise RuntimeError("injected embedding failure")
+
+        monkeypatch.setattr(storage, "_upsert_embedding", upsert_then_fail)
+        conn.fail_when = lambda sql, params: sql.lstrip().startswith("DELETE FROM memories_embeddings WHERE memory_id")
+        result = storage.import_memories(conn, [{"content": "half cleaned row", "tags": ["plan"]}])
+        conn.fail_when = None
+        assert "orphan_ids" not in result and "exactly" in result["message"]
+        assert _contents(conn) == []  # the memory is gone; only a harmless stray vector may remain
+
+
+def test_interrupted_import_rows_are_completed_or_removed_by_the_next_import(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        embedded = _add(conn, "stale embedded row", tags=["plan"], metadata={"k": 1})["id"]
+        bare = _add(conn, "stale unembedded row", tags=["plan"])["id"]
+        young = _add(conn, "young unembedded row", tags=["plan"])["id"]
+        _mark(conn, embedded, age_s=3600)
+        _mark(conn, bare, age_s=3600, embedded=False)
+        _mark(conn, young, age_s=5, embedded=False)
+        assert {m["id"] for m in storage.list_memories(conn, limit=-1)} == set()
+
+        result = storage.import_memories(conn, [{"content": "unrelated import", "tags": ["plan"]}])
+        assert result["imported"] == 1
+        assert result["sweep"] == {"scanned": 3, "completed": 1, "removed": 1, "pending": 1, "failed": []}
+        # Completed: marker stripped, other metadata kept, visible again.
+        assert json.loads(_raw_row(conn, embedded)[1]) == {"k": 1}
+        assert storage.get_memory(conn, embedded)["content"] == "stale embedded row"
+        assert _raw_row(conn, bare) is None  # removed
+        assert _raw_row(conn, young) is not None and storage.get_memory(conn, young) is None  # left pending
+        visible = {m["content"] for m in storage.list_memories(conn, limit=-1)}
+        assert visible == {"stale embedded row", "unrelated import"}
+
+
+def test_sweep_handles_a_malformed_marker_as_stale(local_db):
+    with storage.connect() as conn:
+        mid = _add(conn, "malformed marker row", tags=["plan"])["id"]
+        conn.execute("UPDATE memories SET metadata = ? WHERE id = ?",
+                     (json.dumps({"import_attempt": "legacy:0"}), mid))
+        conn.commit()
+        assert storage.sweep_import_markers(conn)["completed"] == 1
+        assert _raw_row(conn, mid)[1] is None
+
+
+def test_reads_hide_a_marked_row_and_repair_never_embeds_it(local_db):
+    with storage.connect() as conn:
+        keep = _add(conn, "visible neighbour about kiwis", tags=["plan"])["id"]
+        mid = _add(conn, "pending row about kiwis", tags=["plan"])["id"]
+        _mark(conn, mid, age_s=3600, embedded=False)
+        assert storage.get_memory(conn, mid) is None
+        assert storage.get_memory(conn, mid, follow="latest") is None
+        assert [m["id"] for m in storage.list_memories(conn, limit=-1)] == [keep]
+        assert [m["id"] for m in storage.list_memories(conn, query="kiwis")] == [keep]
+        assert [m["id"] for m in storage.list_memories(conn, tags_any=["plan"])] == [keep]
+        assert [m["id"] for m in storage.list_memories(conn, follow="active")] == [keep]
+        assert {r["memory"]["id"] for r in storage.semantic_search(conn, "kiwis")} == {keep}
+        assert {r["memory"]["id"] for r in storage.hybrid_search(conn, "kiwis")} == {keep}
+        # The corpus snapshot's repair pass skipped it: still no vector.
+        assert mid not in _embedded_ids(conn)
+        assert storage._hydrate_memories_by_ids(conn, [keep, mid]).keys() == {keep}
+
+
+def test_import_attempt_is_a_reserved_metadata_key(local_db):
+    with storage.connect() as conn:
+        with pytest.raises(ValueError, match="reserved"):
+            _add(conn, "sneaky", tags=["plan"], metadata={"import_attempt": "x:0:0"})
+        # An export taken mid-import carries the marker: import strips it.
+        result = storage.import_memories(conn, [{"content": "exported mid import", "tags": ["plan"],
+                                                  "metadata": {"import_attempt": "x:0:0", "k": 2}}])
+        assert result["imported"] == 1
+        [m] = storage.list_memories(conn, limit=-1)
+        assert m["metadata"] == {"k": 2}
+
+
+def test_memory_import_sweep_admin_tool(local_db):
+    from memora import server
+
+    bad = asyncio.run(server.memory_import_sweep(older_than_minutes=0))
+    assert bad["error"] == "invalid_input"
+    with storage.connect() as conn:
+        mid = _add(conn, "admin swept row", tags=["plan"])["id"]
+        _mark(conn, mid, age_s=3600, embedded=False)
+    counts = asyncio.run(server.memory_import_sweep())
+    assert counts["removed"] == 1 and counts["failed"] == []
+
+
+def test_startup_sweep_covers_every_configured_store(tmp_path, monkeypatch):
+    from memora import server
+
+    swept = []
+    monkeypatch.setattr(storage, "database_registry", lambda: {"a": "x", "b": "y"})
+    monkeypatch.setattr(storage, "connect", lambda: type("C", (), {"close": lambda self: None})())
+    monkeypatch.setattr(server, "sweep_import_markers",
+                        lambda conn: swept.append(storage.CURRENT_DB.get()))
+    server._startup_import_sweep()
+    assert swept == ["a", "b"] and storage.CURRENT_DB.get() is None

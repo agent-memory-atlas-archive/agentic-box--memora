@@ -6,6 +6,7 @@ import hashlib
 import io
 import contextvars
 import threading
+import time
 from collections import OrderedDict
 import json
 import logging
@@ -1049,6 +1050,9 @@ def _prepare_metadata(
         return None
     if not isinstance(metadata, Mapping):
         raise ValueError("Metadata must be a mapping")
+    if _IMPORT_MARKER_KEY in metadata:
+        # Reserved: a row carrying it is hidden from reads and swept.
+        raise ValueError(f"metadata key {_IMPORT_MARKER_KEY!r} is reserved for memora imports")
     processed = _process_metadata_images(dict(metadata), memory_id=memory_id)
     return _build_metadata_dict(processed)
 
@@ -2521,8 +2525,10 @@ def _iter_memories_with_embeddings(
                 and row["embedding_encoding_source"] == "python"
             ):
                 vector = _CERTIFIED_EMPTY_EMBEDDING
-            yield row, vector
             last_id = row["id"]
+            if _import_pending(row["metadata"]):
+                continue  # an unfinished import row: not a memory yet
+            yield row, vector
         if len(rows) < page_size:
             return
 
@@ -2989,6 +2995,12 @@ def _load_corpus_snapshot(
                 vector = _json_to_embedding(raw_embedding)
             elif row["embedding_representation"] == "empty" and row["embedding_encoding_source"] == "python":
                 vector = _CERTIFIED_EMPTY_EMBEDDING
+            if _import_pending(row["metadata"]):
+                # An unfinished import row: not a memory yet. Never scored,
+                # and never embedded here as if complete (the import or the
+                # marker sweep owns it).
+                last_id = row["id"]
+                continue
             meta_type = _metadata_type_from_metadata(row["metadata"])
             if vector is None:
                 repair.append((row["id"], row["created_at"], row["metadata"]))
@@ -3396,7 +3408,8 @@ def _hydrate_memories_by_ids(conn: sqlite3.Connection, ids) -> Dict[int, sqlite3
     for chunk in _chunked(unique):
         placeholders = ",".join("?" for _ in chunk)
         for row in conn.execute(f"SELECT * FROM memories WHERE id IN ({placeholders})", chunk).fetchall():
-            out[row["id"]] = row
+            if not _import_pending(row["metadata"]):
+                out[row["id"]] = row
     return out
 
 
@@ -7931,6 +7944,23 @@ def get_memory(
     track_access: bool = False,
     follow: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """Retrieve a single memory by ID (see _get_memory_any).
+
+    A row an import has not finished (it still carries the import_attempt
+    marker) is not a memory yet: returned as None, like a missing id.
+    """
+    record = _get_memory_any(conn, memory_id, track_access=track_access, follow=follow)
+    if record is not None and _import_pending(record.get("metadata")):
+        return None
+    return record
+
+
+def _get_memory_any(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    track_access: bool = False,
+    follow: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Retrieve a single memory by ID.
 
     Same contract as _get_memory_legacy (see its docstring), in fewer round
@@ -8417,7 +8447,12 @@ def _list_memory_sql_rows(
     sql_offset: int,
     tiebreak_id: bool,
 ) -> List[sqlite3.Row]:
-    """Fetch one ordered page of raw memory rows (pre-Python filters)."""
+    """Fetch one ordered page of raw memory rows (pre-Python filters).
+
+    Rows an import has not finished (import_attempt marker) are excluded in
+    SQL, so they never reach a page, a count or the keyword search leg."""
+    date_clause_fts += _not_import_pending_sql("m.metadata")
+    date_clause_plain += _not_import_pending_sql("metadata")
     limit_clause = ""
     limit_params: List[Any] = []
     if sql_limit is not None:
@@ -9470,6 +9505,14 @@ def import_memories(
     if strategy not in ("replace", "merge", "append"):
         raise ValueError("strategy must be 'replace', 'merge', or 'append'")
 
+    # Rows a previous, no-longer-running import left marked (crash, failed
+    # cleanup): complete or remove them first. Never fatal to this import.
+    try:
+        sweep = sweep_import_markers(conn)
+    except Exception as exc:
+        logger.error("import sweep failed: %s", exc)
+        sweep = {"error": str(exc)}
+
     skipped = 0
     errors: List[Dict[str, Any]] = []
 
@@ -9497,6 +9540,8 @@ def import_memories(
                 continue
 
             metadata = entry.get("metadata")
+            if isinstance(metadata, Mapping) and _IMPORT_MARKER_KEY in metadata:
+                metadata = {k: v for k, v in metadata.items() if k != _IMPORT_MARKER_KEY}
             tags = entry.get("tags", []) or []
             created_at = entry.get("created_at")
             system = entry.get("system_tags") or []
@@ -9570,9 +9615,15 @@ def import_memories(
     }
     if strategy == "replace":
         result["replaced"] = outcome["replaced"]
-        for key in ("failed", "written_ids", "clear_stage", "message"):
+        for key in ("failed", "written_ids", "clear_stage", "message", "orphan_ids"):
             if key in outcome:
                 result[key] = outcome[key]
+    else:
+        for key in ("failed", "written_ids", "message", "orphan_ids"):
+            if key in outcome and outcome.get("errors"):
+                result[key] = outcome[key]
+    if sweep.get("scanned") or sweep.get("error"):
+        result["sweep"] = sweep
     return result
 
 
@@ -9639,7 +9690,7 @@ _REPLACE_CLEAR_STAGES = (
     ("fts", "DELETE FROM memories_fts"),
     ("memories", "DELETE FROM memories"),
 )
-_IMPORT_MARKER_KEY = "import_attempt"
+from .embeddings import IMPORT_MARKER_KEY as _IMPORT_MARKER_KEY  # noqa: E402
 
 
 def _with_attempts(fn):
@@ -9702,9 +9753,10 @@ def _import_write_d1(conn, prepared_rows, strategy) -> Dict[str, Any]:
                 }
 
     import_id = _uuid.uuid4().hex
+    started = int(time.time())
     written: List[int] = []
     for index, (content, metadata_json, tags_json, created_at, vector) in enumerate(prepared_rows):
-        marker = f"{import_id}:{index}"
+        marker = _import_marker(import_id, started, index)
         meta = json.loads(metadata_json) if metadata_json else {}
         meta[_IMPORT_MARKER_KEY] = marker
         marked_json = json.dumps(meta, ensure_ascii=False)
@@ -9735,23 +9787,34 @@ def _import_write_d1(conn, prepared_rows, strategy) -> Dict[str, Any]:
             except Exception as exc:
                 last_error = exc
         if last_error is not None:
-            _import_remove_marked(conn, marker)
-            return {
+            orphan = _import_remove_marked(conn, marker)
+            outcome = {
                 "imported": len(written),
                 "replaced": "partial" if strategy == "replace" else False,
                 "failed": len(prepared_rows) - index,
                 "written_ids": written,
                 "errors": [{"index": index, "error": f"write failed after "
                                                      f"{_IMPORT_WRITE_ATTEMPTS} attempts: {last_error}"}],
-                "message": (
-                    "D1 import is not atomic: stopped at the first failing row; this import added "
-                    "exactly the rows in written_ids" + (
-                        " (the previous contents were already deleted). Recover by re-running "
-                        "the import from the export file."
-                        if strategy == "replace" else "."
-                    )
-                ),
             }
+            if orphan is None:
+                added = "this import added exactly the rows in written_ids"
+            else:
+                outcome["orphan_ids"] = [orphan]
+                added = (
+                    "this import added the rows in written_ids, and the incomplete row in "
+                    "orphan_ids could not be removed: it is present WITHOUT an embedding (reads "
+                    "hide it while it carries its import marker) and must be cleaned -- the "
+                    "import-marker sweep removes it once the marker is older than "
+                    f"{_IMPORT_MARKER_STALE_S // 60} minutes (memory_import_sweep)"
+                )
+            outcome["message"] = (
+                "D1 import is not atomic: stopped at the first failing row; " + added + (
+                    " (the previous contents were already deleted). Recover by re-running "
+                    "the import from the export file."
+                    if strategy == "replace" else "."
+                )
+            )
+            return outcome
     return {"imported": len(written), "replaced": True, "errors": [], "written_ids": written}
 
 
@@ -9765,20 +9828,181 @@ def _import_find_marked(conn, marker: str) -> Optional[int]:
     return int(_row_field(row, 0, "id")) if row is not None else None
 
 
-def _import_remove_marked(conn, marker: str) -> None:
-    """Remove an incomplete row of this import (and its embedding, if any);
-    rows without this attempt's marker are never touched."""
+def _import_remove_marked(conn, marker: str) -> Optional[Dict[str, Any]]:
+    """Remove an incomplete row of this import; rows without this attempt's
+    marker are never touched. Returns None when the row is verifiably gone
+    (or never committed), else {"id", "marker"} of the row still present.
+
+    The memory row is deleted BEFORE its FTS entry and vector: a stop in
+    between leaves at most a vector (or FTS entry) without a memory, which is
+    harmless and swept by the embedding integrity repair -- never a memory
+    without its vector. Then the row is looked up again; a DELETE that
+    reported success is not taken on trust.
+    """
+    memory_id: Optional[int] = None
     try:
         memory_id = _import_find_marked(conn, marker)
         if memory_id is None:
-            return
-        conn.execute("DELETE FROM memories_embeddings WHERE memory_id = ?", (memory_id,))
-        conn.execute(
-            f"DELETE FROM memories WHERE id = ? AND json_extract(metadata, '$.{_IMPORT_MARKER_KEY}') = ?",
-            (memory_id, marker),
-        )
+            return None
+        _import_delete_marked_row(conn, memory_id, marker)
     except Exception as exc:
         logger.error("import: could not remove the incomplete row with marker %s: %s", marker, exc)
+    try:
+        remaining = _import_find_marked(conn, marker)
+    except Exception as exc:
+        logger.error("import: could not verify removal of marker %s: %s", marker, exc)
+        return {"id": memory_id, "marker": marker, "verified": False}
+    if remaining is None:
+        return None
+    logger.error("import: incomplete row %s with marker %s is still present", remaining, marker)
+    return {"id": remaining, "marker": marker}
+
+
+def _import_delete_marked_row(conn, memory_id: int, marker: str) -> None:
+    """DELETE a marked row (only while it still carries `marker`), then its
+    FTS entry, crossrefs and vector. Memory row first; see _import_remove_marked."""
+    conn.execute(
+        f"DELETE FROM memories WHERE id = ? AND json_extract(metadata, '$.{_IMPORT_MARKER_KEY}') = ?",
+        (memory_id, marker),
+    )
+    if conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone() is not None:
+        return  # not deleted (marker changed or DELETE lost): leave dependents alone
+    if _fts_enabled(conn):
+        _fts_delete(conn, memory_id)
+    conn.execute(
+        "DELETE FROM memories_crossrefs WHERE memory_id = ?", (memory_id,),
+    )
+    conn.execute("DELETE FROM memories_embeddings WHERE memory_id = ?", (memory_id,))
+
+
+# A marked row older than this belongs to an import that is no longer running
+# (a crash, or a cleanup that failed): the sweep completes or removes it.
+_IMPORT_MARKER_STALE_S = 600
+
+
+def _import_marker(import_id: str, started: int, index: int) -> str:
+    """"<import id>:<unix start time>:<row>" -- the time lets a later import,
+    with a different id, recognise the marker as stale."""
+    return f"{import_id}:{started}:{index}"
+
+
+def _import_marker_time(marker: Any) -> Optional[int]:
+    parts = marker.split(":") if isinstance(marker, str) else []
+    if len(parts) == 3 and parts[1].isdigit():
+        return int(parts[1])
+    return None  # malformed: treated as stale
+
+
+def _import_pending(metadata: Any) -> bool:
+    """True for a row an import has not finished (it still carries the
+    import_attempt marker). Reads hide such rows until the import strips the
+    marker or the sweep completes/removes them. `metadata` is the stored JSON
+    text or a parsed mapping."""
+    if not metadata:
+        return False
+    if isinstance(metadata, str):
+        if _IMPORT_MARKER_KEY not in metadata:
+            return False
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return False
+    return isinstance(metadata, Mapping) and _IMPORT_MARKER_KEY in metadata
+
+
+# SQL twin of _import_pending for list queries (see embeddings.not_import_pending_sql).
+def _not_import_pending_sql(col: str) -> str:
+    from .embeddings import not_import_pending_sql
+    return not_import_pending_sql(col)
+
+
+def _embedding_present(conn, memory_id: int) -> bool:
+    row = conn.execute(
+        "SELECT embedding, representation, encoding_source FROM memories_embeddings WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    embedding = _row_field(row, 0, "embedding")
+    if embedding and embedding != "null":
+        return True
+    return (_row_field(row, 1, "representation") == "empty"
+            and _row_field(row, 2, "encoding_source") == "python")
+
+
+def sweep_import_markers(
+    conn: sqlite3.Connection,
+    *,
+    older_than_s: int = _IMPORT_MARKER_STALE_S,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Finish or remove rows left marked by an import that is no longer
+    running, independent of its import id (a crash between INSERT, embedding
+    and marker strip, or a failed cleanup).
+
+    A row whose marker is older than `older_than_s` (or malformed) is
+    COMPLETED when it has its vector -- the marker is stripped, compare-and-
+    set on the exact stored metadata -- and REMOVED when it has none. Younger
+    markers belong to an import that may still be running and are left
+    alone (pending). Runs at the start of every import and at server startup,
+    and as the memory_import_sweep admin tool.
+    """
+    now = time.time() if now is None else now
+    counts: Dict[str, Any] = {"scanned": 0, "completed": 0, "removed": 0, "pending": 0, "failed": []}
+    rows = conn.execute(
+        "SELECT id, metadata FROM memories WHERE instr(metadata, ?) > 0",
+        (f'"{_IMPORT_MARKER_KEY}"',),
+    ).fetchall()
+    for row in rows:
+        memory_id = int(_row_field(row, 0, "id"))
+        raw = _row_field(row, 1, "metadata")
+        try:
+            meta = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(meta, dict) or _IMPORT_MARKER_KEY not in meta:
+            continue
+        counts["scanned"] += 1
+        marker = meta[_IMPORT_MARKER_KEY]
+        started = _import_marker_time(marker)
+        if started is not None and now - started < older_than_s:
+            counts["pending"] += 1
+            continue
+        try:
+            if _embedding_present(conn, memory_id):
+                meta.pop(_IMPORT_MARKER_KEY)
+                clean = json.dumps(meta, ensure_ascii=False) if meta else None
+                conn.execute(
+                    "UPDATE memories SET metadata = ? WHERE id = ? AND metadata = ?",
+                    (clean, memory_id, raw),
+                )
+                row_now = conn.execute("SELECT metadata, content, tags FROM memories WHERE id = ?",
+                                       (memory_id,)).fetchone()
+                if row_now is None or _import_pending(_row_field(row_now, 0, "metadata")):
+                    raise RuntimeError("marker still present after the update")
+                _fts_upsert(conn, memory_id, _row_field(row_now, 1, "content"),
+                            _row_field(row_now, 0, "metadata"), _row_field(row_now, 2, "tags"))
+                counts["completed"] += 1
+            else:
+                if not isinstance(marker, str):
+                    raise RuntimeError(f"marker is not a string: {marker!r}")
+                _import_delete_marked_row(conn, memory_id, marker)
+                if conn.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone() is not None:
+                    raise RuntimeError("row still present after the delete")
+                counts["removed"] += 1
+        except Exception as exc:
+            logger.error("import sweep: row %s (marker %r) not resolved: %s", memory_id, marker, exc)
+            counts["failed"].append(memory_id)
+    if counts["completed"] or counts["removed"]:
+        conn.commit()
+        invalidate_corpus_cache(conn)
+    if counts["scanned"]:
+        logger.info(
+            "import sweep: %d marked row(s): %d completed, %d removed, %d pending (younger than %ds), "
+            "%d failed", counts["scanned"], counts["completed"], counts["removed"], counts["pending"],
+            older_than_s, len(counts["failed"]),
+        )
+    return counts
 
 
 def poll_events(

@@ -1214,6 +1214,23 @@ def _is_numeric_gap_vector(vector: Dict[str, float]) -> bool:
     return keys != set(range(len(keys)))
 
 
+# metadata key a D1 import sets on a row until the row is complete
+# (memora.storage._import_write_d1). Such a row is not a memory yet: reads
+# hide it, and neither the integrity audit nor a rebuild treats it as a
+# memory missing its vector -- the import, or the marker sweep, owns it.
+IMPORT_MARKER_KEY = "import_attempt"
+
+
+def not_import_pending_sql(col: str) -> str:
+    """` AND <col is not an import-pending row>` for a metadata column.
+    CASE, not OR: json_extract on malformed JSON raises, and CASE is lazy."""
+    return (
+        f" AND (CASE WHEN {col} IS NULL OR instr({col}, '\"{IMPORT_MARKER_KEY}\"') = 0 THEN 1"
+        f" WHEN json_valid({col}) THEN json_extract({col}, '$.{IMPORT_MARKER_KEY}') IS NULL"
+        f" ELSE 1 END)"
+    )
+
+
 def _coverage_counts(conn: sqlite3.Connection) -> Dict[str, int]:
     """Indexed anti-joins in both directions; subtraction masks cancellations."""
     return {
@@ -1229,7 +1246,7 @@ def _coverage_counts(conn: sqlite3.Connection) -> Dict[str, int]:
                     (e.embedding IS NOT NULL AND e.embedding != '' AND e.embedding != 'null')
                     OR (e.representation = 'empty' AND e.encoding_source = 'python')
                 )
-               WHERE e.memory_id IS NULL"""
+               WHERE e.memory_id IS NULL""" + not_import_pending_sql("m.metadata")
         ).fetchone()[0]),
         "orphan_embedding_count": int(conn.execute(
             """SELECT COUNT(*) FROM memories_embeddings AS e
@@ -1295,7 +1312,8 @@ def audit_embedding_integrity(conn: sqlite3.Connection) -> Dict[str, Any]:
                  (e.embedding IS NOT NULL AND e.embedding != '' AND e.embedding != 'null')
                  OR (e.representation = 'empty' AND e.encoding_source = 'python')
              )
-            WHERE e.memory_id IS NULL ORDER BY m.id LIMIT 100
+            WHERE e.memory_id IS NULL""" + not_import_pending_sql("m.metadata") + """
+            ORDER BY m.id LIMIT 100
             """
         ).fetchall()
     ]
@@ -1507,7 +1525,7 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
     invalidate_embedding_integrity_cache(conn)
 
     rows = conn.execute(
-        "SELECT id, content, metadata, tags FROM memories"
+        "SELECT id, content, metadata, tags FROM memories WHERE 1=1" + not_import_pending_sql("metadata")
     ).fetchall()
     repaired_rows = conn.execute(
         """

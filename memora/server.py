@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Literal, Mapping, Optional
 
@@ -55,6 +56,7 @@ from .storage import (
     get_statistics,
     hybrid_search,
     import_memories,
+    sweep_import_markers,
     list_absorb_inflight,
     list_memories,
     poll_events,
@@ -955,6 +957,36 @@ def _export_memories(conn):
 @_with_connection(writes=True)
 def _import_memories(conn, data: List[Dict[str, Any]], strategy: str):
     return import_memories(conn, data, strategy)
+
+
+@_with_connection(writes=True)
+def _sweep_import_markers(conn, older_than_s: int):
+    return sweep_import_markers(conn, older_than_s=older_than_s)
+
+
+def _startup_import_sweep() -> None:
+    """Sweep stale import markers in every configured store, off the startup
+    path (a slow D1 store must not delay serving). Failures are logged."""
+    from .storage import CURRENT_DB, connect, database_registry
+
+    try:
+        names: List[Optional[str]] = list(database_registry()) or [None]
+    except Exception as exc:
+        logger.error("startup import sweep: no store list: %s", exc)
+        return
+    for name in names:
+        token = CURRENT_DB.set(name) if name is not None else None
+        try:
+            conn = connect()
+            try:
+                sweep_import_markers(conn)
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.error("startup import sweep of %s failed: %s", name or "default", exc)
+        finally:
+            if token is not None:
+                CURRENT_DB.reset(token)
 
 
 @mcp.tool()
@@ -3275,6 +3307,25 @@ async def memory_import(
         _finish_tool("memory_import")
 
 
+@mcp.tool()
+async def memory_import_sweep(older_than_minutes: int = 10) -> Dict[str, Any]:
+    """Admin: finish or remove rows an interrupted import left behind.
+
+    A D1 import marks each row it writes (metadata.import_attempt) until the
+    row is complete. A crash, or a cleanup that failed, can leave a marked
+    row; reads hide it. This completes each marked row older than
+    `older_than_minutes` that has its embedding (the marker is stripped) and
+    removes each one that has none. Younger markers may belong to an import
+    still running and are left alone. Also runs at the start of every import
+    and at server startup. Returns counts: scanned, completed, removed,
+    pending, failed (ids).
+    """
+    if not isinstance(older_than_minutes, int) or isinstance(older_than_minutes, bool) \
+            or not 1 <= older_than_minutes <= 10080:
+        return {"error": "invalid_input", "message": "older_than_minutes must be an integer in 1..10080"}
+    return await _sweep_import_markers(older_than_minutes * 60)
+
+
 @_with_connection
 def _poll_events(
     conn,
@@ -3490,6 +3541,9 @@ def main(argv: Optional[list[str]] = None) -> None:
             # behaviour: the server is still useful once the backend recovers.
             logger.warning("Database pre-warm failed: %s", e)
             print(f"Warning: Database pre-warm failed: {e}", file=sys.stderr)
+
+        # Complete or remove rows an interrupted import left marked.
+        threading.Thread(target=_startup_import_sweep, name="memora-import-sweep", daemon=True).start()
 
         # Start graph visualization server unless disabled
         if not args.no_graph:

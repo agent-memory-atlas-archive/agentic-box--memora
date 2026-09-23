@@ -104,6 +104,8 @@ skills:
     description: Export memories as an interactive HTML knowledge graph.
   - name: memory_import
     description: Import memories from JSON using replace, merge, or append semantics.
+  - name: memory_import_sweep
+    description: Admin - complete or remove rows an interrupted import left marked.
   - name: memory_events_poll
     description: Poll for memory events, optionally filtering by timestamp and tags.
   - name: memory_events_clear
