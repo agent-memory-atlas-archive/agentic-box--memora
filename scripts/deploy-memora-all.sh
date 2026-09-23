@@ -1,35 +1,49 @@
 #!/usr/bin/env bash
-# Full deploy of the live memora-all container (nuc8) to v0.4.2: fetch +
+# Full deploy of the live memora-all container (nuc8) to v0.4.3: fetch +
 # build the tagged image and recreate the container from it, then verify it.
 #
-# v0.4.1's deploy switched MEMORA_LLM_MODEL to openai/gpt-4o-mini (3-4s per
-# absorb classification call vs 12-17s for the prior reasoning model), but
-# every classification came back "LLM classify empty" — gpt-4o-mini
-# consistently echoes the prompt's own "[#482]" match-display notation back
-# as memory_id instead of the bare number, and the old parser dropped it.
-# v0.4.2 is that parser fix (SHA 201f7c8): confirmed live against the real
-# model, macro_f1 0.931 across the fixture set instead of failing outright.
-# MEMORA_LLM_MODEL is already openai/gpt-4o-mini from the v0.4.1 deploy, so
-# step 2 below is a confirming no-op this time, not a real switch.
+# What v0.4.3 changes (see CHANGELOG.md "0.4.3"): memory_absorb only.
+#  - Far fewer D1 round trips: batched phase-1 reads, bounded supersession
+#    views, SELECT 1 existence checks, batched embeddings. Modeled on a
+#    9-fact update-heavy absorb: 550 D1 requests / ~120 s -> 204 / ~49 s.
+#    Why: live absorb calls were hitting the caller's 300 s timeout while
+#    the server kept committing.
+#  - A per-leaf supersede gate (similarity floor + a narrow LLM check on the
+#    exact memory being hidden, re-checked at the write boundary and for
+#    concurrent siblings). Why: #1082 was superseded by unrelated #1109.
+#    Each UPDATE now costs one extra LLM call per leaf it would supersede.
+#  - Every absorb result carries a "profile" field (per-phase time and D1
+#    request counts).
+#
+# NO MODEL CHANGE: MEMORA_LLM_MODEL stays openai/gpt-4o-mini (set by the
+# v0.4.1 deploy); step 2 below re-writes the same value, a confirming no-op.
+# No new required env vars. One new OPTIONAL one, set here:
+# MEMORA_LOG_LEVEL=INFO. Without it memora configures no logging and every
+# INFO line -- including absorb's per-call profile and its supersede /
+# downgrade audit lines -- is silently dropped. With it they go to the
+# container's stderr (docker logs memora-all). The audit lines carry up to
+# 500 characters of memory text each; that log stays on nuc8.
 #
 # Steps, all on nuc8:
-#  1. git fetch + checkout the v0.4.2 tag in the nuc8 checkout, docker build.
+#  1. git fetch + checkout the v0.4.3 tag in the nuc8 checkout, docker build.
 #     The image currently tagged memora:latest is kept as memora:rollback-<ts>
 #     before the new one replaces it.
 #  2. Edit MEMORA_LLM_MODEL in ~/.config/memora/credentials.mcp.json (already
-#     openai/gpt-4o-mini — see above).
-#  3. Recreate memora-all — same image tag, mounts, ports, memory/cpu limits
+#     openai/gpt-4o-mini -- a confirming no-op, see above; backup kept).
+#  3. Recreate memora-all -- same image tag, mounts, ports, memory/cpu limits
 #     and restart policy the live container already runs with (checked via
-#     docker inspect on 2026-09-14), only the image content changed. Old
-#     container kept stopped as memora-all-grok-<ts> (name predates this
-#     being a no-op model switch; still accurate as "the container before
-#     this deploy").
-#  4. Wait for GET /health, then run one 3-fact dry-run memory_absorb call,
-#     asserting no JSON-RPC error and a real session id at initialize and
-#     no JSON-RPC error / isError at tools/call (a JSON-RPC error rides
-#     HTTP 200 — an HTTP-status-only check would print and exit zero on a
-#     server that answers but can't actually serve requests), before
-#     calling this done.
+#     docker inspect on 2026-09-14), plus MEMORA_LOG_LEVEL=INFO. Old
+#     container kept stopped as memora-all-grok-<ts> (the name predates the
+#     model switch being a no-op; it still means "the container before this
+#     deploy", and the rollback commands below depend on it).
+#  4. Wait for GET /health, check it reports version 0.4.3 (proves the new
+#     build is the one serving, not a stale image), then run one 3-fact
+#     dry-run memory_absorb call, asserting no JSON-RPC error and a real
+#     session id at initialize, no JSON-RPC error / isError at tools/call (a
+#     JSON-RPC error rides HTTP 200 -- an HTTP-status-only check would print
+#     and exit zero on a server that answers but can't actually serve
+#     requests), and a result with a "decisions" list and the new "profile"
+#     field, before calling this done.
 #
 # HARDENED (queue item 23 follow-up, sealed review msg 5698/5699): the
 # credentials-env parser used to stream straight into the while loop via
@@ -51,7 +65,7 @@
 #   restore ~/.config/memora/credentials.mcp.json.bak-llm-<ts> if MEMORA_LLM_MODEL itself needs reverting
 set -euo pipefail
 
-TAG="v0.4.2"
+TAG="v0.4.3"
 
 # MEMORA_DATABASES names a Cloudflare account + database ids — read from the
 # git-ignored instance config rather than written into this (public) script.
@@ -142,12 +156,13 @@ docker run -d --name memora-all \
   -e "MEMORA_HEALTH_REFRESH_INTERVAL=15" \
   -e "MEMORA_VECTOR_SCAN_PAGE_SIZE=100" \
   -e "MEMORA_ALLOW_ANY_TAG=1" \
+  -e "MEMORA_LOG_LEVEL=INFO" \
   -e "MEMORA_DATABASES=$MEMORA_DATABASES" \
   -e "MEMORA_DEFAULT_DB=memora" \
   "${ENV_ARGS[@]}" \
   memora:latest
 
-echo "memora-all recreated from $TAG with MEMORA_LLM_MODEL=openai/gpt-4o-mini"
+echo "memora-all recreated from $TAG (MEMORA_LLM_MODEL=openai/gpt-4o-mini unchanged, MEMORA_LOG_LEVEL=INFO)"
 echo "old container kept stopped as memora-all-grok-$TS; old image kept as memora:rollback-$TS"
 echo "rollback: docker rm -f memora-all && docker rename memora-all-grok-$TS memora-all && docker start memora-all"
 
@@ -166,10 +181,20 @@ if [ "$healthy" -ne 1 ]; then
   exit 1
 fi
 
-python3 - <<'PY'
+python3 - "${TAG#v}" <<'PY'
 import json, sys, time, urllib.request
 
+EXPECTED_VERSION = sys.argv[1]
 BASE = "http://127.0.0.1:8920/mcp/memora"
+
+# The version the RUNNING process reports -- a stale image or a failed
+# rebuild would still answer /health, just with the old version.
+with urllib.request.urlopen("http://127.0.0.1:8920/health", timeout=10) as resp:
+    health = json.loads(resp.read().decode())
+if health.get("version") != EXPECTED_VERSION:
+    print(f"/health reports version {health.get('version')!r}, expected {EXPECTED_VERSION!r}", file=sys.stderr)
+    sys.exit(1)
+print(f"/health reports version {EXPECTED_VERSION}")
 HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 
 def _post(body, session_id=None):
@@ -209,9 +234,9 @@ if not sid:
 _post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id=sid)
 
 facts = [
-    "deploy-check fact one about the gpt-4o-mini rollout",
-    "deploy-check fact two about the gpt-4o-mini rollout",
-    "deploy-check fact three about the gpt-4o-mini rollout",
+    "deploy-check fact one about the v0.4.3 absorb rollout",
+    "deploy-check fact two about the v0.4.3 absorb rollout",
+    "deploy-check fact three about the v0.4.3 absorb rollout",
 ]
 t0 = time.time()
 _, raw = _post({
@@ -227,7 +252,33 @@ tool_result = result.get("result", {})
 if tool_result.get("isError"):
     print(f"memory_absorb reported isError=true: {json.dumps(tool_result)[:2000]}", file=sys.stderr)
     sys.exit(1)
-print(f"3-fact dry-run absorb via memory store: {elapsed:.1f}s")
-print(json.dumps(tool_result, indent=2)[:2000])
+# The absorb result dict: FastMCP sends it as JSON text content (and as
+# structuredContent["result"]). Check its shape, not just the absence of an
+# error: v0.4.3 must return "decisions" and the new "profile" field.
+absorb = None
+for item in tool_result.get("content") or []:
+    if item.get("type") == "text":
+        try:
+            absorb = json.loads(item["text"])
+        except ValueError:
+            pass
+        break
+if absorb is None:
+    absorb = (tool_result.get("structuredContent") or {}).get("result")
+if not isinstance(absorb, dict) or "error" in absorb:
+    print(f"memory_absorb returned no result dict or an error: {json.dumps(tool_result)[:2000]}", file=sys.stderr)
+    sys.exit(1)
+# Not one decision per fact: near-identical facts may be consolidated.
+if not isinstance(absorb.get("decisions"), list) or not absorb["decisions"]:
+    print(f"memory_absorb result has no decisions: {json.dumps(absorb)[:2000]}", file=sys.stderr)
+    sys.exit(1)
+profile = absorb.get("profile")
+if not isinstance(profile, dict) or "total_requests" not in profile:
+    print(f"memory_absorb result lacks the v0.4.3 profile field: {json.dumps(absorb)[:2000]}", file=sys.stderr)
+    sys.exit(1)
+print(f"3-fact dry-run absorb via memory store: {elapsed:.1f}s "
+      f"({profile['total_requests']} {profile.get('request_unit', 'requests')}, "
+      f"server-side {profile['total_seconds']}s)")
+print("actions:", [d.get("action") for d in absorb["decisions"]])
 PY
 REMOTE

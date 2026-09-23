@@ -10,7 +10,7 @@ import os
 import re
 import sys
 import time
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Mapping, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -3223,8 +3223,40 @@ async def memory_events_clear(event_ids: List[int]) -> Dict[str, Any]:
 # Graph functions moved to memora/graph/ module
 
 
+def _configure_memora_logging(env: Optional[Mapping[str, str]] = None) -> Optional[int]:
+    """Opt-in stderr logging for the ``memora`` loggers (MEMORA_LOG_LEVEL).
+
+    Nothing configures logging otherwise, so Python's last-resort handler
+    drops everything below WARNING -- including absorb's per-call profile
+    and its supersede / downgrade audit lines (INFO). Unset keeps that
+    behaviour exactly. Set (e.g. INFO) attaches one stderr handler to the
+    ``memora`` logger at that level; stderr, never stdout, so the stdio
+    transport's protocol stream is untouched. An unknown level name is
+    reported and ignored. Returns the level applied, or None.
+    """
+    env = os.environ if env is None else env
+    raw = (env.get("MEMORA_LOG_LEVEL") or "").strip().upper()
+    if not raw:
+        return None
+    level = logging.getLevelName(raw)
+    if not isinstance(level, int):
+        print(f"memora: ignoring unknown MEMORA_LOG_LEVEL={raw!r}", file=sys.stderr)
+        return None
+    pkg = logging.getLogger("memora")
+    if not any(getattr(h, "_memora_log_level", False) for h in pkg.handlers):
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        handler._memora_log_level = True  # type: ignore[attr-defined]
+        pkg.addHandler(handler)
+    pkg.setLevel(level)
+    pkg.propagate = False
+    return level
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     from . import __version__
+
+    _configure_memora_logging()
 
     parser = argparse.ArgumentParser(description="Memory MCP Server")
     parser.add_argument("--version", action="version", version=f"memora {__version__}")

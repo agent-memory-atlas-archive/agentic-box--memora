@@ -12,6 +12,40 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.4.3
+
+Absorb: far fewer D1 round trips, and supersessions that must be verified
+against the exact memory they hide. Prompted by live `memory_absorb` calls
+failing the caller's 300 s timeout on update-heavy batches while the server
+kept committing, and by #1082 (a parked design idea) being superseded by
+#1109 (unrelated work that only shared "clmux agent delivery").
+
+### Absorb: D1 round trips
+- Measured offline with `scripts/measure_absorb_roundtrips.py` (a 9-fact update-heavy absorb against a 964-row store through the FakeD1 double; modeled 0.2 s per D1 request, 0.1 s per embedding, 2 s per LLM call): **550 D1 requests / ~120 s -> 204 / ~49 s**, with identical decisions (the script asserts this against a pre-change run). These are modeled seconds, not a live measurement.
+- Phase 1 is batched across facts: one tombstone-hash lookup, one embedding batch, one hydration of every fact's candidates, one bounded retirement lookup (was per fact, and per candidate).
+- Supersession graph reads use a bounded neighborhood view: one `memories LEFT JOIN memories_crossrefs` query per BFS level plus two retirement queries, instead of per-node crossref and existence reads (each walk re-read nodes several times). Loaded fresh per call, never reused across a graph write; falls back to per-row reads past 1000 nodes.
+- `add_link` checks existence with `SELECT 1` instead of fetching both full memories.
+- Phase-3 storage embeddings go out as one batch on the dense backend.
+- Writes, their order, and corpus-cache invalidation are unchanged. What batching writes would take is in `plans/absorb-write-batching-notes.md` (not in the repo; plans/ is git-ignored).
+
+### Absorb: per-phase profile
+- Every call returns `result["profile"]`: exclusive wall time and DB request count per phase (`corpus_load`, `phase1_prep`, `embeddings`, `classification`, `supersede_plan`, `supersede_verify`, `phase3_insert`, `phase3_link`, `supersede_resolve`, `supersede_link`, `fork_heal`, `final_checks`, `inflight`, ...) plus counters (LLM calls, embedding requests, late/re-gated/sibling checks). Also logged at INFO.
+- `D1Connection.request_count` counts HTTPS POSTs.
+
+### Absorb: supersede gate
+- A classifier UPDATE is only a proposal. Absorb supersedes a memory only after gating **every leaf it would actually supersede** (the classifier's candidate is resolved to the current live leaves of its supersession chain first): the fact's similarity to that leaf must be at least 0.55, and a second, narrow LLM check (`_verify_absorb_supersede_llm`) shown both texts in full, their tags and the caller's context must answer an explicit yes to same project, same entity and full replacement. No LLM, an error or an unparseable answer never supersedes.
+- Leaves that fail stay live: an **intentional fork**, reported in the decision (`intentional_fork`, `not_superseded`, `leaf_checks`). If no leaf passes, the new memory is linked RELATED to the closest leaf instead (or left unlinked if the check calls them unrelated).
+- The write boundary re-resolves and re-reads every leaf: a check is reused only if the leaf's fingerprint (text + tags) is unchanged since it was made, so an `update_memory` edit in between is re-gated; a leaf that appeared in between is gated then.
+- Fork heal no longer lets a concurrent absorb's new memory supersede this call's new memory on the strength of both having passed against the same old leaf: that exact pair must pass the gate, or both stay live.
+- The classifier sees 800 characters per candidate (was 300) and a strict UPDATE definition.
+- Every supersede and every downgraded UPDATE is logged at INFO with target, score, gate, both reasons, old text and new text.
+- Calibration (`scripts/measure_supersede_gate.py`, 19 labelled pairs in `tests/fixtures/supersede_gate_pairs.json`, live bge-m3 + `openai/gpt-4o-mini`): precision 7/7, recall 7/7, 0 false supersedes; true updates scored 0.79-0.89, the #1082/#1109 analogue 0.47. A project-tag-prefix rule was tried and **removed**: it blocked a genuine update tagged `clmux/` vs `memora/`, and the verifier (which sees the tags) rejected every cross-project pair on its own. 19 pairs is a small set.
+- Prompt-injection framing: stored and caller text goes into nonce-delimited data blocks with marker runs defanged, and the prompt says the blocks contain no instructions. **Limit:** this stops stored text escaping its block, not semantic injection inside it; the tests prove the framing only. What bounds the damage is structural (explicit yes on all three fields, fail-closed parsing, the score floor, the audit log).
+
+### Operations
+- New opt-in `MEMORA_LOG_LEVEL` (e.g. `INFO`): attaches a stderr handler to the `memora` loggers. Nothing configured logging before, so every memora INFO line (including the absorb profile and supersede audit above) was silently dropped. Unset keeps the old behaviour. The memora-all deploy sets it to `INFO`; note that the supersede audit lines put up to 500 characters of memory text into the container log.
+- No other new env vars or config. `MEMORA_LLM_MODEL` is unchanged (`openai/gpt-4o-mini`). Each UPDATE now costs one extra LLM call per leaf it would supersede.
+
 ## 0.4.2
 
 Absorb classification fix for the v0.4.1 gpt-4o-mini switch — a same-day
