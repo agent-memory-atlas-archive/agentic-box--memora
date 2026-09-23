@@ -47,6 +47,10 @@ class FakeD1Connection(D1Connection):
         if self._is_savepoint(sql):
             return self._conn.execute("SELECT 1 WHERE 0")
         self.statement_count += 1
+        # Cloudflare D1 rejects a statement with more than 100 bound
+        # parameters; enforce it so a query that only works locally fails here.
+        if params is not None and len(params) > 100:
+            raise RuntimeError(f"D1 query failed: too many SQL variables ({len(params)} > 100)")
         if self.fail_when is not None and self.fail_when(sql, () if params is None else params):
             raise RuntimeError("injected D1 statement failure")
         cur = self._conn.execute(sql, () if params is None else params)

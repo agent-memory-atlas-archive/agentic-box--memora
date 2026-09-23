@@ -2419,6 +2419,12 @@ async def memory_related(memory_id: int, refresh: bool = False) -> Dict[str, Any
     ``refresh=True`` to recompute this memory's crossrefs on the fly (the
     strong-consistency path). For a full rebuild across the store, call
     ``memory_rebuild_crossrefs``.
+
+    An EMPTY stored list is a stored answer too: it is returned as-is and is
+    only recomputed with ``refresh=True`` (or a rebuild), the same rule as a
+    non-empty list. Only a memory whose crossrefs were never computed is
+    computed on read. (Before this change an empty list was recomputed on
+    every call.)
     """
 
     related = await _get_related(memory_id, refresh)

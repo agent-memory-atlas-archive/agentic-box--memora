@@ -1091,10 +1091,36 @@ class _D1Transport:
                 pass
             self._conn = None
 
-    def post(self, suffix: str, body: bytes, headers: dict, *, retry_safe: bool):
-        """POST and return (status, response header getter, body bytes)."""
+    def _send_and_receive_status(self, suffix: str, body: bytes, headers: dict):
+        """Send the request and read the status line + headers.
+
+        Raises _NoResponse only when NOT ONE response byte arrived: the send
+        failed (the socket was already closed or reset), or the server closed
+        the connection without answering (http.client.RemoteDisconnected is
+        raised exactly when the status line read returns zero bytes). Anything
+        after the first response byte propagates unchanged and is never
+        retried.
+        """
         import http.client
 
+        try:
+            self._conn.request("POST", self._path + suffix, body=body, headers=headers)
+        except (http.client.CannotSendRequest, ConnectionResetError, BrokenPipeError) as exc:
+            raise _NoResponse(exc) from exc
+        try:
+            return self._conn.getresponse()
+        except http.client.RemoteDisconnected as exc:
+            raise _NoResponse(exc) from exc
+
+    def post(self, suffix: str, body: bytes, headers: dict, *, retry_safe: bool):
+        """POST and return (status, response header getter, body bytes).
+
+        A retry happens at most once, only for a SELECT (retry_safe), only on
+        a REUSED socket, and only when no response byte arrived at all
+        (_NoResponse). A write -- including get_memory's track_access UPDATE,
+        whose SQL is not a SELECT -- is never re-sent; a failure after the
+        status line (e.g. while reading the body) is never retried either.
+        """
         now = time.monotonic()
         if self._conn is not None and now - self._last_used > _D1_KEEPALIVE_IDLE_SECONDS:
             self.close()
@@ -1102,19 +1128,19 @@ class _D1Transport:
         if self._conn is None:
             self._conn = self._new()
         try:
-            self._conn.request("POST", self._path + suffix, body=body, headers=headers)
-            resp = self._conn.getresponse()
+            try:
+                resp = self._send_and_receive_status(suffix, body, headers)
+            except _NoResponse as no_resp:
+                self.close()
+                if not (reused and retry_safe):
+                    raise no_resp.cause
+                logger.debug("D1 keep-alive connection was stale (%s); retrying read once", no_resp.cause)
+                self._conn = self._new()
+                resp = self._send_and_receive_status(suffix, body, headers)
             data = resp.read()
-        except (http.client.RemoteDisconnected, http.client.CannotSendRequest,
-                ConnectionResetError, BrokenPipeError) as exc:
+        except _NoResponse as no_resp:
             self.close()
-            if not (reused and retry_safe):
-                raise
-            logger.debug("D1 keep-alive connection was stale (%s); retrying read once", exc)
-            self._conn = self._new()
-            self._conn.request("POST", self._path + suffix, body=body, headers=headers)
-            resp = self._conn.getresponse()
-            data = resp.read()
+            raise no_resp.cause
         except Exception:
             self.close()
             raise
@@ -1122,6 +1148,14 @@ class _D1Transport:
         if (resp.getheader("connection") or "").lower() == "close":
             self.close()
         return resp.status, resp.getheader, data
+
+
+class _NoResponse(Exception):
+    """Internal: the request failed before any response byte arrived."""
+
+    def __init__(self, cause: BaseException):
+        super().__init__(str(cause))
+        self.cause = cause
 
 
 class D1Backend(StorageBackend):

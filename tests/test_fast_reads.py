@@ -148,6 +148,8 @@ def _seed_graph(conn, *, malformed_refs=True):
         "string_id": [{"id": str(g["a"]), "edge_type": "superseded_by"}],
         "float_id": [{"id": float(g["a"]), "edge_type": "superseded_by"}],
         "non_dict": ["oops", 3, {"edge_type": "superseded_by"}],
+        # JSON true: the legacy Python path treats it as memory id 1.
+        "bool_id": [{"id": True, "edge_type": "superseded_by"}],
         "self_loop": None,
     }
     for name, blob in odd.items():
@@ -173,7 +175,18 @@ def test_follow_status_equals_legacy(db):
         sup, ret, unsafe = storage._follow_status(conn, ids)
         assert g["a"] in sup and g["float_id"] in sup and g["string_id"] not in sup
         assert {g["t2"], g["legacy_tomb"]} <= ret
-        assert unsafe == {g["string_id"], g["float_id"], g["non_dict"]}
+        assert unsafe == {g["string_id"], g["float_id"], g["non_dict"], g["bool_id"]}
+        assert g["a"] == 1 and g["bool_id"] in sup  # True counted as #1, as legacy did
+
+
+@pytest.mark.parametrize("is_search", [False, True])
+def test_follow_active_with_malformed_refs_equals_legacy(db, is_search):
+    with storage.connect() as conn:
+        _seed_graph(conn)
+        mems = storage.list_memories(conn, limit=-1)
+        items = [{"score": 0.5, "memory": m} for m in mems] if is_search else mems
+        assert storage.apply_follow(conn, [dict(i) for i in items], "active", is_search=is_search) == \
+            legacy_apply_follow(conn, [dict(i) for i in items], "active", is_search=is_search)
 
 
 def test_follow_status_one_statement_for_any_size(fake_d1_backend):
@@ -315,6 +328,18 @@ class _FakeD1Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             self.connection.close()
             return
+        if srv.truncate_next:
+            # Status line and headers arrive, then the body is cut short.
+            srv.truncate_next = False
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "500")
+            self.end_headers()
+            self.wfile.write(b'{"success": tr')
+            self.wfile.flush()
+            self.close_connection = True
+            self.connection.shutdown(2)
+            return
         if body["sql"].startswith("BAD"):
             payload, status = b'{"errors":[{"message":"nope"}]}', 400
         else:
@@ -334,7 +359,7 @@ def fake_d1_http(monkeypatch):
     for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
         monkeypatch.delenv(k, raising=False)
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FakeD1Handler)
-    srv.requests, srv.drop_next = [], False
+    srv.requests, srv.drop_next, srv.truncate_next = [], False, False
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     conn = D1Connection("acct", "db", "token")
     conn.base_url = f"http://127.0.0.1:{srv.server_address[1]}/client/v4/accounts/acct/d1/database/db"
@@ -428,3 +453,79 @@ def test_follow_latest_past_view_bounds_equals_legacy(db, monkeypatch):
             for follow in ("latest", "full_history"):
                 assert storage.get_memory(conn, m["id"], follow=follow) == \
                     storage._get_memory_legacy(conn, m["id"], follow=follow)
+
+
+def test_cold_search_repairs_more_than_100_missing_embeddings(fake_d1_backend, monkeypatch):
+    """FakeD1 enforces D1's 100-bound-parameter cap (conftest)."""
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        ids = [_raw_insert(conn, f"deploy note {i}", embed=False) for i in range(101)]
+        conn.commit()
+        storage._corpus_cache.clear()
+        q = storage._compute_embedding("deploy note", None, [])
+        out = storage._search_by_vector(conn, q, top_k=None)
+        assert {r["memory"]["id"] for r in out} == set(ids)
+        assert len(storage._get_embeddings_for_ids(conn, ids)) == 101
+
+
+def test_malformed_tags_blob_does_not_abort_search_or_absorb(db, caplog, monkeypatch):
+    monkeypatch.setattr(storage, "_bad_tags_warned", set())  # warn-once is per process
+    with storage.connect() as conn:
+        _seed_search_store(conn)
+        bad = _raw_insert(conn, "zzz unrelated bad tags row")
+        conn.execute("UPDATE memories SET tags = ? WHERE id = ?", ("{not json", bad))
+        conn.commit()
+        storage._corpus_cache.clear()
+        q = storage._compute_embedding("deploy proxy", None, [])
+        # A tag filter treats the bad row as untagged instead of raising.
+        out = storage._search_by_vector(conn, q, top_k=5, tags_none=["memora/deploy"])
+        assert out and bad not in {r["memory"]["id"] for r in out}
+        assert "unparseable tags JSON" in caplog.text
+        storage._corpus_cache.clear()
+        result = storage.absorb_memory(conn, ["a brand new fact about lighthouses"])
+        assert result["created"] == 1
+
+
+@pytest.mark.parametrize("min_score", [None, 0.0])
+def test_fresh_empty_repair_scores_zero_once_like_the_old_backfill(tmp_path, monkeypatch, min_score):
+    """A missing embedding that repairs to an EMPTY vector (punctuation-only
+    content): the old inline backfill scored it 0 on that call, then it was
+    certified empty and skipped. Compared on two identical stores, since
+    both paths write the repair."""
+    from memora.backends import LocalSQLiteBackend
+
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+    monkeypatch.setattr(storage, "calculate_importance", lambda *a, **k: 1.0)
+    runs = {}
+    for name in ("new", "old"):
+        monkeypatch.setattr(storage, "STORAGE_BACKEND", LocalSQLiteBackend(tmp_path / f"{name}.db"))
+        storage._corpus_cache.clear()
+        with storage.connect() as conn:
+            _raw_insert(conn, "deploy proxy one")
+            empty_id = _raw_insert(conn, "!!! ...", embed=False)
+            _raw_insert(conn, "cache sidebar two")
+            conn.commit()
+            q = storage._compute_embedding("deploy proxy", None, [])
+            fn = storage._search_by_vector if name == "new" else storage._search_by_vector_scan
+            first = fn(conn, q, top_k=None, min_score=min_score)
+            second = fn(conn, q, top_k=None, min_score=min_score)
+            runs[name] = (first, second)
+    assert runs["new"] == runs["old"]
+    first, second = runs["new"]
+    assert empty_id in {r["memory"]["id"] for r in first}
+    assert [r["score"] for r in first if r["memory"]["id"] == empty_id] == [0.0]
+    assert empty_id not in {r["memory"]["id"] for r in second}
+
+
+def test_d1_transport_never_retries_after_response_bytes(fake_d1_http):
+    """Headers arrived, then the connection died mid-body: even a SELECT on
+    a reused socket is NOT re-sent (it could observe a newer state)."""
+    conn, srv = fake_d1_http
+    conn.execute("SELECT 1")  # socket now reused
+    srv.truncate_next = True
+    with pytest.raises(Exception):
+        conn.execute("SELECT 3")
+    assert [sql for _, sql in srv.requests].count("SELECT 3") == 1
+    # The transport recovers on the next call with a fresh socket.
+    assert conn.execute("SELECT 4").fetchone() is not None

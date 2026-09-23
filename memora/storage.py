@@ -2365,8 +2365,14 @@ def _search_by_vector(
     tags_none: Optional[List[str]] = None,
     corpus: Optional["_CorpusSnapshot"] = None,
     meta: Optional[Dict[str, Optional[str]]] = None,
+    fresh_empty: Optional[List["_CorpusEntry"]] = None,
 ) -> List[Dict[str, Any]]:
     """Exhaustive vector search scored against the corpus snapshot.
+
+    fresh_empty: rows this call's snapshot load repaired to an EMPTY vector
+    (see _repair_corpus_embeddings). The old scan's inline backfill scored
+    such a row 0 on the call that backfilled it, so they take part here with
+    score 0; later calls see them certified-empty and skip them, as before.
 
     Same result as _search_by_vector_scan (the full-row paginated scan it
     replaces): every filter runs before top-k truncation, ties break on
@@ -2376,15 +2382,25 @@ def _search_by_vector(
     instead of a full download. Its load-time repair pass computes and
     stores any missing embedding, replacing the scan's inline backfill.
     """
-    base = corpus if corpus is not None else _corpus_base(conn, meta=meta)
+    if corpus is None:
+        fresh_empty = [] if fresh_empty is None else fresh_empty
+        base = _corpus_base(conn, meta=meta, empty_sink=fresh_empty)
+    else:
+        base = corpus
     exclude_set = set(exclude_ids or [])
     validated_filters = _validate_metadata_filters(metadata_filters) if metadata_filters else None
     parsed_date_from = _parse_date_filter(date_from) if date_from else None
     parsed_date_to = _parse_date_filter(date_to) if date_to else None
     filtering_tags_dates = bool(parsed_date_from or parsed_date_to or tags_any or tags_all or tags_none)
 
+    entries = base.entries_in_id_order()
+    if fresh_empty:
+        merged = {e.id: e for e in entries}
+        for e in fresh_empty:
+            merged[e.id] = e
+        entries = [merged[i] for i in sorted(merged)]
     scored: List[Tuple[float, str, int]] = []
-    for entry in base.entries_in_id_order():
+    for entry in entries:
         if entry.id in exclude_set or entry.vector is _CERTIFIED_EMPTY_EMBEDDING:
             continue
         if validated_filters:
@@ -2567,7 +2583,6 @@ def _search_by_vector_ids_only(
 # created_at, metadata type, encoding source), never content for all rows.
 # ---------------------------------------------------------------------------
 
-_CORPUS_REPAIR_BATCH = 256
 
 
 class _CorpusEntry:
@@ -2591,6 +2606,18 @@ class _CorpusEntry:
 
 class _CorpusSnapshot:
     """One skinny in-memory corpus snapshot reused for a whole absorb call.
+
+    MEMORY FOOTPRINT (measured 2026-09-23, CPython 3.12, 1024-dim dense
+    vectors as the Dict[str, float] json_to_embedding returns): ~93 KB per
+    row, almost all of it the vector dict (1024 str keys + float objects).
+    The metadata JSON and parsed tags semantic search added cost ~0.6 KB per
+    row (<1%). So ~93 MB per 1k-row database and ~930 MB per 10k rows,
+    per database, held for the process lifetime once searched or absorbed.
+    memora-all (768 MB limit) serves four databases and, since reads now use
+    the cache too, may hold a snapshot for each. At today's ~1k rows that
+    fits; well before ~5k rows per database a cap is warranted -- better,
+    store vectors as array('f') / float32 (~4 KB per row, ~20x smaller) with
+    precomputed norms, which also speeds up scoring.
 
     Scoring stays exhaustive and exact (never narrows the candidate set), so
     for the corpus represented by the snapshot it carries ZERO dedup-recall
@@ -2669,9 +2696,24 @@ class _CorpusSnapshot:
         return [(entry_id, score) for score, _, entry_id in results[:top_k]]
 
 
-def _tags_from_json(tags_json: Optional[str]) -> List[str]:
-    # Same parse as _serialise_row's "tags".
-    return json.loads(tags_json) if tags_json else []
+_bad_tags_warned: set = set()
+
+
+def _tags_from_json(tags_json: Optional[str], memory_id: Optional[int] = None) -> Any:
+    """Tags for snapshot filtering: _serialise_row's parse, except that an
+    unparseable blob (e.g. a malformed import) filters as no tags instead of
+    aborting the whole load -- the snapshot loader serves absorb too, whose
+    loader never read tags before. Warned once per memory id."""
+    if not tags_json:
+        return []
+    try:
+        return json.loads(tags_json)
+    except (json.JSONDecodeError, TypeError) as exc:
+        if memory_id not in _bad_tags_warned:
+            _bad_tags_warned.add(memory_id)
+            logger.warning("memory #%s has unparseable tags JSON (%s); filtering it as untagged",
+                           memory_id, exc)
+        return []
 
 
 def _metadata_type_from_metadata(metadata_json: Optional[str]) -> Optional[str]:
@@ -2696,7 +2738,12 @@ def _metadata_dict_from_json(metadata_json: Optional[str]) -> Optional[Dict[str,
     return meta if isinstance(meta, dict) else None
 
 
-def _load_corpus_snapshot(conn: sqlite3.Connection, *, page_size: int = _VECTOR_SCAN_PAGE_SIZE) -> _CorpusSnapshot:
+def _load_corpus_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    page_size: int = _VECTOR_SCAN_PAGE_SIZE,
+    empty_sink: Optional[List["_CorpusEntry"]] = None,
+) -> _CorpusSnapshot:
     """Load the corpus ONCE into a skinny snapshot, repairing missing embeddings.
 
     The main pass pulls only scoring columns (no content/metadata/tags for the
@@ -2743,14 +2790,14 @@ def _load_corpus_snapshot(conn: sqlite3.Connection, *, page_size: int = _VECTOR_
                 snapshot.append(
                     row["id"], vector, row["created_at"], meta_type,
                     row["embedding_encoding_source"],
-                    metadata_json=row["metadata"], tags=_tags_from_json(row["tags"]),
+                    metadata_json=row["metadata"], tags=_tags_from_json(row["tags"], row["id"]),
                 )
             last_id = row["id"]
         if len(rows) < page_size:
             break
 
     if repair:
-        _repair_corpus_embeddings(conn, repair, snapshot)
+        _repair_corpus_embeddings(conn, repair, snapshot, empty_sink=empty_sink)
     return snapshot
 
 
@@ -2758,6 +2805,8 @@ def _repair_corpus_embeddings(
     conn: sqlite3.Connection,
     repair: List[Tuple[int, str, Optional[str]]],
     snapshot: _CorpusSnapshot,
+    *,
+    empty_sink: Optional[List["_CorpusEntry"]] = None,
 ) -> None:
     """Compute embeddings for rows that were missing one, once per absorb.
 
@@ -2769,8 +2818,8 @@ def _repair_corpus_embeddings(
     ids = [row_id for row_id, _, _ in repair]
     meta_by_id = {row_id: meta for row_id, _, meta in repair}
     created_by_id = {row_id: created for row_id, created, _ in repair}
-    for start in range(0, len(ids), _CORPUS_REPAIR_BATCH):
-        batch = ids[start:start + _CORPUS_REPAIR_BATCH]
+    # _chunked: D1 rejects more than 100 bound parameters per statement.
+    for batch in _chunked(ids):
         placeholders = ",".join("?" for _ in batch)
         rows = conn.execute(
             f"SELECT id, content, metadata, tags FROM memories WHERE id IN ({placeholders})",
@@ -2795,6 +2844,17 @@ def _repair_corpus_embeddings(
             # every absorb would re-fetch and re-compute this row forever.
             _upsert_embedding(conn, row["id"], vector)
             if not vector:
+                # From now on a certified-empty row (skipped by every search).
+                # But the old search's inline backfill scored it 0 on THIS
+                # call; the caller that wants that (semantic search) passes a
+                # sink. Never added to the snapshot, so a cached base never
+                # carries it into later calls, matching the old behaviour.
+                if empty_sink is not None:
+                    empty_sink.append(_CorpusEntry(
+                        row["id"], {}, created_by_id.get(row["id"]),
+                        _metadata_type_from_metadata(meta_by_id.get(row["id"])), "python",
+                        row["metadata"], tags,
+                    ))
                 continue
             snapshot.append(
                 row["id"], vector, created_by_id.get(row["id"]),
@@ -2941,6 +3001,7 @@ def _corpus_base(
     conn: sqlite3.Connection,
     *,
     meta: Optional[Mapping[str, Optional[str]]] = None,
+    empty_sink: Optional[List["_CorpusEntry"]] = None,
 ) -> _CorpusSnapshot:
     """Return the immutable shared base snapshot for this store, loading and
     caching it under a STABLE epoch. Callers must fork() before mutating.
@@ -2958,7 +3019,7 @@ def _corpus_base(
     store = _store_cache_key(conn)
     model, epoch = _corpus_meta_from(meta) if meta is not None else _corpus_meta(conn)
     if epoch is None:
-        loaded = _load_corpus_snapshot(conn)
+        loaded = _load_corpus_snapshot(conn, empty_sink=empty_sink)
         loaded._cache_key = None
         return loaded
     key = _corpus_cache_key_for(store, model)
@@ -2975,10 +3036,10 @@ def _corpus_base(
         for _ in range(_CORPUS_LOAD_RETRIES):
             _model, before = _corpus_meta(conn)
             if before is None:
-                loaded = _load_corpus_snapshot(conn)
+                loaded = _load_corpus_snapshot(conn, empty_sink=empty_sink)
                 loaded._cache_key = None
                 return loaded
-            loaded = _load_corpus_snapshot(conn)
+            loaded = _load_corpus_snapshot(conn, empty_sink=empty_sink)
             _model2, after = _corpus_meta(conn)
             if after is None:
                 loaded._cache_key = None
@@ -4355,7 +4416,11 @@ def _follow_status(conn: sqlite3.Connection, ids: List[int]) -> Tuple[set, set, 
     Equal to (_superseded_ids_batch(ids), ids & retired_memory_ids()): a
     memory is superseded when its crossref blob (a JSON array) holds an
     object with edge_type "superseded_by" and a numeric id of a memory that
-    exists (Python's `5.0 in {5}` is True, and SQLite's m.id = 5.0 matches);
+    exists. Blobs with any NON-integer supersession id (real, string, JSON
+    true/false/null) are flagged walk_unsafe, and for exactly those ids the
+    superseded answer comes from _superseded_ids_batch itself: its Python
+    set membership has quirks (`True in {1}` and `5.0 in {5}` are True)
+    that are cheaper to reuse than to re-derive in SQL.
     retired when either tombstone table names it. json_valid / json_type
     guard exactly the blobs the Python parser skips (malformed, non-array,
     non-object entries, non-numeric ids).
@@ -4381,7 +4446,7 @@ def _follow_status(conn: sqlite3.Connection, ids: List[int]) -> Tuple[set, set, 
                AND json_valid(c.related) AND json_type(c.related) = 'array'
                AND j.type = 'object'
                AND json_extract(j.value, '$.edge_type') = 'superseded_by'
-               AND json_type(j.value, '$.id') IN ('integer', 'real')
+               AND json_type(j.value, '$.id') = 'integer'
                AND EXISTS (SELECT 1 FROM memories m
                             WHERE m.id = json_extract(j.value, '$.id'))
             UNION
@@ -4405,6 +4470,9 @@ def _follow_status(conn: sqlite3.Connection, ids: List[int]) -> Tuple[set, set, 
         ).fetchall()
         for r in rows:
             found[_row_field(r, 1, "kind")].add(int(_row_field(r, 0, "id")))
+        if found["unsafe"]:
+            unsafe = sorted(found["unsafe"])
+            found["superseded"] = (found["superseded"] - found["unsafe"]) | _superseded_ids_batch(conn, unsafe)
     except Exception as exc:
         _warn_fast_path_fallback("follow status", exc)
         return _follow_status_legacy(conn, unique)
@@ -8413,12 +8481,14 @@ def semantic_search(
     if not vector_query:
         return []
     candidate_top_k = _follow_candidate_limit(top_k, follow)
+    fresh_empty: List[_CorpusEntry] = []
     with absorb_phase("corpus"):
-        corpus = _corpus_base(conn, meta=meta)
+        corpus = _corpus_base(conn, meta=meta, empty_sink=fresh_empty)
     results = _search_by_vector(
         conn,
         vector_query,
         corpus=corpus,
+        fresh_empty=fresh_empty,
         metadata_filters=metadata_filters,
         top_k=candidate_top_k,
         min_score=min_score,

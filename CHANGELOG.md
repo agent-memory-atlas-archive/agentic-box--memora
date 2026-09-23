@@ -12,6 +12,18 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## Unreleased
+
+Fast reads (branch perf/fast-reads).
+
+### Behaviour change
+- `memory_related`: a memory whose stored crossref list is **empty** now gets that empty list back; it is recomputed only with `refresh=True` or `memory_rebuild_crossrefs`, the same staleness rule every non-empty list already had. Previously an empty list was recomputed (a full-store scan) on every call, which also let a list stored empty while the store had no neighbours heal itself on the next read; it now stays empty until refreshed. A memory whose crossrefs were never computed (no stored row) is still computed on read.
+
+### Performance
+- `memory_semantic_search` / `memory_hybrid_search` score against the epoch-validated in-process corpus snapshot and hydrate only the ranked results; one `memories_meta` read feeds the integrity and cache checks; `follow` filtering, `memory_get` and `memory_related` recomputes need far fewer D1 statements; D1 keeps one HTTPS connection per worker thread; query embeddings are cached (LRU 256). Fake-D1 bench, warm calls: semantic search 16 -> 3 requests, hybrid 17 -> 4, `memory_get` 8 -> 1, `memory_list` 4 -> 2. Results are identical to the previous read paths (tests/test_fast_reads.py).
+- Read tools return a `profile` field (per-phase seconds and D1 request counts).
+- **Memory:** the corpus snapshot is now also cached for databases that are only searched (previously only after an absorb). About 93 KB per row with 1024-dim vectors (vectors dominate; metadata and tags add ~0.6 KB), i.e. ~93 MB per 1k-row database; see the note on `_CorpusSnapshot`.
+
 ## 0.4.3
 
 Absorb: far fewer D1 round trips, and supersessions that must be verified
