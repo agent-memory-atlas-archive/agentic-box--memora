@@ -1,0 +1,25 @@
+{
+  "name": "store_forbidden",
+  "description": "The token does not list the store.",
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/ob1/health",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token"
+    }
+  },
+  "response": {
+    "status": 403,
+    "body": {
+      "error": "store_forbidden",
+      "message": "this token does not allow the store"
+    }
+  },
+  "request_schema": null,
+  "response_schema": "error_response.json",
+  "volatile": [],
+  "replay": {},
+  "live": {
+    "compare": "exact"
+  }
+}

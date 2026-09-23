@@ -1,0 +1,53 @@
+{
+  "name": "search_project_filter",
+  "description": "Search restricted to one project the store declares.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/memora/search",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "query": "how does clmux use memora",
+      "top_k": 5,
+      "project": "clmux",
+      "preview_chars": 80
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "count": 1,
+      "mode": "hybrid-v1",
+      "embedding_model": "bge-m3",
+      "results": [
+        {
+          "id": 1182,
+          "created_at": "2026-09-23 09:12:04",
+          "tags": [
+            "clmux/architecture",
+            "landing"
+          ],
+          "preview": "clmuxd owns memora access: agents never call memora directly.",
+          "cosine": 0.6243,
+          "fused": 0.0475,
+          "rank": 1
+        }
+      ],
+      "unscored": 0,
+      "took_ms": 97
+    }
+  },
+  "request_schema": "search_request.json",
+  "response_schema": "search_response.json",
+  "volatile": [
+    "took_ms"
+  ],
+  "replay": {
+    "search_hits": "response"
+  },
+  "live": {
+    "compare": "schema"
+  }
+}

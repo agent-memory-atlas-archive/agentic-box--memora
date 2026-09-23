@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "memora-api/v1/health_response.json",
+  "title": "GET /api/v1/{store}/health -- 200 when status is ok, 503 otherwise",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "store",
+    "version",
+    "api_version",
+    "contract_version",
+    "projects",
+    "mode",
+    "supervisor"
+  ],
+  "properties": {
+    "status": {
+      "enum": [
+        "ok",
+        "degraded",
+        "down"
+      ]
+    },
+    "store": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]{1,64}$"
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "api_version": {
+      "const": "v1"
+    },
+    "contract_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+\\.[0-9]+$"
+    },
+    "writes": {
+      "enum": [
+        "transactional",
+        "unsupported"
+      ],
+      "description": "Absent or unknown on a 200 means unsupported (fail safe). May be absent on a 503; a 503 never changes the client's last known value."
+    },
+    "projects": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9_-]{1,64}$"
+      },
+      "uniqueItems": true,
+      "description": "Projects the store declares (MEMORA_PROJECTS); empty = none declared."
+    },
+    "mode": {
+      "const": "hybrid-v1"
+    },
+    "reason": {
+      "enum": [
+        "probe_error",
+        "store_missing",
+        "store_locked",
+        "integrity_fault",
+        "stale",
+        "unproven"
+      ],
+      "description": "Only on a 503. down: probe_error (the probe failed), store_missing (no database there), store_locked (a local store the read-only probe must not open without creating a file or taking its lock), integrity_fault (e.g. detail schema_missing). degraded: unproven, stale."
+    },
+    "supervisor": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "restarts_1h",
+            "circuit",
+            "probe_errors"
+          ],
+          "properties": {
+            "restarts_1h": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "circuit": {
+              "enum": [
+                "closed",
+                "open"
+              ]
+            },
+            "probe_errors": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "store",
+                  "reason"
+                ],
+                "properties": {
+                  "store": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9_-]{1,64}$"
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "description": "The Phase L lock supervisor's state; null until that supervisor exists."
+    },
+    "detail": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "description": "Optional, only on a 503 with reason store_missing, store_locked or integrity_fault (e.g. no_database, wal_sidecars_incomplete, wal_shm_unusable, schema_missing)."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "ok"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "writes"
+        ],
+        "not": {
+          "required": [
+            "reason"
+          ]
+        }
+      },
+      "else": {
+        "required": [
+          "reason"
+        ]
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "detail"
+        ]
+      },
+      "then": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "enum": [
+              "store_missing",
+              "store_locked",
+              "integrity_fault"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

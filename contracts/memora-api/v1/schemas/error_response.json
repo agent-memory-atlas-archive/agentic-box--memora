@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "memora-api/v1/error_response.json",
+  "title": "Every non-2xx response except the health route's 503 (a health document): 400, 401, 403, 404, 409, 413, 429, 500, 501, 503 (search)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "error",
+    "message"
+  ],
+  "properties": {
+    "error": {
+      "enum": [
+        "bad_request",
+        "bad_token",
+        "store_forbidden",
+        "unknown_store",
+        "in_progress",
+        "key_conflict",
+        "admission",
+        "internal",
+        "writes_unsupported",
+        "payload_too_large",
+        "store_degraded",
+        "store_unavailable"
+      ]
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "writes": {
+      "const": "unsupported",
+      "description": "Only with error writes_unsupported (501)."
+    },
+    "status": {
+      "enum": [
+        "degraded",
+        "down"
+      ],
+      "description": "Only with store_degraded (degraded) or store_unavailable (down)."
+    },
+    "reason": {
+      "enum": [
+        "model_mismatch",
+        "integrity_fault",
+        "store_missing",
+        "store_locked"
+      ],
+      "description": "Only with store_degraded (model_mismatch) or store_unavailable (integrity_fault | store_missing | store_locked)."
+    },
+    "detail": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "description": "Only with store_degraded / store_unavailable: the underlying reason (diagnostic; clients switch on reason)."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "error": {
+            "const": "writes_unsupported"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "writes"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "writes"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "error": {
+            "const": "store_degraded"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "status",
+          "reason",
+          "detail"
+        ],
+        "properties": {
+          "status": {
+            "const": "degraded"
+          },
+          "reason": {
+            "const": "model_mismatch"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "error": {
+            "const": "store_unavailable"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "status",
+          "reason",
+          "detail"
+        ],
+        "properties": {
+          "status": {
+            "const": "down"
+          },
+          "reason": {
+            "enum": [
+              "integrity_fault",
+              "store_missing",
+              "store_locked"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "properties": {
+            "error": {
+              "enum": [
+                "store_degraded",
+                "store_unavailable"
+              ]
+            }
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "status"
+              ]
+            },
+            {
+              "required": [
+                "reason"
+              ]
+            },
+            {
+              "required": [
+                "detail"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "name": "bad_token",
+  "description": "Missing or unknown bearer token.",
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/memora/health",
+    "headers": {
+      "Authorization": "Bearer not-a-valid-token"
+    }
+  },
+  "response": {
+    "status": 401,
+    "body": {
+      "error": "bad_token",
+      "message": "missing or unknown bearer token"
+    }
+  },
+  "request_schema": null,
+  "response_schema": "error_response.json",
+  "volatile": [],
+  "replay": {},
+  "live": {
+    "compare": "exact"
+  }
+}

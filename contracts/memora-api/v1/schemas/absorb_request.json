@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "memora-api/v1/absorb_request.json",
+  "title": "POST /api/v1/{store}/absorb request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "idempotency_key",
+    "project",
+    "facts",
+    "source"
+  ],
+  "properties": {
+    "idempotency_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+      "description": "Store-scoped. Same key + same request = the same absorb (see README)."
+    },
+    "project": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]{1,64}$",
+      "description": "The facts' project (the daemon sends the workspace project). Must be one of the store's declared projects when it declares any."
+    },
+    "facts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 10000
+      }
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "context": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "metadata": {
+      "type": "object"
+    },
+    "tags": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100
+      }
+    }
+  }
+}

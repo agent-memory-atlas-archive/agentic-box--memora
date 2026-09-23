@@ -1,0 +1,44 @@
+{
+  "name": "health_unavailable",
+  "description": "The store cannot be read: here no database exists at its path (store_missing, detail no_database) -- the read-only probe never creates one. A probe that fails otherwise reports probe_error; a store without its schema, integrity_fault / schema_missing.",
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/memora/health",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token"
+    }
+  },
+  "response": {
+    "status": 503,
+    "body": {
+      "status": "down",
+      "store": "memora",
+      "version": "0.4.4",
+      "api_version": "v1",
+      "contract_version": "1.0.0",
+      "writes": "unsupported",
+      "projects": [
+        "agentic-box",
+        "clmux",
+        "memora"
+      ],
+      "mode": "hybrid-v1",
+      "supervisor": null,
+      "reason": "store_missing",
+      "detail": "no_database"
+    }
+  },
+  "request_schema": null,
+  "response_schema": "health_response.json",
+  "volatile": [
+    "version"
+  ],
+  "replay": {
+    "capability": "unsupported",
+    "probe": "store_missing"
+  },
+  "live": {
+    "compare": "exact",
+    "store": "broken"
+  }
+}

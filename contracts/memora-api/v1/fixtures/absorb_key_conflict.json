@@ -1,0 +1,40 @@
+{
+  "name": "absorb_key_conflict",
+  "description": "Same key, different request (request_sha256 differs): a client bug, never retried.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/memora/absorb",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "idempotency_key": "landing:clmux:dev:3f2a9c1e",
+      "project": "clmux",
+      "facts": [
+        "Landed 3f2a9c1e on clmux dev: memora HTTP client with store-scoped token (review PASS 7021)."
+      ],
+      "source": "landing",
+      "context": "verifier green on clmux dev",
+      "tags": [
+        "landing",
+        "clmux/landing"
+      ]
+    }
+  },
+  "response": {
+    "status": 409,
+    "body": {
+      "error": "key_conflict",
+      "message": "this idempotency key was used with a different request"
+    }
+  },
+  "request_schema": "absorb_request.json",
+  "response_schema": "error_response.json",
+  "volatile": [],
+  "replay": {
+    "capability": "transactional",
+    "absorb": "response"
+  },
+  "live": null
+}

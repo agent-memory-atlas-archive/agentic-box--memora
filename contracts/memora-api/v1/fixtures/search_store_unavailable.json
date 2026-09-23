@@ -1,0 +1,35 @@
+{
+  "name": "search_store_unavailable",
+  "description": "The store cannot serve reads at all: no schema (integrity_fault / schema_missing) or no database (store_missing / no_database). The read-only search creates nothing: 503 store_unavailable.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/memora/search",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "query": "how does clmux use memora"
+    }
+  },
+  "response": {
+    "status": 503,
+    "body": {
+      "error": "store_unavailable",
+      "message": "this store cannot serve reads (schema_missing); nothing was written or created",
+      "status": "down",
+      "reason": "integrity_fault",
+      "detail": "schema_missing"
+    }
+  },
+  "request_schema": "search_request.json",
+  "response_schema": "error_response.json",
+  "volatile": [],
+  "replay": {
+    "search_unavailable": {
+      "reason": "integrity_fault",
+      "detail": "schema_missing"
+    }
+  },
+  "live": null
+}

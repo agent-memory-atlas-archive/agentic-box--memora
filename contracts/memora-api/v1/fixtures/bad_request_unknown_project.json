@@ -1,0 +1,30 @@
+{
+  "name": "bad_request_unknown_project",
+  "description": "A project the store does not declare.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/memora/search",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "query": "anything",
+      "project": "trader"
+    }
+  },
+  "response": {
+    "status": 400,
+    "body": {
+      "error": "bad_request",
+      "message": "unknown_project: store 'memora' does not hold project 'trader'"
+    }
+  },
+  "request_schema": "search_request.json",
+  "response_schema": "error_response.json",
+  "volatile": [],
+  "replay": {},
+  "live": {
+    "compare": "exact"
+  }
+}

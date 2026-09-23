@@ -1,0 +1,25 @@
+{
+  "name": "unknown_store",
+  "description": "The token allows the store, but this server does not configure it.",
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/nostore/health",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token"
+    }
+  },
+  "response": {
+    "status": 404,
+    "body": {
+      "error": "unknown_store",
+      "message": "unknown store"
+    }
+  },
+  "request_schema": null,
+  "response_schema": "error_response.json",
+  "volatile": [],
+  "replay": {},
+  "live": {
+    "compare": "exact"
+  }
+}

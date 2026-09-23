@@ -1,0 +1,40 @@
+{
+  "name": "search_empty",
+  "description": "No hit passes the filters: count 0, results [].",
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/memora/search",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "query": "quarterly tax filing",
+      "tags_any": [
+        "finance/tax"
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "count": 0,
+      "mode": "hybrid-v1",
+      "embedding_model": "bge-m3",
+      "results": [],
+      "unscored": 0,
+      "took_ms": 35
+    }
+  },
+  "request_schema": "search_request.json",
+  "response_schema": "search_response.json",
+  "volatile": [
+    "took_ms"
+  ],
+  "replay": {
+    "search_hits": "response"
+  },
+  "live": {
+    "compare": "schema"
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "created",
+    "superseded",
+    "skipped",
+    "linked",
+    "memory_ids",
+    "took_ms"
+  ],
+  "properties": {
+    "status": {
+      "const": "done"
+    },
+    "created": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "superseded": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "skipped": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "linked": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "memory_ids": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "took_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "memora-api/v1/absorb_response.json",
+  "title": "POST /api/v1/{store}/absorb 200: completed (or the replayed stored response)"
+}

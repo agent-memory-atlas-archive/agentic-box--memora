@@ -1,0 +1,39 @@
+{
+  "name": "health_transactional",
+  "description": "Store on a transactional backend (Phase L): absorb allowed.",
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/memora/health",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "store": "memora",
+      "version": "0.4.4",
+      "api_version": "v1",
+      "contract_version": "1.0.0",
+      "writes": "transactional",
+      "projects": [
+        "agentic-box",
+        "clmux",
+        "memora"
+      ],
+      "mode": "hybrid-v1",
+      "supervisor": null
+    }
+  },
+  "request_schema": null,
+  "response_schema": "health_response.json",
+  "volatile": [
+    "version"
+  ],
+  "replay": {
+    "capability": "transactional",
+    "probe": "ok"
+  },
+  "live": null
+}

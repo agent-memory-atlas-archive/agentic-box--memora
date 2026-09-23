@@ -1,0 +1,61 @@
+{
+  "name": "search_keyword_only",
+  "description": "A hit found by the keyword leg only: cosine is null. Dispatch reads drop it; memory_search shows it.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/memora/search",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "query": "MEMORA_CORPUS_CACHE_BUDGET_MB",
+      "top_k": 2,
+      "preview_chars": 120
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "count": 2,
+      "mode": "hybrid-v1",
+      "embedding_model": "bge-m3",
+      "results": [
+        {
+          "id": 1182,
+          "created_at": "2026-09-23 09:12:04",
+          "tags": [
+            "clmux/architecture",
+            "landing"
+          ],
+          "preview": "clmuxd owns memora access: agents never call memora directly.",
+          "cosine": 0.4402,
+          "fused": 0.0431,
+          "rank": 1
+        },
+        {
+          "id": 1204,
+          "created_at": "2026-09-23 10:01:44",
+          "tags": [
+            "memora/deploy"
+          ],
+          "preview": "memora-all MEMORA_CORPUS_CACHE_BUDGET_MB is left unset so the 384 MB default applies.",
+          "cosine": null,
+          "fused": 0.0066,
+          "rank": 2
+        }
+      ],
+      "unscored": 0,
+      "took_ms": 188
+    }
+  },
+  "request_schema": "search_request.json",
+  "response_schema": "search_response.json",
+  "volatile": [
+    "took_ms"
+  ],
+  "replay": {
+    "search_hits": "response"
+  },
+  "live": null
+}

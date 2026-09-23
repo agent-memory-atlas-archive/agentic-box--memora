@@ -6,6 +6,7 @@ keeping the same API surface.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -17,7 +18,7 @@ import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 try:
     import filelock
@@ -181,6 +182,16 @@ class ConflictError(Exception):
     pass
 
 
+class StoreMissingError(RuntimeError):
+    """A read-only open found no database (nothing was created)."""
+
+
+class StoreLockedError(RuntimeError):
+    """A read-only open was refused rather than create a file: WAL sidecar
+    files that cannot be used for the read lock, an incomplete sidecar pair,
+    or a hot journal needing recovery. str() is a short, stable detail."""
+
+
 class StorageBackend(ABC):
     """Abstract base class for storage backends.
 
@@ -204,6 +215,12 @@ class StorageBackend(ABC):
         """
         pass
 
+    def connect_read_only(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
+        """A connection for READ-ONLY callers (the plain JSON API, readiness
+        probes). Default: connect(). Local SQLite overrides it so a read never
+        creates a file or directory."""
+        return self.connect(check_same_thread=check_same_thread)
+
     @abstractmethod
     def sync_before_use(self) -> None:
         """Sync state before using the database (e.g., download from cloud)."""
@@ -220,6 +237,397 @@ class StorageBackend(ABC):
         pass
 
 
+class _StoreRWLock:
+    """A process-wide reader-writer lock for ONE local store (see
+    LocalSQLiteBackend.connect / connect_read_only). Writer-preferring, so a
+    stream of reads cannot starve a writer's open or close. A thread that
+    already holds the shared side may re-enter it; the exclusive side is
+    re-entrant for its holder; opening a writer on the same store while
+    holding a read raises instead of deadlocking.
+
+    Closes by the GC never block (a finalizer may run on a thread holding
+    unrelated locks): they take the exclusive side only if it is free now,
+    else hand the connection to defer_close, and the lock closes it -- under
+    the exclusive side -- as soon as the reads drain or the writer section
+    ends."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers: Dict[int, int] = {}  # thread id -> shared holds
+        self._writer = False
+        self._writer_owner: Optional[int] = None
+        self._waiting_writers = 0
+        self.open_writers = 0  # in-process writer connections open (changed under exclusive)
+        self._deferred: list = []  # writer connections the GC could not close yet
+        self._draining = False
+
+    def acquire_shared(self) -> None:
+        me = threading.get_ident()
+        with self._cond:
+            if me not in self._readers:
+                while self._writer or self._waiting_writers:
+                    self._cond.wait()
+            self._readers[me] = self._readers.get(me, 0) + 1
+
+    def release_shared(self, holder: Optional[int] = None) -> None:
+        me = threading.get_ident() if holder is None else holder
+        with self._cond:
+            count = self._readers.get(me, 0)
+            if count <= 1:
+                self._readers.pop(me, None)
+            else:
+                self._readers[me] = count - 1
+            if not self._readers:
+                self._cond.notify_all()
+        self._drain_deferred()
+
+    def _try_exclusive(self, ignore_waiting: bool = False) -> bool:
+        me = threading.get_ident()
+        with self._cond:
+            if self._writer or self._readers or (self._waiting_writers and not ignore_waiting):
+                return False
+            self._writer, self._writer_owner = True, me
+            return True
+
+    def _release_exclusive(self) -> None:
+        with self._cond:
+            self._writer, self._writer_owner = False, None
+            self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def exclusive(self):
+        me = threading.get_ident()
+        with self._cond:
+            nested = self._writer and self._writer_owner == me
+        if nested:
+            yield  # re-entered by its holder
+            return
+        with self._cond:
+            if me in self._readers:
+                raise RuntimeError("a writer connection was opened or closed on a local store while this "
+                                   "thread holds a read-only connection to it (would deadlock)")
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._cond.wait()
+            finally:
+                self._waiting_writers -= 1
+            self._writer, self._writer_owner = True, me
+        try:
+            self._drain_locked()  # pending GC closes run inside every writer section
+            yield
+        finally:
+            try:
+                self._drain_locked()
+            finally:
+                self._release_exclusive()
+
+    def _drain_locked(self) -> None:
+        """Close deferred connections; the caller holds the exclusive side."""
+        while True:
+            with self._cond:
+                if not self._deferred:
+                    return
+                conn = self._deferred.pop(0)
+            try:
+                conn._memora_close_locked()
+            except Exception:
+                logger.exception("local store writer connection: deferred close failed")
+
+    def close_from_gc(self, conn: Any) -> None:
+        """Close a writer connection the GC is finalizing, never blocking."""
+        with self._cond:
+            nested = self._writer and self._writer_owner == threading.get_ident()
+        if nested:
+            conn._memora_close_locked()
+            return
+        if self._try_exclusive():
+            try:
+                conn._memora_close_locked()
+            finally:
+                self._release_exclusive()
+            self._drain_deferred()
+            return
+        with self._cond:
+            self._deferred.append(conn)  # keeps it alive until closed
+
+    def _drain_deferred(self) -> None:
+        with self._cond:
+            if self._draining or not self._deferred:
+                return
+            self._draining = True
+        try:
+            while True:
+                with self._cond:
+                    if not self._deferred:
+                        return
+                # Deferred closes go before waiting writers (they are short and
+                # must not starve); a busy exclusive side drains them itself.
+                if not self._try_exclusive(ignore_waiting=True):
+                    return
+                try:
+                    with self._cond:
+                        conn = self._deferred.pop(0)
+                    try:
+                        conn._memora_close_locked()
+                    except Exception:
+                        logger.exception("local store writer connection: deferred close failed")
+                finally:
+                    self._release_exclusive()
+        finally:
+            with self._cond:
+                self._draining = False
+
+
+_STORE_LOCKS: Dict[str, _StoreRWLock] = {}
+_STORE_LOCKS_GUARD = threading.Lock()
+
+
+def _store_lock(path: Path) -> _StoreRWLock:
+    """The lock for a local store, by its real path (so two names for one
+    file share it). Never creates anything."""
+    key = os.path.realpath(str(path))
+    with _STORE_LOCKS_GUARD:
+        lock = _STORE_LOCKS.get(key)
+        if lock is None:
+            lock = _STORE_LOCKS[key] = _StoreRWLock()
+        return lock
+
+
+# SQLite's own close, through one name (tests make it fail to prove the
+# wrappers' bookkeeping only follows a SUCCESSFUL close).
+def _sqlite_close(conn: sqlite3.Connection) -> None:
+    sqlite3.Connection.close(conn)
+
+
+# Thread checks that mirror stock sqlite3 with check_same_thread=True.
+# The native connection is opened with check_same_thread=False (so a close by
+# the GC, on any thread, can really close it under the store lock); the
+# wrappers below re-impose the caller's check on EVERY public method of
+# Connection and Cursor present on the running Python -- default-deny: a
+# method a new Python adds is checked too -- except the ones stock sqlite3
+# itself allows from any thread (verified by tests/test_local_store_lock.py
+# against native sqlite3).
+_CONNECTION_UNCHECKED = frozenset({"__enter__", "interrupt"})
+_CURSOR_UNCHECKED = frozenset({"__iter__", "setinputsizes", "setoutputsize"})
+_CHECKED_DUNDERS = frozenset({"__enter__", "__exit__", "__iter__", "__next__"})
+
+
+def _public_callables(cls: type) -> list:
+    return sorted(
+        name for name in dir(cls)
+        if (not name.startswith("_") or name in _CHECKED_DUNDERS) and callable(getattr(cls, name, None))
+        and not isinstance(getattr(cls, name), type)
+    )
+
+
+def _checked(base: type, name: str):
+    native = getattr(base, name)
+
+    def method(self, *args, **kwargs):
+        self._memora_check()
+        return native(self, *args, **kwargs)
+
+    method.__name__ = method.__qualname__ = name
+    method.__doc__ = getattr(native, "__doc__", None)
+    method._memora_checked = True
+    return method
+
+
+class _ThreadCheckedCursor(sqlite3.Cursor):
+    """Every public Cursor method thread-checked like stock sqlite3."""
+
+    def _memora_check(self) -> None:
+        check = getattr(self.connection, "_memora_check", None)
+        if check is not None:
+            check()
+
+
+for _name in _public_callables(sqlite3.Cursor):
+    if _name not in _CURSOR_UNCHECKED:
+        setattr(_ThreadCheckedCursor, _name, _checked(sqlite3.Cursor, _name))
+
+
+class _ThreadCheckedConnection(sqlite3.Connection):
+    """Every public Connection method (and the autocommit property, which
+    stock sqlite3 checks) thread-checked like stock sqlite3; cursor() --
+    also used by execute() -- returns thread-checked cursors."""
+
+    _memora_owner: Optional[int] = None
+    _memora_check_thread = True
+
+    def _memora_check(self) -> None:
+        if self._memora_check_thread and self._memora_owner is not None \
+                and threading.get_ident() != self._memora_owner:
+            raise sqlite3.ProgrammingError(
+                "SQLite objects created in a thread can only be used in that same thread. "
+                f"The object was created in thread id {self._memora_owner} and this is thread id "
+                f"{threading.get_ident()}.")
+
+    def cursor(self, factory=None):
+        self._memora_check()
+        if factory is None:
+            factory = _ThreadCheckedCursor
+        elif not issubclass(factory, _ThreadCheckedCursor):
+            factory = type(f"_ThreadChecked{factory.__name__}", (_ThreadCheckedCursor, factory), {})
+        return sqlite3.Connection.cursor(self, factory)
+
+    # The C-level convenience methods create their cursor WITHOUT calling the
+    # Python cursor() above, so they go through it here explicitly (same
+    # arguments, return values and exceptions as native).
+    def execute(self, sql, parameters=(), /):
+        self._memora_check()
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(self, sql, parameters, /):
+        self._memora_check()
+        return self.cursor().executemany(sql, parameters)
+
+    def executescript(self, sql_script, /):
+        self._memora_check()
+        return self.cursor().executescript(sql_script)
+
+    def blobopen(self, *args, **kwargs):
+        self._memora_check()
+        return _ThreadCheckedBlob(sqlite3.Connection.blobopen(self, *args, **kwargs), self)
+
+
+# Connection methods returning a cursor or cursor-like object are overridden
+# explicitly above; iterdump's generator builds its cursor through cursor().
+_CONNECTION_EXPLICIT = frozenset({"cursor", "execute", "executemany", "executescript", "blobopen"})
+for _name in _public_callables(sqlite3.Connection):
+    if _name not in _CONNECTION_UNCHECKED and _name not in _CONNECTION_EXPLICIT:
+        setattr(_ThreadCheckedConnection, _name, _checked(sqlite3.Connection, _name))
+
+
+class _ThreadCheckedBlob:
+    """sqlite3.Blob cannot be subclassed: a proxy that thread-checks every
+    public Blob operation (stock sqlite3 checks them all) and delegates."""
+
+    __slots__ = ("_blob", "_conn")
+
+    def __init__(self, blob, conn) -> None:
+        self._blob, self._conn = blob, conn
+
+    def __enter__(self):
+        self._conn._memora_check()
+        self._blob.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self._conn._memora_check()
+        return self._blob.__exit__(*exc)
+
+    def __len__(self):
+        self._conn._memora_check()
+        return len(self._blob)
+
+    def __getitem__(self, key):
+        self._conn._memora_check()
+        return self._blob[key]
+
+    def __setitem__(self, key, value):
+        self._conn._memora_check()
+        self._blob[key] = value
+
+
+_BLOB_DUNDERS = frozenset({"__enter__", "__exit__", "__len__", "__getitem__", "__setitem__"})
+if hasattr(sqlite3, "Blob"):
+    for _name in [n for n in dir(sqlite3.Blob) if not n.startswith("_") and callable(getattr(sqlite3.Blob, n))]:
+        def _blob_method(self, *args, _name=_name, **kwargs):
+            self._conn._memora_check()
+            return getattr(self._blob, _name)(*args, **kwargs)
+
+        _blob_method.__name__ = _name
+        setattr(_ThreadCheckedBlob, _name, _blob_method)
+if hasattr(sqlite3.Connection, "autocommit"):  # Python 3.12+
+    _native_autocommit = sqlite3.Connection.autocommit
+
+    def _get_autocommit(self):
+        self._memora_check()
+        return _native_autocommit.__get__(self)
+
+    def _set_autocommit(self, value):
+        self._memora_check()
+        _native_autocommit.__set__(self, value)
+
+    _ThreadCheckedConnection.autocommit = property(_get_autocommit, _set_autocommit)
+
+
+class _LockedWriterConnection(_ThreadCheckedConnection):
+    """A local writer connection whose close (explicit or by the GC) takes
+    the exclusive side of its store lock (see LocalSQLiteBackend.connect).
+
+    The bookkeeping (closed flag, open_writers) changes only AFTER the
+    underlying close succeeded: a close that raises (e.g. from the wrong
+    thread) leaves the connection open, counted, and still closable only
+    under the exclusive side; the exception propagates."""
+
+    _memora_lock: Optional[_StoreRWLock] = None
+    _memora_closed = False
+
+    def close(self) -> None:
+        self._memora_check()
+        lock = self._memora_lock
+        if lock is None or self._memora_closed:
+            return super().close()
+        with lock.exclusive():
+            self._memora_close_locked()
+
+    def _memora_close_locked(self) -> None:
+        """Close under the exclusive side (held by the caller)."""
+        if self._memora_closed:
+            return
+        _sqlite_close(self)  # raises -> nothing below runs
+        self._memora_closed = True
+        self._memora_lock.open_writers -= 1
+
+    def __del__(self) -> None:
+        lock = self._memora_lock
+        if lock is None or self._memora_closed:
+            return
+        try:
+            lock.close_from_gc(self)  # never blocks; may defer (keeping self alive)
+        except Exception:
+            logger.exception("local store writer connection: close by the GC failed")
+
+
+class _LockedReaderConnection(_ThreadCheckedConnection):
+    """A read-only connection that holds the shared side of its store lock
+    until the underlying close SUCCEEDS (explicitly or by the GC): a close
+    that raises (e.g. from the wrong thread) keeps the read protected."""
+
+    _memora_release = None
+
+    def close(self) -> None:
+        self._memora_check()
+        _sqlite_close(self)  # raises -> the shared hold is kept
+        release, self._memora_release = self._memora_release, None
+        if release is not None:
+            release()
+
+    def __del__(self) -> None:
+        try:
+            _sqlite_close(self)
+        except Exception:
+            logger.exception("local store read-only connection: close by the GC failed")
+            return
+        release, self._memora_release = self._memora_release, None
+        if release is not None:
+            release()
+
+
+def _sqlite_header_is_wal(path: Path) -> bool:
+    """WAL mode per the database header (file format write/read version bytes
+    18-19 == 2), read without opening SQLite -- so nothing is created."""
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(20)
+    except OSError:
+        return False
+    return len(header) >= 20 and header[:16] == b"SQLite format 3\x00" and (header[18] == 2 or header[19] == 2)
+
+
 class LocalSQLiteBackend(StorageBackend):
     """Local file-based SQLite backend (original behavior)."""
 
@@ -230,15 +638,103 @@ class LocalSQLiteBackend(StorageBackend):
             db_path: Path to the SQLite database file
         """
         self.db_path = Path(db_path)
-        self._ensure_parent_dir()
 
     def _ensure_parent_dir(self) -> None:
         """Ensure parent directory exists."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     def connect(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
-        """Return a connection to the local SQLite database."""
-        conn = sqlite3.connect(self.db_path, check_same_thread=check_same_thread)
+        """Return a WRITER connection to the local SQLite database (created if
+        missing: this is the writing path).
+
+        Every in-process writer connection to a local store is opened HERE,
+        and its open and close take the EXCLUSIVE side of the store's
+        process-wide lock (_store_lock): no writer opens or closes while a
+        read-only connection is open (connect_read_only holds the shared side
+        until it is closed). The open also touches the database once, so a
+        WAL database's -wal/-shm exist for as long as this connection is open.
+        """
+        self._ensure_parent_dir()
+        lock = _store_lock(self.db_path)
+        with lock.exclusive():
+            conn = sqlite3.connect(self.db_path, check_same_thread=False,
+                                   factory=_LockedWriterConnection)
+            conn._memora_owner = threading.get_ident()
+            conn._memora_check_thread = check_same_thread
+            try:
+                conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            except sqlite3.Error:
+                pass  # e.g. not a database yet; the caller's own statements report it
+            conn._memora_lock = lock
+            lock.open_writers += 1
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def connect_read_only(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
+        """A read that NEVER creates a file (no directory, database, -wal or
+        -shm) -- for writers in THIS process; a read may be REFUSED.
+
+        The whole read -- from this open to the returned connection's close
+        -- holds the SHARED side of the store's process-wide lock, so no
+        in-process writer connection opens or closes meanwhile (their open
+        and close take the exclusive side). Under it:
+        - No database file: StoreMissingError.
+        - Rollback-journal database: mode=ro (memora's own local stores).
+        - WAL database (header bytes 18-19 == 2) with an in-process writer
+          open: its -wal and -shm exist (the writer's open touched them) and
+          cannot go away during this read; mode=ro takes the WAL read lock
+          through them and sees committed data. Refused (StoreLockedError)
+          if they are incomplete or this user cannot use the -shm.
+        - WAL database with NO in-process writer and no sidecars:
+          mode=ro&immutable=1 (no locks, nothing created). SQLite's immutable
+          mode turns off locking and change detection, so a file changing
+          under it can give stale or torn results; it is used only while the
+          shared lock guarantees no in-process writer can start.
+        - WAL database with no in-process writer but sidecars present (an
+          EXTERNAL writer, or a crash's leftovers): mode=ro through them if
+          both exist and are usable, else refused.
+        A first read runs at open; any other open/lock failure is refused as
+        StoreLockedError, never repaired by creating anything.
+
+        OUT OF SCOPE: writers in another process. memora is the single writer
+        of its local stores (the design assumes it); an external writer can
+        defeat both the no-create guarantee (it can close, deleting the
+        sidecars, between our check and our open) and immutable correctness.
+        """
+        path = self.db_path
+        lock = _store_lock(path)
+        lock.acquire_shared()
+        try:
+            if not path.is_file():
+                raise StoreMissingError(f"no database file at {path}")
+            from urllib.parse import quote
+
+            wal, shm = Path(f"{path}-wal"), Path(f"{path}-shm")
+            params = "mode=ro"
+            if _sqlite_header_is_wal(path):
+                has_wal, has_shm = wal.exists(), shm.exists()
+                if lock.open_writers == 0 and not has_wal and not has_shm:
+                    params = "mode=ro&immutable=1"
+                elif has_wal != has_shm or not has_wal:
+                    raise StoreLockedError("wal_sidecars_incomplete")
+                elif not (os.access(shm, os.R_OK | os.W_OK) and os.access(wal, os.R_OK)):
+                    # SQLite would fall back to an unlocked heap-memory read;
+                    # the policy is to refuse rather than read without the lock.
+                    raise StoreLockedError("wal_shm_unusable")
+            uri = "file:" + quote(str(path.resolve())) + "?" + params
+            try:
+                conn = sqlite3.connect(uri, uri=True, check_same_thread=False,
+                                       factory=_LockedReaderConnection)
+                conn._memora_owner = threading.get_ident()
+                conn._memora_check_thread = check_same_thread
+                conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            except sqlite3.Error as exc:
+                raise StoreLockedError("store_locked_or_unreadable") from exc
+            holder = threading.get_ident()
+            conn._memora_release = lambda: lock.release_shared(holder)  # released by close()
+        except BaseException:
+            lock.release_shared()
+            raise
         conn.row_factory = sqlite3.Row
         return conn
 

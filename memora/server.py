@@ -3583,6 +3583,13 @@ def main(argv: Optional[list[str]] = None) -> None:
 
             register_health_routes(mcp)
 
+            # /api/v1: the plain JSON API for clmuxd (memora/api_v1.py).
+            # Custom routes, outside the MCP session lifecycle. Fails closed:
+            # not registered on a non-loopback bind without a tokens file.
+            from .api_v1 import register_api_routes
+
+            register_api_routes(mcp, bind_host=args.host)
+
         if args.transport == "streamable-http":
             # Serve streamable-http ourselves rather than via mcp.run(), for
             # BOTH single-database and registry deployments. Two reasons:
@@ -3625,6 +3632,16 @@ def main(argv: Optional[list[str]] = None) -> None:
                 served,
                 host=args.host,
                 port=args.port,
+                # Explicit, not "auto": the /api/v1 body bound ("cap + one
+                # ASGI message") is stated for THIS parser and loop. h11
+                # buffers at most 16 KiB of an incomplete request line and
+                # headers; body data reaches the app one transport read at a
+                # time, measured at <= 262144 bytes with loop="asyncio"
+                # (scripts/measure_asgi_body_messages.py, CPython 3.12.8 and
+                # 3.13.1, uvicorn 0.42.0). uvloop would read differently.
+                http="h11",
+                loop="asyncio",
+                h11_max_incomplete_event_size=16 * 1024,
                 # FastMCP's configured level, not a hardcoded one: mcp.run()
                 # uses mcp.settings.log_level and bypassing it silently changes
                 # logging behaviour for multi-database deployments only.

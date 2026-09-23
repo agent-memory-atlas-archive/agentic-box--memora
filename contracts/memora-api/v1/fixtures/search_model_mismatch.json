@@ -1,0 +1,35 @@
+{
+  "name": "search_model_mismatch",
+  "description": "The store's vectors cannot be scored against the current embedding model (mismatch, mixed, unrecorded, or a rebuild in progress). The read-only search never rebuilds: 503 store_degraded, nothing written.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/memora/search",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "query": "how does clmux use memora"
+    }
+  },
+  "response": {
+    "status": 503,
+    "body": {
+      "error": "store_degraded",
+      "message": "search cannot score this store (model_or_representation_mismatch); nothing was written",
+      "status": "degraded",
+      "reason": "model_mismatch",
+      "detail": "model_or_representation_mismatch"
+    }
+  },
+  "request_schema": "search_request.json",
+  "response_schema": "error_response.json",
+  "volatile": [],
+  "replay": {
+    "search_unavailable": {
+      "reason": "model_mismatch",
+      "detail": "model_or_representation_mismatch"
+    }
+  },
+  "live": null
+}

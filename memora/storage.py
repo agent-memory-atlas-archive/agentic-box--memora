@@ -709,6 +709,19 @@ def connect(*, check_same_thread: bool = True) -> sqlite3.Connection:
     return _connect(current_backend(), check_same_thread=check_same_thread)
 
 
+def connect_without_schema(*, check_same_thread: bool = True) -> sqlite3.Connection:
+    """A connection that NEVER runs schema setup (no CREATE / ALTER / INSERT
+    OR IGNORE): for read-only callers -- the plain JSON API and the readiness
+    probe -- which must have no write path. The schema is set up by the
+    writing paths (startup pre-warm, MCP tools, CLI); a store without one
+    fails its queries instead of being created by a read. Local SQLite opens
+    in read-only URI mode (no mkdir, no new file; a missing database raises
+    backends.StoreMissingError); D1 and other backends open as usual."""
+    backend = current_backend()
+    opener = getattr(backend, "connect_read_only", None) or backend.connect
+    return opener(check_same_thread=check_same_thread)
+
+
 def sync_to_cloud() -> None:
     """Sync database to cloud storage if using a cloud backend."""
     from .schema import sync_to_cloud as _sync
@@ -2631,6 +2644,7 @@ def _search_by_vector(
     corpus: Optional["_CorpusSnapshot"] = None,
     meta: Optional[Dict[str, Optional[str]]] = None,
     fresh_empty: Optional[List["_CorpusEntry"]] = None,
+    project: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Exhaustive vector search scored against the corpus snapshot.
 
@@ -2685,6 +2699,10 @@ def _search_by_vector(
             )
             if not _metadata_matches_filters(present, validated_filters):
                 continue
+        if project and not _record_in_project(
+            _metadata_dict_from_json(entry.metadata_json), entry.tags, project,
+        ):
+            continue
         if filtering_tags_dates and not _record_passes_date_tag_filters(
             {"created_at": entry.created_at, "tags": entry.tags or []},
             parsed_date_from=parsed_date_from,
@@ -2723,6 +2741,7 @@ def _search_by_vector_scan(
     tags_any: Optional[List[str]] = None,
     tags_all: Optional[List[str]] = None,
     tags_none: Optional[List[str]] = None,
+    project: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """The pre-snapshot search: page every row with content and embedding.
     Kept as the reference _search_by_vector must equal (tests) and for
@@ -2746,6 +2765,8 @@ def _search_by_vector_scan(
         if validated_filters and not _metadata_matches_filters(
             record.get("metadata"), validated_filters
         ):
+            continue
+        if project and not _record_in_project(record.get("metadata"), record.get("tags"), project):
             continue
 
         # Phase 0: apply date + tag filters uniformly across both retrieval legs.
@@ -2902,11 +2923,17 @@ class _CorpusSnapshot:
     (score, then created_at, descending).
     """
 
-    __slots__ = ("_by_id", "_cache_key")
+    __slots__ = ("_by_id", "_cache_key", "unscored", "unrepaired")
 
     def __init__(self):
         self._by_id: Dict[int, _CorpusEntry] = {}
         self._cache_key: Optional[str] = None
+        # Rows this snapshot cannot score: certified-empty vectors, plus (in a
+        # read-only load, which never repairs) rows missing their vector.
+        self.unscored = 0
+        # Rows missing their vector that this (read-only) load did not repair:
+        # a snapshot with any is never published for the repairing callers.
+        self.unrepaired = 0
 
     def __len__(self) -> int:
         return len(self._by_id)
@@ -2918,6 +2945,8 @@ class _CorpusSnapshot:
         new = _CorpusSnapshot()
         new._by_id = dict(self._by_id)  # shallow copy; entries are immutable
         new._cache_key = self._cache_key
+        new.unscored = self.unscored
+        new.unrepaired = self.unrepaired
         return new
 
     def append(self, id, vector, created_at, metadata_type, encoding_source: str = "python",
@@ -3004,8 +3033,13 @@ def _load_corpus_snapshot(
     *,
     page_size: int = _VECTOR_SCAN_PAGE_SIZE,
     empty_sink: Optional[List["_CorpusEntry"]] = None,
+    repair_missing: bool = True,
 ) -> _CorpusSnapshot:
     """Load the corpus ONCE into a skinny snapshot, repairing missing embeddings.
+
+    repair_missing=False is the READ-ONLY load (the plain JSON API): no
+    statement but SELECTs; a row missing its vector is left out and counted
+    in snapshot.unscored, as is every certified-empty row.
 
     The main pass pulls only scoring columns (no content/metadata/tags for the
     common, fully-embedded case). Legacy rows with a missing embedding are
@@ -3063,8 +3097,12 @@ def _load_corpus_snapshot(
         if len(rows) < page_size:
             break
 
-    if repair:
+    if repair and repair_missing:
         _repair_corpus_embeddings(conn, repair, snapshot, empty_sink=empty_sink)
+    snapshot.unrepaired = 0 if repair_missing else len(repair)
+    snapshot.unscored = snapshot.unrepaired + sum(
+        1 for e in snapshot.entries_in_id_order() if e.vector is _CERTIFIED_EMPTY_EMBEDDING
+    )
     return snapshot
 
 
@@ -3361,9 +3399,18 @@ def _corpus_base(
     *,
     meta: Optional[Mapping[str, Optional[str]]] = None,
     empty_sink: Optional[List["_CorpusEntry"]] = None,
+    read_only: bool = False,
 ) -> _CorpusSnapshot:
     """Return the immutable shared base snapshot for this store, loading and
     caching it under a STABLE epoch. Callers must fork() before mutating.
+
+    read_only (the JSON API): never repairs (no write). Uses a current cached
+    snapshot if there is one; otherwise loads WITHOUT the repair pass, under
+    the same lock (single-flight: concurrent cold reads wait for one load)
+    and the same byte budget / LRU. A complete load (no unrepaired rows) is
+    published as the shared snapshot; an incomplete one goes to this store's
+    read-only slot (key + "|ro"), which only read-only callers use -- the
+    repairing callers never see a snapshot missing rows.
 
     Fail closed on the cache: if the freshness proof (epoch) is missing or
     malformed, exact-load and DO NOT cache. An unavailable proof must never
@@ -3378,13 +3425,15 @@ def _corpus_base(
     store = _store_cache_key(conn)
     model, epoch = _corpus_meta_from(meta) if meta is not None else _corpus_meta(conn)
     if epoch is None:
-        loaded = _load_corpus_snapshot(conn, empty_sink=empty_sink)
+        loaded = _load_corpus_snapshot(conn, empty_sink=empty_sink, repair_missing=not read_only)
         loaded._cache_key = None
         return loaded
     key = _corpus_cache_key_for(store, model)
     hit = _corpus_cache_get(key, epoch)
     if hit is not None:
         return hit
+    if read_only:
+        return _corpus_base_read_only_locked(conn, key, epoch)
     # Cold load: only cache if the epoch is stable across the read, so we never
     # publish a snapshot under an epoch it did not observe.
     with _corpus_cache_lock:
@@ -3412,6 +3461,36 @@ def _corpus_base(
                 _corpus_cache_publish_locked(key, loaded, after)
                 return loaded
         # See RETRY EXHAUSTION in the module comment: last load, uncached.
+        loaded._cache_key = None
+        return loaded
+
+
+def _corpus_base_read_only_locked(conn: sqlite3.Connection, key: str, epoch: int) -> _CorpusSnapshot:
+    """The read-only cold path of _corpus_base (see there)."""
+    ro_key = key + "|ro"
+    with _corpus_cache_lock:
+        for k in (key, ro_key):
+            entry = _corpus_cache.get(k)
+            if entry is not None and entry.epoch == epoch:
+                _corpus_cache.move_to_end(k)
+                return entry.snapshot
+        loaded: Optional[_CorpusSnapshot] = None
+        for _ in range(_CORPUS_LOAD_RETRIES):
+            _model, before = _corpus_meta(conn)
+            loaded = _load_corpus_snapshot(conn, repair_missing=False)
+            if before is None:
+                break
+            _model2, after = _corpus_meta(conn)
+            if after is None:
+                break
+            if before == after:
+                target = key if loaded.unrepaired == 0 else ro_key
+                loaded._cache_key = target
+                _corpus_cache_publish_locked(target, loaded, after)
+                if target == key:
+                    _corpus_cache.pop(ro_key, None)
+                return loaded
+        # No stable proof of freshness: return it uncached (see RETRY EXHAUSTION).
         loaded._cache_key = None
         return loaded
 
@@ -8705,6 +8784,19 @@ def _has_kind_tag(tags: Any, kind: str) -> bool:
     )
 
 
+def _record_in_project(metadata: Any, tags: Any, project: str) -> bool:
+    """Is a memory explicitly in `project`? metadata.project equal to it, or a
+    tag equal to it or prefixed "<project>/". Explicit markers only -- no
+    content heuristics (the /api/v1 search `project` filter; issue #47)."""
+    if isinstance(metadata, Mapping) and metadata.get("project") == project:
+        return True
+    prefix = project + "/"
+    for tag in tags if isinstance(tags, list) else []:
+        if isinstance(tag, str) and (tag == project or tag.startswith(prefix)):
+            return True
+    return False
+
+
 def _records_pass_post_sql_filters(
     record: Dict[str, Any],
     validated_filters: Optional[Dict[str, Any]],
@@ -8712,10 +8804,13 @@ def _records_pass_post_sql_filters(
     tags_all: Optional[List[str]],
     tags_none: Optional[List[str]],
     kind_tag: Optional[str] = None,
+    project: Optional[str] = None,
 ) -> bool:
     if validated_filters and not _metadata_matches_filters(record.get("metadata"), validated_filters):
         return False
     if kind_tag and not _has_kind_tag(record.get("tags"), kind_tag):
+        return False
+    if project and not _record_in_project(record.get("metadata"), record.get("tags"), project):
         return False
     record_tags = set(record.get("tags", []))
     if tags_any and not any(tag in record_tags for tag in tags_any):
@@ -8741,11 +8836,14 @@ def list_memories(
     sort_by_importance: bool = False,
     follow: Optional[str] = None,
     kind_tag: Optional[str] = None,
+    project: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """List memories with optional query, metadata, date, tag and lineage filters.
 
     kind_tag: only memories with a typed tag of this kind ("todos"), bare or
     with any project prefix (_has_kind_tag); applied before limit/offset.
+    project: only memories explicitly in this project (_record_in_project);
+    applied before limit/offset.
     """
     validated_filters = _validate_metadata_filters(metadata_filters)
     limit = _clamp_limit(limit)
@@ -8756,7 +8854,7 @@ def list_memories(
     # Lineage (active/latest) is also post-SQL: windowed continuation below.
     lineage_filters_results = follow in {"active", "latest"}
     has_post_sql_filters = bool(
-        validated_filters or tags_any or tags_all or tags_none or kind_tag
+        validated_filters or tags_any or tags_all or tags_none or kind_tag or project
         or lineage_filters_results
     )
 
@@ -8817,7 +8915,7 @@ def list_memories(
                 rec
                 for rec in (_serialise_row(row) for row in rows)
                 if _records_pass_post_sql_filters(
-                    rec, validated_filters, tags_any, tags_all, tags_none, kind_tag
+                    rec, validated_filters, tags_any, tags_all, tags_none, kind_tag, project
                 )
             ]
             batch = apply_follow(
@@ -8876,7 +8974,7 @@ def list_memories(
         rec
         for rec in (_serialise_row(row) for row in rows)
         if _records_pass_post_sql_filters(
-            rec, validated_filters, tags_any, tags_all, tags_none, kind_tag
+            rec, validated_filters, tags_any, tags_all, tags_none, kind_tag, project
         )
     ]
 
@@ -8981,6 +9079,48 @@ def _query_embedding(query: str) -> Dict[str, float]:
     return vector
 
 
+class SearchUnavailable(RuntimeError):
+    """A read-only search cannot score this store correctly (see
+    _read_only_search_gate); nothing was written."""
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+        self.detail = detail
+
+
+def _read_only_search_gate(conn: sqlite3.Connection, integrity: Dict[str, Any]) -> None:
+    """Decide, from the (read-only) integrity status, whether a read-only
+    search can run. Missing vectors (or a store never audited) are fine as
+    long as the vectors present match the current model: those rows are just
+    unscored. Anything else a normal search would rebuild -- a model or
+    representation mismatch, mixed encodings, a rebuild in progress -- is
+    "model_mismatch"; a fault no rebuild repairs is "integrity_fault"."""
+    if not integrity.get("mismatch"):
+        return
+    audit = integrity.get("audit") or {}
+    if not audit.get("memory_count") and not audit.get("embedding_count"):
+        return  # an empty store: nothing to score, nothing to mismatch
+    reason = str(integrity.get("reason") or "unknown")
+    if not integrity.get("repairable"):
+        raise SearchUnavailable("integrity_fault", reason)
+    if reason in ("missing_embeddings", "integrity_uninitialized"):
+        from .embeddings import _model_mismatch_for_reps, get_stored_embedding_model
+
+        stored = get_stored_embedding_model(conn)
+        if stored is None:
+            # Never searched or rebuilt: no record of which model made the
+            # vectors, so a query vector cannot be proven comparable. A normal
+            # (MCP) search records it.
+            raise SearchUnavailable("model_mismatch", "embedding_model_unrecorded")
+        if not audit.get("mixed") and not _model_mismatch_for_reps(
+            audit.get("reps") or {}, stored, EMBEDDING_MODEL,
+        ):
+            return
+        reason = "model_or_representation_mismatch"
+    raise SearchUnavailable("model_mismatch", reason)
+
+
 def semantic_search(
     conn: sqlite3.Connection,
     query: str,
@@ -8995,8 +9135,18 @@ def semantic_search(
     tags_all: Optional[List[str]] = None,
     tags_none: Optional[List[str]] = None,
     follow: Optional[str] = None,
+    project: Optional[str] = None,
+    read_only: bool = False,
+    coverage: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Perform semantic search using vector embeddings.
+
+    read_only=True (the plain JSON API): issues SELECTs only. No rebuild on a
+    model mismatch and no repair of missing vectors: a store whose vectors
+    cannot be scored against the current model raises SearchUnavailable
+    (reason "model_mismatch", or "integrity_fault" for a non-repairable
+    fault); rows missing their vector are simply not scored, and their count
+    (plus certified-empty rows) is put in coverage["unscored"].
 
     Args:
         conn: Database connection
@@ -9012,6 +9162,7 @@ def semantic_search(
         tags_none: Exclude memories with ANY of these tags (NOT)
         follow: Lineage mode — "latest" (resolve to current version),
                 "active" (exclude superseded), "full_history" (expand chains)
+        project: Only memories explicitly in this project (_record_in_project)
 
     Returns:
         List of results with score and memory
@@ -9024,7 +9175,10 @@ def semantic_search(
     # be surfaced instead of entering an auto-rebuild loop.
     with absorb_phase("integrity"):
         integrity = _get_embedding_integrity_status(conn, EMBEDDING_MODEL, meta=meta)
-    if integrity["mismatch"] and not integrity["repairable"]:
+    if read_only:
+        _read_only_search_gate(conn, integrity)
+        auto_rebuild = False
+    elif integrity["mismatch"] and not integrity["repairable"]:
         raise EmbeddingIntegrityFault(integrity["reason"], integrity["fault_ids"])
     if auto_rebuild and integrity["mismatch"]:
         import sys
@@ -9045,12 +9199,15 @@ def semantic_search(
     candidate_top_k = _follow_candidate_limit(top_k, follow)
     fresh_empty: List[_CorpusEntry] = []
     with absorb_phase("corpus"):
-        corpus = _corpus_base(conn, meta=meta, empty_sink=fresh_empty)
+        corpus = _corpus_base(conn, meta=meta, empty_sink=fresh_empty, read_only=read_only)
+    if coverage is not None:
+        coverage["unscored"] = int(corpus.unscored)
     results = _search_by_vector(
         conn,
         vector_query,
         corpus=corpus,
         fresh_empty=fresh_empty,
+        project=project,
         metadata_filters=metadata_filters,
         top_k=candidate_top_k,
         min_score=min_score,
@@ -9102,8 +9259,44 @@ def hybrid_search(
     tags_none: Optional[List[str]] = None,
     auto_rebuild: bool = True,
     follow: Optional[str] = None,
+    project: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Hybrid search; see hybrid_search_scored. Returns {score, memory} items
+    (the fused score), exactly as before the scored variant existed."""
+    return [
+        {k: v for k, v in item.items() if k != "cosine"}
+        for item in hybrid_search_scored(
+            conn, query, semantic_weight=semantic_weight, top_k=top_k,
+            min_score=min_score, metadata_filters=metadata_filters,
+            date_from=date_from, date_to=date_to, tags_any=tags_any,
+            tags_all=tags_all, tags_none=tags_none, auto_rebuild=auto_rebuild,
+            follow=follow, project=project,
+        )
+    ]
+
+
+def hybrid_search_scored(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    semantic_weight: float = 0.6,
+    top_k: int = 10,
+    min_score: float = 0.0,
+    metadata_filters: Optional[Dict[str, Any]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    tags_any: Optional[List[str]] = None,
+    tags_all: Optional[List[str]] = None,
+    tags_none: Optional[List[str]] = None,
+    auto_rebuild: bool = True,
+    follow: Optional[str] = None,
+    project: Optional[str] = None,
+    read_only: bool = False,
+    coverage: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Combine FTS keyword search and semantic vector search using Reciprocal Rank Fusion.
+
+    read_only / coverage: see semantic_search (the keyword leg only reads).
 
     Args:
         conn: Database connection
@@ -9138,12 +9331,15 @@ def hybrid_search(
         metadata_filters=metadata_filters,
         top_k=top_k * 3,
         min_score=None,  # Get all results, filter after fusion
-        auto_rebuild=auto_rebuild,
+        auto_rebuild=auto_rebuild and not read_only,
         date_from=date_from,
         date_to=date_to,
         tags_any=tags_any,
         tags_all=tags_all,
         tags_none=tags_none,
+        project=project,
+        read_only=read_only,
+        coverage=coverage,
     )
 
     # 2. Get keyword search results
@@ -9158,6 +9354,7 @@ def hybrid_search(
         tags_any=tags_any,
         tags_all=tags_all,
         tags_none=tags_none,
+        project=project,
     )
 
     # 3. Apply Reciprocal Rank Fusion (RRF)
@@ -9165,6 +9362,7 @@ def hybrid_search(
     rrf_k = 60
     scores: Dict[int, float] = {}
     memories_by_id: Dict[int, Dict[str, Any]] = {}
+    cosine_by_id: Dict[int, float] = {}
 
     # Score semantic results
     for rank, result in enumerate(semantic_results):
@@ -9172,6 +9370,7 @@ def hybrid_search(
         memory_id = memory["id"]
         memories_by_id[memory_id] = memory
         semantic_score = result.get("score", 0.0)
+        cosine_by_id[memory_id] = semantic_score
         # Combine RRF with original semantic score for better ranking
         rrf_contribution = semantic_weight / (rrf_k + rank)
         score_boost = semantic_weight * semantic_score * 0.1  # Small boost from actual similarity
@@ -9197,6 +9396,8 @@ def hybrid_search(
         results.append({
             "score": round(score, 4),
             "memory": memory,
+            # The semantic leg's raw cosine; None for a keyword-only hit.
+            "cosine": cosine_by_id.get(memory_id),
         })
 
     if follow:

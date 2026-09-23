@@ -1,0 +1,29 @@
+{
+  "name": "admission",
+  "description": "Too many API requests in flight: retry with backoff (transient).",
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/memora/search",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "query": "how does clmux use memora"
+    }
+  },
+  "response": {
+    "status": 429,
+    "body": {
+      "error": "admission",
+      "message": "too many API requests in flight"
+    }
+  },
+  "request_schema": "search_request.json",
+  "response_schema": "error_response.json",
+  "volatile": [],
+  "replay": {
+    "admission_full": true
+  },
+  "live": null
+}

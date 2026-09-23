@@ -13,6 +13,20 @@ from memora import health, storage
 from memora.storage import CURRENT_DB
 
 
+def _create_stores():
+    """Create every registered store (schema included) through the WRITING
+    path: readiness probes are read-only and never create a database."""
+    storage._registry_cache = None
+    storage._registry_source = None
+    for name in json.loads(os.environ["MEMORA_DATABASES"]):
+        token = CURRENT_DB.set(name)
+        try:
+            with storage.connect() as c:
+                c.commit()
+        finally:
+            CURRENT_DB.reset(token)
+
+
 @pytest.fixture(autouse=True)
 def _reset_health_state():
     """codex P1: module-global snapshot leaked BETWEEN tests and servers.
@@ -97,7 +111,7 @@ class TestReadinessIsPerDatabase:
     def test_probe_does_not_count_rows(self, monkeypatch):
         """codex: COUNT(*) is costlier AND unnecessary inventory leakage."""
         seen = []
-        real = storage.connect
+        real = storage.connect_without_schema
 
         class _Spy:
             def __init__(self, inner):
@@ -110,21 +124,21 @@ class TestReadinessIsPerDatabase:
             def __getattr__(self, k):
                 return getattr(self._i, k)
 
-        monkeypatch.setattr(storage, "connect", lambda *a, **k: _Spy(real(*a, **k)))
+        monkeypatch.setattr(storage, "connect_without_schema", lambda *a, **k: _Spy(real(*a, **k)))
         health.readiness_payload()
         assert seen, "no statement issued"
         assert not any("COUNT" in s.upper() for s in seen), seen
 
     def test_one_broken_database_does_not_hide_the_healthy_ones(self, monkeypatch):
         """The whole point: a slow D1 must show as THAT database degraded."""
-        real = storage.connect
+        real = storage.connect_without_schema
 
         def selective(*a, **k):
             if CURRENT_DB.get() == "beta":
                 raise RuntimeError("beta is unreachable")
             return real(*a, **k)
 
-        monkeypatch.setattr(storage, "connect", selective)
+        monkeypatch.setattr(storage, "connect_without_schema", selective)
         payload = health.readiness_payload()
 
         assert payload["status"] == "degraded"
@@ -138,7 +152,7 @@ class TestReadinessIsPerDatabase:
         def explode(*a, **k):
             raise RuntimeError("boom")
 
-        monkeypatch.setattr(storage, "connect", explode)
+        monkeypatch.setattr(storage, "connect_without_schema", explode)
         payload = health.readiness_payload()          # must not raise
         assert payload["status"] == "degraded"
         assert set(payload["degraded"]) == {"alpha", "beta"}
@@ -188,14 +202,14 @@ class TestEndpointsOverHttp:
                 CURRENT_DB.reset(token)
 
         if break_beta:
-            real = storage.connect
+            real = storage.connect_without_schema
 
             def selective(*a, **k):
                 if CURRENT_DB.get() == "beta":
                     raise RuntimeError("beta is unreachable")
                 return real(*a, **k)
 
-            monkeypatch.setattr(storage, "connect", selective)
+            monkeypatch.setattr(storage, "connect_without_schema", selective)
 
         app = FastMCP("health-probe", host="127.0.0.1", port=port)
         health.register_health_routes(app)
@@ -373,18 +387,19 @@ class TestAsyncPropertiesActuallyHold:
             "alpha": str(tmp_path / "a.db"), "beta": str(tmp_path / "b.db")}))
         monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
         monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+        _create_stores()
         storage._registry_cache = None
         storage._registry_source = None
         monkeypatch.setattr(health, "REFRESH_DEADLINE_S", 0.5)
 
-        real = storage.connect
+        real = storage.connect_without_schema
 
         def selective(*a, **k):
             if CURRENT_DB.get() == "alpha":
                 _t.sleep(5)          # hangs well past the deadline
             return real(*a, **k)
 
-        monkeypatch.setattr(storage, "connect", selective)
+        monkeypatch.setattr(storage, "connect_without_schema", selective)
         payload = health.readiness_payload()
 
         assert payload["databases"]["beta"]["status"] == "ok", (
@@ -576,19 +591,20 @@ class TestTimedOutProbesAreTrulyAbandoned:
             "alpha": str(tmp_path / "a.db"), "beta": str(tmp_path / "b.db")}))
         monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
         monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+        _create_stores()
         storage._registry_cache = None
         storage._registry_source = None
         monkeypatch.setattr(health, "REFRESH_DEADLINE_S", 0.4)
         health._inflight.clear()
 
-        real = storage.connect
+        real = storage.connect_without_schema
 
         def selective(*a, **k):
             if CURRENT_DB.get() == "alpha":
                 _t.sleep(sleep_s)
             return real(*a, **k)
 
-        monkeypatch.setattr(storage, "connect", selective)
+        monkeypatch.setattr(storage, "connect_without_schema", selective)
 
     def test_publication_happens_at_the_deadline_not_after_the_hang(
             self, monkeypatch, tmp_path):
@@ -696,6 +712,7 @@ class TestReadinessRefreshesWithoutAnAuthorisedCaller:
         monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": str(tmp_path / "a.db")}))
         monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
         monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+        _create_stores()
         storage._registry_cache = None
         storage._registry_source = None
         app = FastMCP("refresh-probe")
@@ -1006,6 +1023,7 @@ class TestPerDatabaseRouteAlsoSelfRefreshes:
         monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": str(tmp_path / "a.db")}))
         monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
         monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+        _create_stores()
         storage._registry_cache = None
         storage._registry_source = None
         monkeypatch.setattr(health, "REFRESH_INTERVAL_S", 0.05)

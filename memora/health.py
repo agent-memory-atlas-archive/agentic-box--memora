@@ -158,14 +158,18 @@ def _probe_one(name: Optional[str]) -> Dict[str, Any]:
     SELECT 1, not COUNT(*): readiness asks whether the store answers, and a
     row count is both costlier and unnecessary inventory to expose.
     """
-    from .storage import connect
+    # Read-only: no schema setup (it writes), and a missing local database is
+    # an error here, never created by a probe.
+    from .storage import connect_without_schema
 
     started = time.time()
     token = CURRENT_DB.set(name) if name is not None else None
     try:
-        conn = connect()
+        conn = connect_without_schema()
         try:
-            conn.execute("SELECT 1").fetchone()
+            # One row at most, never a count: proves the store answers AND
+            # has its schema (a store without one fails here).
+            conn.execute("SELECT 1 FROM memories LIMIT 1").fetchone()
         finally:
             conn.close()
         return {"status": "ok", "latency_ms": round((time.time() - started) * 1000, 1)}

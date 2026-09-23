@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "memora-api/v1/search_response.json",
+  "title": "POST /api/v1/{store}/search 200",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "count",
+    "mode",
+    "embedding_model",
+    "results",
+    "unscored",
+    "took_ms"
+  ],
+  "properties": {
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "mode": {
+      "const": "hybrid-v1"
+    },
+    "embedding_model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "results": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "created_at",
+          "tags",
+          "preview",
+          "cosine",
+          "fused",
+          "rank"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "preview": {
+            "type": "string",
+            "maxLength": 400
+          },
+          "cosine": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": -1,
+            "maximum": 1,
+            "description": "Raw cosine from the semantic leg; null for a keyword-only hit. The only relevance signal."
+          },
+          "fused": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Rank-fusion score: an ORDER, not a relevance. Never threshold it."
+          },
+          "rank": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "1-based position in results (by fused)."
+          }
+        }
+      }
+    },
+    "took_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "unscored": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Rows this search could not score: missing a vector (never repaired by this read-only route) or certified empty. Coverage signal, not an error."
+    }
+  }
+}

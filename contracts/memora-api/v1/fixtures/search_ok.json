@@ -1,0 +1,74 @@
+{
+  "name": "search_ok",
+  "description": "Hybrid search with semantic hits. Filter on cosine only; present in fused order.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/memora/search",
+    "headers": {
+      "Authorization": "Bearer memora-api-v1-test-token",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "query": "how does clmux use memora",
+      "top_k": 3,
+      "preview_chars": 200
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "count": 3,
+      "mode": "hybrid-v1",
+      "embedding_model": "bge-m3",
+      "results": [
+        {
+          "id": 1182,
+          "created_at": "2026-09-23 09:12:04",
+          "tags": [
+            "clmux/architecture",
+            "landing"
+          ],
+          "preview": "clmuxd owns memora access: agents never call memora directly; reads happen at dispatch and writes at landing.",
+          "cosine": 0.6243,
+          "fused": 0.0475,
+          "rank": 1
+        },
+        {
+          "id": 1175,
+          "created_at": "2026-09-22 18:40:51",
+          "tags": [
+            "memora/absorb"
+          ],
+          "preview": "memora absorb gates every supersession per leaf: similarity floor 0.55 plus an LLM check on the exact memory.",
+          "cosine": 0.5118,
+          "fused": 0.0405,
+          "rank": 2
+        },
+        {
+          "id": 1093,
+          "created_at": "2026-09-19 07:02:13",
+          "tags": [
+            "clmux/research"
+          ],
+          "preview": "The daemon's sidebar shows memora health from /health/db/<store>.",
+          "cosine": 0.3876,
+          "fused": 0.0328,
+          "rank": 3
+        }
+      ],
+      "unscored": 0,
+      "took_ms": 212
+    }
+  },
+  "request_schema": "search_request.json",
+  "response_schema": "search_response.json",
+  "volatile": [
+    "took_ms"
+  ],
+  "replay": {
+    "search_hits": "response"
+  },
+  "live": {
+    "compare": "schema"
+  }
+}
