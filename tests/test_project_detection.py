@@ -1533,3 +1533,24 @@ def test_export_import_round_trip_of_a_legacy_typed_issue(db, projects):
         assert storage.import_memories(conn, [dict(entry, project="clmux")], strategy="replace")["replaced"] is True
         (restored,) = storage.list_memories(conn, limit=-1)
         assert restored["tags"] == ["clmux/issues"] and restored["metadata"]["project"] == "clmux"
+
+
+@pytest.mark.parametrize("strategy", ["append", "replace"])
+def test_an_import_with_a_forged_typed_tag_prefix_is_refused(db, projects, strategy):
+    """Only the OLD DEFAULT memora/<kind> is a legacy exception; any other
+    prefix on a no-project memory is a forged system tag."""
+    projects(["memora", "clmux", "acebar", "pi"])
+    with storage.connect() as conn:
+        _legacy_issue(conn)  # the store already holds one memory
+        before = [m["id"] for m in storage.list_memories(conn, limit=-1)]
+        forged = {"content": "forged typed tag", "tags": ["evil/issues"], "system_tags": ["evil/issues"],
+                  "metadata": {"type": "issue"}}
+        result = storage.import_memories(conn, [forged], strategy=strategy)
+        assert result["imported"] == 0 and result["total_errors"] == 1
+        assert "invalid system tag" in result["errors"][0]["error"]
+        if strategy == "replace":
+            assert result["replaced"] is False
+        assert [m["id"] for m in storage.list_memories(conn, limit=-1)] == before  # nothing written
+        # The old default itself is still accepted.
+        ok = dict(forged, content="old default typed tag", tags=["memora/issues"], system_tags=["memora/issues"])
+        assert storage.import_memories(conn, [ok])["imported"] == 1

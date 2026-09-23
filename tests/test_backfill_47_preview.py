@@ -103,3 +103,39 @@ def test_preview_skips_import_pending_rows(store, tmp_path):
     preview.main(["--out", str(out)])
     data = json.loads(out.read_text())
     assert data["contradictions"] == [] and data["keyword_only"] == []
+
+
+def test_preview_refuses_a_local_wal_store_in_use_and_creates_nothing(store, tmp_path, monkeypatch):
+    import sqlite3
+
+    writer = sqlite3.connect(store)  # another process's writer, in effect
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("INSERT INTO memories (content) VALUES ('x')")
+    writer.commit()
+    try:
+        before = sorted(os.listdir(store.parent))
+        assert f"{store.name}-wal" in before and f"{store.name}-shm" in before
+        with pytest.raises(SystemExit) as exc:
+            preview.main(["--out", str(tmp_path / "never.json")])
+        assert exc.value.code != 0 and "store in use by a writer" in str(exc.value.code)
+        assert sorted(os.listdir(store.parent)) == before and not (tmp_path / "never.json").exists()
+    finally:
+        writer.close()
+    # Writer gone (no sidecars): read immutably, nothing created.
+    assert sorted(os.listdir(store.parent)) == [store.name]
+    out = tmp_path / "out"
+    out.mkdir()
+    assert preview.main(["--out", str(out / "p.json")]) == 0
+    assert sorted(os.listdir(store.parent)) == [store.name, "out"]
+
+
+def test_preview_reads_only_the_header(store, tmp_path, monkeypatch):
+    from pathlib import Path
+
+    def no_whole_file(self):
+        raise AssertionError("read the whole database")
+
+    monkeypatch.setattr(Path, "read_bytes", no_whole_file)
+    out = tmp_path / "out"
+    out.mkdir()
+    assert preview.main(["--out", str(out / "p.json")]) == 0

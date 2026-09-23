@@ -1405,6 +1405,8 @@ _SYSTEM_KIND_TYPES: Dict[str, frozenset] = {
 # what a memory IS, not which project it belongs to -- the old default put
 # memora/issues on every issue -- so it is never project evidence.
 _TYPED_TAG_KINDS = frozenset(_SYSTEM_KIND_TYPES) | {"knowledge"}
+# The prefix every typed tag got before issue #47, whatever the memory's project.
+_LEGACY_TYPED_PREFIX = "memora"
 
 
 def _typed_tag_kind(tag: Any) -> Optional[str]:
@@ -1436,10 +1438,11 @@ def _system_typed_tags(
     import re-applying an export's system_tags field); public entry dicts
     cannot carry them.
 
-    legacy_prefix_ok (import only): with NO resolved project, a stored
-    "<other project>/<kind>" (e.g. the old default memora/issues) is kept as
-    it is -- typed tags are not project evidence, so there is nothing to
-    re-prefix it to yet (see _retarget_typed_tags).
+    legacy_prefix_ok (import only): with NO resolved project, the old
+    default "memora/<kind>" is kept as it is -- typed tags are not project
+    evidence, so there is nothing to re-prefix it to yet (see
+    _retarget_typed_tags). Bare "<kind>" is the regular no-project form. Any
+    other prefix is refused.
     """
     mtype = metadata.get("type") if isinstance(metadata, Mapping) else None
     out: List[str] = []
@@ -1448,8 +1451,9 @@ def _system_typed_tags(
             raise ValueError(f"invalid system tag {tag!r}")
         kind = tag.split("/", 1)[1] if "/" in tag else tag
         expected = project_tag(project, kind)
-        legacy = (legacy_prefix_ok and project is None and "/" in tag
-                  and _typed_tag_kind(tag) == kind)
+        # Only the OLD DEFAULT form (memora/<kind>) is a legacy exception;
+        # any other prefix is a forged system tag.
+        legacy = (legacy_prefix_ok and project is None and tag == f"{_LEGACY_TYPED_PREFIX}/{kind}")
         if kind not in _SYSTEM_KIND_TYPES or (tag != expected and not legacy):
             raise ValueError(f"invalid system tag {tag!r} (expected {expected!r})")
         if mtype not in _SYSTEM_KIND_TYPES[kind]:

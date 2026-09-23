@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Issue #47 backfill PREVIEW with an explicit approval list. READ-ONLY.
 
-Writes NOTHING to the store: it opens it read-only (a local SQLite store in
-SQLite read-only mode, or immutable for a WAL file with no sidecars; D1
-through a raw connection with no schema pass) and runs SELECTs only. Its
+Writes NOTHING and creates nothing; it may REFUSE. A local SQLite store opens
+read-only (mode=ro, or immutable for a WAL file with no sidecars); a local
+WAL store WITH sidecars is in use by a writer process and is refused (exit
+non-zero: stop the server, or use --db against D1). D1 opens through a raw
+connection with no schema pass. SELECTs only. Its
 output is a preview FILE the user reviews: every row carries
 "approved": false, and a later apply step (a separate item) may act only on
 rows the user flipped to true.
@@ -57,17 +59,34 @@ from memora import storage  # noqa: E402
 from memora.backends import LocalSQLiteBackend  # noqa: E402
 
 
+class StoreInUse(SystemExit):
+    pass
+
+
 def open_read_only():
-    """A connection that cannot write and creates nothing (see module doc)."""
+    """A connection that cannot write and creates nothing -- or a refusal.
+
+    Local SQLite: a WAL database with a -wal or -shm present has a writer in
+    another process (e.g. the memora server): reading it would need its
+    locks, and if that writer closed between our check and our open the read
+    would recreate its sidecars. So it is REFUSED. With no sidecars it opens
+    immutable (no locks, nothing created); a rollback-journal database opens
+    mode=ro. D1 and others: a raw connection with no schema pass.
+    Guarantee: creates nothing, may refuse.
+    """
     backend = storage.current_backend()
     if isinstance(backend, LocalSQLiteBackend):
         path = backend.db_path
         if not path.is_file():
             raise SystemExit(f"no database at {path}")
-        header = path.read_bytes()[:20]
+        with open(path, "rb") as fh:
+            header = fh.read(20)  # only the header, never the whole database
         wal = len(header) >= 20 and (header[18] == 2 or header[19] == 2)
-        sidecars = Path(f"{path}-wal").exists() or Path(f"{path}-shm").exists()
-        params = "mode=ro&immutable=1" if wal and not sidecars else "mode=ro"
+        if wal and (Path(f"{path}-wal").exists() or Path(f"{path}-shm").exists()):
+            raise StoreInUse(
+                f"store in use by a writer ({path} has WAL sidecars); stop the server, "
+                "or use --db against D1")
+        params = "mode=ro&immutable=1" if wal else "mode=ro"
         return sqlite3.connect(f"file:{quote(str(path.resolve()))}?{params}", uri=True)
     return backend.connect()  # D1 and others: a raw connection, no schema pass
 
