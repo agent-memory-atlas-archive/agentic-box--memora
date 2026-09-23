@@ -12,6 +12,13 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## Unreleased
+
+### Absorb: a supersession never crosses memory types
+- Absorb could let a plain narrative fact supersede an open todo when the verifier judged the fact to "reiterate and confirm" it, so the task vanished from `follow="active"` lists (memora issue memory 1126: #1122 superseded open todo #1118). The per-leaf supersede gate now checks the **type boundary first**, before the similarity floor and without an LLM call: a leaf whose `metadata.type` (`todo`, `issue`, `section`, `document_root`, `document_fragment`, or none for a plain memory) differs from the new fact's (the absorb call's `metadata.type`) is downgraded to a related link. The decision's `supersede_check` and `leaf_checks` report `gate: "type"`, `type_mismatch: true`, `old_type` and `new_type`.
+- The same rule applies to the concurrent-sibling (fork heal) pair check: siblings of different types never collapse.
+- For a same-type pair the supersede verifier now sees both sides' type.
+
 ## 0.4.5
 
 Project identity is explicit (issue #47), and the import hardening that fixing
