@@ -1008,7 +1008,7 @@ def test_live_import_rows_survive_a_sweep_past_the_age_bound(fake_d1_backend, mo
         assert all(s["live_lease"] >= 1 for s in sweeps)
         assert _contents(conn) == ["new row 0", "new row 1", "new row 2"]
         assert set(result["written_ids"]) <= _embedded_ids(conn)
-        assert conn.execute("SELECT COUNT(*) FROM import_inflight").fetchone()[0] == 0  # released
+        assert conn.execute("SELECT COUNT(*) FROM import_lease").fetchone()[0] == 0  # released
 
 
 class _Crash(BaseException):
@@ -1030,7 +1030,7 @@ def test_rows_of_a_crashed_import_are_swept_once_its_lease_expires(fake_d1_backe
         # A crash mid-import: row 0 complete, row 1 inserted without its vector.
         # (The lease release in `finally` still runs on an exception; a real
         # death does not, so drop the release for this simulation.)
-        monkeypatch.setattr(storage, "_end_import_lease", lambda c, i: None)
+        monkeypatch.setattr(storage._ImportLease, "release", lambda self: None)
         with pytest.raises(_Crash):
             storage.import_memories(conn, NEW[:2])
         monkeypatch.undo()
@@ -1042,7 +1042,7 @@ def test_rows_of_a_crashed_import_are_swept_once_its_lease_expires(fake_d1_backe
         swept = storage.sweep_import_markers(conn, now=time.time() + storage.IMPORT_LEASE_SECONDS + 60)
         assert swept["removed"] == 1 and swept["failed"] == []
         assert _contents(conn) == ["new row 0"]
-        assert conn.execute("SELECT COUNT(*) FROM import_inflight").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM import_lease").fetchone()[0] == 0
 
 
 def test_rows_marked_by_an_import_without_a_lease_are_stale_by_age(fake_d1_backend):
@@ -1097,22 +1097,33 @@ def test_no_lease_no_write(fake_d1_backend, monkeypatch):
     monkeypatch.setattr(memora, "TAG_WHITELIST", set())
     with storage.connect() as conn:
         before = _setup_previous(conn)
-        conn.fail_when = lambda sql, params: "import_inflight" in sql and sql.lstrip().startswith("INSERT")
+        conn.fail_when = lambda sql, params: "import_lease" in sql and sql.lstrip().startswith("INSERT")
         result = storage.import_memories(conn, NEW, strategy="replace")
         conn.fail_when = None
         assert result["replaced"] is False and result["imported"] == 0
+        assert result["error"] == "import_lease_unavailable"
         assert _contents(conn) == before  # nothing cleared, nothing written
 
 
 def test_heartbeat_failure_stops_the_import(fake_d1_backend, monkeypatch):
     monkeypatch.setattr(memora, "TAG_WHITELIST", set())
-    monkeypatch.setattr(storage, "_IMPORT_HEARTBEAT_S", 0)
+    monkeypatch.setattr(storage, "_IMPORT_HEARTBEAT_S", 0)  # renew at every fence
     with storage.connect() as conn:
-        _fail_nth(conn, lambda sql: sql.lstrip().startswith("UPDATE import_inflight"), 2)
+        real_upsert, armed = storage._upsert_embedding, {"on": False, "n": 0}
+
+        def upsert(c, mid, vec):
+            armed["n"] += 1
+            armed["on"] = armed["n"] == 2  # renewals fail from row two's strip on
+            return real_upsert(c, mid, vec)
+
+        monkeypatch.setattr(storage, "_upsert_embedding", upsert)
+        conn.fail_when = lambda sql, params: armed["on"] and sql.lstrip().startswith("UPDATE import_lease SET lease_until")
         result = storage.import_memories(conn, NEW)
         conn.fail_when = None
+        monkeypatch.undo()
         assert result["imported"] == 1 and "lease lost" in result["errors"][0]["error"]
-        assert _contents(conn) == ["new row 0"]
+        assert len(result["written_ids"]) == 1 and result["left_marked"][0]["id"] not in result["written_ids"]
+        assert _contents(conn) == ["new row 0", "new row 1"]  # row 1 left marked for the sweep; row 2 never written
 
 
 def test_markers_carry_a_per_row_time(fake_d1_backend, monkeypatch):
@@ -1209,3 +1220,137 @@ def test_a_strip_that_does_not_apply_is_never_counted(fake_d1_backend, monkeypat
         monkeypatch.undo()
         assert result["imported"] == 0 and result["written_ids"] == []
         assert "marker strip did not apply" in result["errors"][0]["error"]
+
+
+# --- round 9: one lease per store, fenced renewal and ownership (7106) ---
+
+NEW_B = [{"content": f"b row {i}", "tags": ["plan"]} for i in range(2)]
+
+
+def test_a_second_import_on_the_same_store_is_refused_while_the_first_runs(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        _setup_previous(conn)
+        real_upsert, during = storage._upsert_embedding, {}
+
+        def upsert(c, mid, vec):
+            if "b" not in during:  # A is mid-row: B tries a replace of its own
+                during["b"] = storage.import_memories(conn, NEW_B, strategy="replace")
+                during["b_append"] = storage.import_memories(conn, NEW_B, strategy="append")
+            return real_upsert(c, mid, vec)
+
+        monkeypatch.setattr(storage, "_upsert_embedding", upsert)
+        a = storage.import_memories(conn, NEW, strategy="replace")
+        monkeypatch.setattr(storage, "_upsert_embedding", real_upsert)
+        for refused in (during["b"], during["b_append"]):
+            assert refused["error"] == "import_in_progress" and refused["imported"] == 0
+            assert "nothing was written" in refused["message"]
+        assert during["b"]["replaced"] is False
+        assert a["replaced"] is True and a["total_errors"] == 0
+        assert _contents(conn) == ["new row 0", "new row 1", "new row 2"]  # not mixed
+        assert set(a["written_ids"]) == {m["id"] for m in storage.list_memories(conn, limit=-1)}
+        # After A released the lease, B runs.
+        b = storage.import_memories(conn, NEW_B, strategy="replace")
+        assert b["replaced"] is True, b
+        assert _contents(conn) == ["b row 0", "b row 1"]
+
+
+def test_renewal_of_an_expired_lease_is_refused(fake_d1_backend):
+    with storage.connect() as conn:
+        lease = storage._ImportLease(conn, "a" * 32)
+        lease.acquire()
+        conn.execute("UPDATE import_lease SET lease_until = '2000-01-01 00:00:00'")
+        with pytest.raises(storage.ImportLeaseLostError):
+            lease.renew()
+        assert conn.execute("SELECT lease_until FROM import_lease").fetchone()[0] == "2000-01-01 00:00:00"
+        with pytest.raises(storage.ImportLeaseLostError):
+            lease.fence()
+        # An expired lease can be taken over by the next import.
+        other = storage._ImportLease(conn, "b" * 32)
+        other.acquire()
+        with pytest.raises(storage.ImportLeaseLostError):
+            lease.renew()  # and the old owner can never take it back
+        assert conn.execute("SELECT owner FROM import_lease").fetchone()[0] == "b" * 32
+
+
+def test_a_paused_importer_whose_lease_expired_is_refused_on_resume(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        real_upsert, calls = storage._upsert_embedding, {"n": 0}
+
+        def pause_on_second_row(c, mid, vec):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                # The importer stalls past its lease; the sweep acts meanwhile.
+                conn.execute("UPDATE import_lease SET lease_until = '2000-01-01 00:00:00'")
+                swept = storage.sweep_import_markers(conn, now=time.time() + 601)
+                assert swept["removed"] == 1  # row 1: marked, not yet embedded
+            return real_upsert(c, mid, vec)
+
+        monkeypatch.setattr(storage, "_upsert_embedding", pause_on_second_row)
+        result = storage.import_memories(conn, NEW)
+        monkeypatch.undo()
+        assert result["imported"] == 1 and len(result["written_ids"]) == 1
+        assert "lease lost" in result["errors"][0]["error"] and "wrote nothing further" in result["message"]
+        assert _contents(conn) == ["new row 0"]  # row 1 swept, row 2 never written
+        assert conn.execute("SELECT COUNT(*) FROM import_lease").fetchone()[0] == 0  # not resurrected
+
+
+def test_ownership_is_checked_before_each_clear_stage(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        before = _setup_previous(conn)
+        embedded_before = _embedded_ids(conn)
+        real_execute = conn.execute
+
+        def execute(sql, params=None):
+            cur = real_execute(sql, params)
+            if sql.strip() == "DELETE FROM memories_crossrefs":
+                real_execute("UPDATE import_lease SET owner = 'intruder'")  # the lease is taken
+            return cur
+
+        monkeypatch.setattr(conn, "execute", execute)
+        result = storage.import_memories(conn, NEW, strategy="replace")
+        monkeypatch.undo()
+        assert result["replaced"] == "partial" and result["clear_stage"] == "embeddings"
+        assert "lease lost" in result["errors"][0]["error"] and result["written_ids"] == []
+        assert _contents(conn) == before and _embedded_ids(conn) == embedded_before  # nothing further cleared
+
+
+def test_a_row_completed_just_before_the_lease_is_lost_is_reported_apart(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        real_execute = conn.execute
+
+        def execute(sql, params=None):
+            cur = real_execute(sql, params)
+            if sql.lstrip().startswith("SELECT metadata FROM memories WHERE id = ?"):  # the strip read-back
+                real_execute("UPDATE import_lease SET owner = 'intruder'")
+            return cur
+
+        monkeypatch.setattr(conn, "execute", execute)
+        result = storage.import_memories(conn, NEW[:1])
+        monkeypatch.undo()
+        assert result["imported"] == 0 and result["written_ids"] == []
+        [done] = result["unconfirmed_ids"]
+        assert storage.get_memory(conn, done)["content"] == "new row 0"
+        assert "unconfirmed_ids" in result["message"]
+
+
+def test_ownership_is_checked_before_each_row_insert(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        real_marker, calls = storage._import_marker, {"n": 0}
+
+        def marker(import_id, started, index):
+            calls["n"] += 1
+            if calls["n"] == 2:  # between row 0 (counted) and row 1's INSERT
+                conn.execute("UPDATE import_lease SET owner = 'intruder'")
+            return real_marker(import_id, started, index)
+
+        monkeypatch.setattr(storage, "_import_marker", marker)
+        result = storage.import_memories(conn, NEW)
+        monkeypatch.setattr(storage, "_import_marker", real_marker)
+        assert result["imported"] == 1 and "lease lost" in result["errors"][0]["error"]
+        assert "left_marked" not in result
+        assert _contents(conn) == ["new row 0"]  # row 1 was never inserted

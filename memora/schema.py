@@ -133,7 +133,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_updated_at_column(conn)
     _ensure_tombstones_table(conn)
     _ensure_absorb_inflight_table(conn)
-    _ensure_import_inflight_table(conn)
+    _ensure_import_lease_table(conn)
 
 
 def _ensure_fts(conn: sqlite3.Connection) -> None:
@@ -397,17 +397,19 @@ def _ensure_absorb_inflight_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _ensure_import_inflight_table(conn: sqlite3.Connection) -> None:
-    """Live D1 imports (memora.storage._import_write_d1): one row per import
-    id, heartbeated while it runs. The import-marker sweep never touches a
-    row whose import holds a live lease, however old its marker."""
+def _ensure_import_lease_table(conn: sqlite3.Connection) -> None:
+    """The store's import lease (memora.storage._ImportLease): at most ONE
+    row, so at most one D1 import runs on a store at a time. The row lives in
+    the store's own database, so its fixed key is per store by construction.
+    The import-marker sweep never touches rows of the import holding a live
+    lease."""
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS import_inflight (
-            import_id TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS import_lease (
+            lease_key TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
             started_at TEXT NOT NULL,
-            lease_until TEXT NOT NULL,
-            owner TEXT
+            lease_until TEXT NOT NULL
         )
         """
     )

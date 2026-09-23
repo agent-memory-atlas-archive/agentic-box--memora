@@ -9518,7 +9518,46 @@ def import_memories(
     """
     if strategy not in ("replace", "merge", "append"):
         raise ValueError("strategy must be 'replace', 'merge', or 'append'")
+    if not isinstance(conn, D1Connection):
+        # Local SQLite: one transaction (the SQLite write lock serialises it).
+        return _import_memories_body(conn, data, strategy, None)
 
+    # D1: every strategy runs under the store's single import lease, taken
+    # before the sweep, the merge read and preparation. A second import on
+    # this store fails fast and writes nothing (no waiting).
+    import uuid as _uuid
+
+    lease = _ImportLease(conn, _uuid.uuid4().hex)
+    try:
+        lease.acquire()
+    except Exception as exc:
+        busy = isinstance(exc, ImportLeaseBusyError)
+        result: Dict[str, Any] = {
+            "imported": 0,
+            "skipped": 0,
+            "errors": [{"index": None, "error": str(exc)}],
+            "total_errors": 1,
+            "error": "import_in_progress" if busy else "import_lease_unavailable",
+            "message": (
+                f"another import is running on this store ({exc}); nothing was written. "
+                "Retry after it finishes." if busy else
+                f"import not started: the store's import lease could not be taken ({exc}); "
+                "nothing was written."
+            ),
+        }
+        if strategy == "replace":
+            result["replaced"] = False
+        return result
+    try:
+        return _import_memories_body(conn, data, strategy, lease)
+    finally:
+        try:
+            lease.release()
+        except Exception as exc:  # it simply expires
+            logger.error("import: could not release the store's import lease: %s", exc)
+
+
+def _import_memories_body(conn, data, strategy, lease: Optional["_ImportLease"]) -> Dict[str, Any]:
     # Rows a previous, no-longer-running import left marked (crash, failed
     # cleanup): complete or remove them first. Never fatal to this import.
     try:
@@ -9540,6 +9579,16 @@ def import_memories(
 
     prepared_rows: List[Tuple[str, Optional[str], str, Optional[str], Dict[str, float]]] = []
     for idx, entry in enumerate(data):
+        if lease is not None:
+            try:
+                lease.fence()  # preparation can be slow (embeddings): keep the lease
+            except ImportLeaseLostError as exc:
+                result = {"imported": 0, "skipped": skipped, "total_errors": 1,
+                          "errors": [{"index": idx, "error": f"import lease lost: {exc}"}],
+                          "message": "import stopped while preparing: nothing was written"}
+                if strategy == "replace":
+                    result["replaced"] = False
+                return result
         try:
             content = entry.get("content", "").strip()
             if not content:
@@ -9609,7 +9658,7 @@ def import_memories(
     if transactional:
         outcome = _import_write_transactional(conn, prepared_rows, strategy)
     else:
-        outcome = _import_write_d1(conn, prepared_rows, strategy)
+        outcome = _import_write_d1(conn, prepared_rows, strategy, lease)
     imported = outcome["imported"]
     errors.extend(outcome["errors"])
 
@@ -9631,13 +9680,14 @@ def import_memories(
     }
     if strategy == "replace":
         result["replaced"] = outcome["replaced"]
-        for key in ("failed", "written_ids", "clear_stage", "message", "orphan_ids"):
+        for key in ("failed", "written_ids", "clear_stage", "message", "orphan_ids", "left_marked",
+                    "unconfirmed_ids"):
             if key in outcome:
                 result[key] = outcome[key]
     else:
         if "written_ids" in outcome:
             result["written_ids"] = outcome["written_ids"]
-        for key in ("failed", "message", "orphan_ids"):
+        for key in ("failed", "message", "orphan_ids", "left_marked", "unconfirmed_ids"):
             if key in outcome and outcome.get("errors"):
                 result[key] = outcome[key]
     if sweep.get("scanned") or sweep.get("error"):
@@ -9722,34 +9772,7 @@ def _with_attempts(fn):
     return None, last_error
 
 
-def _import_write_d1(conn, prepared_rows, strategy) -> Dict[str, Any]:
-    """D1 import under a live lease (import_inflight), taken BEFORE anything
-    is cleared or written and released at the end. While it is heartbeated,
-    the import-marker sweep leaves this import's rows alone, however long the
-    import runs. If the lease cannot be taken, nothing is written."""
-    import uuid as _uuid
-
-    import_id = _uuid.uuid4().hex
-    _result, error = _with_attempts(lambda: _begin_import_lease(conn, import_id))
-    if error is not None:
-        return {
-            "imported": 0,
-            "replaced": False,
-            "failed": len(prepared_rows),
-            "written_ids": [],
-            "errors": [{"index": None, "error": f"could not take the import lease: {error}"}],
-            "message": "import not started: the import lease could not be taken; the store is unchanged",
-        }
-    try:
-        return _import_write_d1_leased(conn, prepared_rows, strategy, import_id)
-    finally:
-        try:
-            _end_import_lease(conn, import_id)
-        except Exception as exc:  # the lease simply expires
-            logger.error("import: could not release lease %s: %s", import_id, exc)
-
-
-def _import_write_d1_leased(conn, prepared_rows, strategy, import_id: str) -> Dict[str, Any]:
+def _import_write_d1(conn, prepared_rows, strategy, lease: "_ImportLease") -> Dict[str, Any]:
     """D1 (no transactions: every statement autocommits). NOT ATOMIC.
 
     replace clears the store in stages (_REPLACE_CLEAR_STAGES: crossrefs,
@@ -9764,8 +9787,12 @@ def _import_write_d1_leased(conn, prepared_rows, strategy, import_id: str) -> Di
     before its first INSERT), stripped once the row is complete -- by a
     compare-and-set on the marker, then read back: a row found removed (e.g.
     by a sweep) is inserted again, and never counted until it is verified
-    complete. The lease is heartbeated at least every _IMPORT_HEARTBEAT_S;
-    a heartbeat that fails stops the import like a failing row. Only after an INSERT attempt failed is a row carrying THAT
+    complete. The store's lease (acquired by import_memories) is FENCED --
+    renewed when due, then ownership proven by a fresh read -- before each
+    clear stage, before each row's INSERT, before the strip and before the
+    row is counted. A lost lease stops the import at once: nothing further is
+    written (not even cleanup), written_ids is exact, and a row this import
+    left marked is reported in left_marked for the sweep. Only after an INSERT attempt failed is a row carrying THAT
     marker adopted (its commit landed, its response was lost) instead of
     inserted again; a pre-existing memory can never be adopted, because it
     cannot carry this import's marker. A row that still fails is removed only
@@ -9776,11 +9803,48 @@ def _import_write_d1_leased(conn, prepared_rows, strategy, import_id: str) -> Di
     the previous contents are gone; recover by re-running the import from
     the export file). A replace is never reported as done with errors.
     """
+    import_id = lease.import_id
+    written: List[int] = []
+
+    def lease_lost(index, exc, memory_id=None, marker=None, stage=None, completed=False):
+        outcome = {
+            "imported": len(written),
+            "replaced": "partial" if strategy == "replace" else False,
+            "failed": len(prepared_rows) - (index or 0),
+            "written_ids": list(written),
+            "errors": [{"index": index, "error": f"import lease lost: {exc}"}],
+        }
+        if stage is not None:
+            outcome["clear_stage"] = stage
+        note = ""
+        if memory_id is not None and completed:
+            # Verified complete (marker stripped), but ownership could not be
+            # proven before counting: a normal memory, reported apart.
+            outcome["unconfirmed_ids"] = [memory_id]
+            note = ("; the row in unconfirmed_ids was completed (it is a normal memory) just "
+                    "before the lease was lost, so it is reported apart from written_ids")
+        elif memory_id is not None:
+            outcome["left_marked"] = [{"id": memory_id, "marker": marker}]
+            note = ("; the row in left_marked is still marked (hidden from reads) and is "
+                    "completed or removed by the import-marker sweep")
+        outcome["message"] = (
+            "D1 import stopped: it lost the store's import lease, so it wrote nothing further; "
+            "this import added exactly the rows in written_ids" + note + (
+                ". The previous contents may already be (partly) deleted: recover by re-running "
+                "the import from the export file." if strategy == "replace" else "."
+            )
+        )
+        return outcome
+
     if strategy == "replace":
         fts = _fts_enabled(conn)
         for index, (stage, sql) in enumerate(_REPLACE_CLEAR_STAGES):
             if stage == "fts" and not fts:
                 continue
+            try:
+                lease.fence()
+            except ImportLeaseLostError as exc:
+                return lease_lost(None, exc, stage=stage)
             _result, error = _with_attempts(lambda sql=sql: conn.execute(sql))
             if error is not None:
                 remaining = [name for name, _sql in _REPLACE_CLEAR_STAGES[index:]]
@@ -9799,38 +9863,20 @@ def _import_write_d1_leased(conn, prepared_rows, strategy, import_id: str) -> Di
                     ),
                 }
 
-    written: List[int] = []
-    heartbeat_at = time.monotonic()
     for index, (content, metadata_json, tags_json, created_at, vector) in enumerate(prepared_rows):
-        if time.monotonic() - heartbeat_at >= _IMPORT_HEARTBEAT_S:
-            _result, error = _with_attempts(lambda: _touch_import_lease(conn, import_id))
-            if error is not None:
-                return {
-                    "imported": len(written),
-                    "replaced": "partial" if strategy == "replace" else False,
-                    "failed": len(prepared_rows) - index,
-                    "written_ids": written,
-                    "errors": [{"index": index, "error": f"import lease lost: {error}"}],
-                    "message": (
-                        "D1 import is not atomic: stopped because its lease could not be renewed; "
-                        "this import added exactly the rows in written_ids" + (
-                            " (the previous contents were already deleted). Recover by re-running "
-                            "the import from the export file." if strategy == "replace" else "."
-                        )
-                    ),
-                }
-            heartbeat_at = time.monotonic()
         marker = _import_marker(import_id, int(time.time()), index)
         meta = json.loads(metadata_json) if metadata_json else {}
         meta[_IMPORT_MARKER_KEY] = marker
         marked_json = json.dumps(meta, ensure_ascii=False)
         memory_id: Optional[int] = None
+        stripped = False
         last_error: Optional[Exception] = None
         for _attempt in range(_IMPORT_WRITE_ATTEMPTS):
             try:
                 if memory_id is None:
                     memory_id = _import_find_marked(conn, marker)  # lost response of a previous attempt
                 if memory_id is None:
+                    lease.fence()
                     if created_at:
                         cur = conn.execute(
                             "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
@@ -9844,6 +9890,7 @@ def _import_write_d1_leased(conn, prepared_rows, strategy, import_id: str) -> Di
                     memory_id = int(cur.lastrowid)
                 _fts_upsert(conn, memory_id, content, metadata_json, tags_json)
                 _upsert_embedding(conn, memory_id, vector)
+                lease.fence()
                 conn.execute(
                     f"UPDATE memories SET metadata = ? WHERE id = ? "
                     f"AND json_extract(metadata, '$.{_IMPORT_MARKER_KEY}') = ?",
@@ -9855,12 +9902,21 @@ def _import_write_d1_leased(conn, prepared_rows, strategy, import_id: str) -> Di
                     raise RuntimeError("the row was removed before the import completed it")
                 if _import_pending(_row_field(check, 0, "metadata")):
                     raise RuntimeError("the marker strip did not apply")
+                stripped = True
+                lease.fence()
                 written.append(memory_id)
                 last_error = None
                 break
+            except ImportLeaseLostError as exc:
+                # Stop at once: no cleanup, no further statement of this import.
+                return lease_lost(index, exc, memory_id, marker, completed=stripped)
             except Exception as exc:
                 last_error = exc
         if last_error is not None:
+            try:
+                lease.fence()  # the cleanup DELETE is destructive too
+            except ImportLeaseLostError as exc:
+                return lease_lost(index, exc, memory_id, marker)
             orphan = _import_remove_marked(conn, marker)
             outcome = {
                 "imported": len(written),
@@ -9962,41 +10018,110 @@ _IMPORT_HEARTBEAT_S = 30
 
 
 class ImportLeaseLostError(RuntimeError):
-    """The import no longer holds its import_inflight row."""
+    """The import no longer holds the store's lease: it must stop at once."""
 
 
-def _begin_import_lease(conn, import_id: str) -> None:
-    now = _absorb_now()
-    conn.execute(
-        "INSERT OR IGNORE INTO import_inflight (import_id, started_at, lease_until, owner) VALUES (?, ?, ?, ?)",
-        (import_id, _absorb_format_ts(now),
-         _absorb_format_ts(now + timedelta(seconds=IMPORT_LEASE_SECONDS)), f"pid:{os.getpid()}"),
-    )
-    conn.commit()
-    if conn.execute("SELECT 1 FROM import_inflight WHERE import_id = ?", (import_id,)).fetchone() is None:
-        raise ImportLeaseLostError(f"import lease {import_id} was not recorded")
+class ImportLeaseBusyError(RuntimeError):
+    """Another import holds the store's lease."""
 
 
-def _touch_import_lease(conn, import_id: str) -> None:
-    """Extend the lease; verified by read-back (D1 rowcount is not relied on)."""
-    lease = _absorb_format_ts(_absorb_now() + timedelta(seconds=IMPORT_LEASE_SECONDS))
-    conn.execute("UPDATE import_inflight SET lease_until = ? WHERE import_id = ?", (lease, import_id))
-    conn.commit()
-    row = conn.execute("SELECT lease_until FROM import_inflight WHERE import_id = ?", (import_id,)).fetchone()
-    if row is None or str(_row_field(row, 0, "lease_until")) != lease:
-        raise ImportLeaseLostError(f"import lease {import_id} lost")
+_IMPORT_LEASE_KEY = "store"
 
 
-def _end_import_lease(conn, import_id: str) -> None:
-    conn.execute("DELETE FROM import_inflight WHERE import_id = ?", (import_id,))
-    conn.commit()
+class _ImportLease:
+    """The store's single import lease (table import_lease, one row).
+
+    acquire: a conditional INSERT, or a take-over of an EXPIRED row, then a
+    read-back -- a second import on the same store fails fast (busy) and
+    writes nothing. renew: only an UNEXPIRED lease owned by this import is
+    extended (UPDATE ... WHERE owner AND lease_until >= now, then read back);
+    an expired lease is never resurrected. fence: renew when due, then a
+    fresh read proving this import still owns an unexpired lease; the
+    importer calls it before every destructive or completing step. Any
+    failure to prove ownership raises ImportLeaseLostError.
+    """
+
+    def __init__(self, conn, import_id: str):
+        self.conn = conn
+        self.import_id = import_id
+        self.lease_until = ""
+        self.renewed_at = 0.0
+
+    def _now(self) -> str:
+        return _absorb_format_ts(_absorb_now())
+
+    def _next_until(self) -> str:
+        return _absorb_format_ts(_absorb_now() + timedelta(seconds=IMPORT_LEASE_SECONDS))
+
+    def _read(self):
+        return self.conn.execute(
+            "SELECT owner, lease_until FROM import_lease WHERE lease_key = ?", (_IMPORT_LEASE_KEY,)
+        ).fetchone()
+
+    def acquire(self) -> None:
+        now, until = self._now(), self._next_until()
+        self.conn.execute(
+            "INSERT OR IGNORE INTO import_lease (lease_key, owner, started_at, lease_until) VALUES (?, ?, ?, ?)",
+            (_IMPORT_LEASE_KEY, self.import_id, now, until),
+        )
+        self.conn.execute(
+            "UPDATE import_lease SET owner = ?, started_at = ?, lease_until = ? "
+            "WHERE lease_key = ? AND lease_until < ?",
+            (self.import_id, now, until, _IMPORT_LEASE_KEY, now),
+        )
+        self.conn.commit()
+        row = self._read()
+        if row is None:
+            raise RuntimeError("import lease row missing after acquire")
+        owner, held_until = str(_row_field(row, 0, "owner")), str(_row_field(row, 1, "lease_until"))
+        if owner != self.import_id:
+            raise ImportLeaseBusyError(f"another import holds this store's lease until {held_until} UTC")
+        self.lease_until, self.renewed_at = held_until, time.monotonic()
+
+    def renew(self) -> None:
+        until = self._next_until()
+        self.conn.execute(
+            "UPDATE import_lease SET lease_until = ? WHERE lease_key = ? AND owner = ? AND lease_until >= ?",
+            (until, _IMPORT_LEASE_KEY, self.import_id, self._now()),
+        )
+        self.conn.commit()
+        row = self._read()
+        if (row is None or str(_row_field(row, 0, "owner")) != self.import_id
+                or str(_row_field(row, 1, "lease_until")) != until):
+            raise ImportLeaseLostError("the import lease expired or was taken: renewal refused")
+        self.lease_until, self.renewed_at = until, time.monotonic()
+
+    def fence(self) -> None:
+        """Prove ownership now (renewing first when due). Transient read
+        errors are retried; ownership that cannot be proven is lost."""
+        last: Optional[Exception] = None
+        for _ in range(_IMPORT_WRITE_ATTEMPTS):
+            try:
+                if time.monotonic() - self.renewed_at >= _IMPORT_HEARTBEAT_S:
+                    self.renew()
+                row = self._read()
+                if (row is None or str(_row_field(row, 0, "owner")) != self.import_id
+                        or str(_row_field(row, 1, "lease_until")) < self._now()):
+                    raise ImportLeaseLostError("this import no longer owns an unexpired lease")
+                return
+            except ImportLeaseLostError:
+                raise
+            except Exception as exc:
+                last = exc
+        raise ImportLeaseLostError(f"lease ownership could not be verified: {last}")
+
+    def release(self) -> None:
+        self.conn.execute(
+            "DELETE FROM import_lease WHERE lease_key = ? AND owner = ?", (_IMPORT_LEASE_KEY, self.import_id)
+        )
+        self.conn.commit()
 
 
 def _live_import_ids(conn, now: datetime) -> set:
     rows = conn.execute(
-        "SELECT import_id FROM import_inflight WHERE lease_until >= ?", (_absorb_format_ts(now),)
+        "SELECT owner FROM import_lease WHERE lease_until >= ?", (_absorb_format_ts(now),)
     ).fetchall()
-    return {str(_row_field(row, 0, "import_id")) for row in rows}
+    return {str(_row_field(row, 0, "owner")) for row in rows}
 
 
 def _import_marker(import_id: str, started: int, index: int) -> str:
@@ -10059,7 +10184,7 @@ def sweep_import_markers(
     running, independent of its import id (a crash between INSERT, embedding
     and marker strip, or a failed cleanup).
 
-    A row whose import holds a live lease (import_inflight) is never
+    A row whose import holds the store's live lease (import_lease) is never
     touched, however old its marker. Otherwise a row whose marker is older
     than `older_than_s` (or malformed) is COMPLETED when it has its vector --
     the marker is stripped, compare-and-set on the exact stored metadata --
@@ -10122,7 +10247,7 @@ def sweep_import_markers(
             logger.error("import sweep: row %s (marker %r) not resolved: %s", memory_id, marker, exc)
             counts["failed"].append(memory_id)
     try:  # expired leases: their rows were just resolved (or are failed, logged)
-        conn.execute("DELETE FROM import_inflight WHERE lease_until < ?", (_absorb_format_ts(now_utc),))
+        conn.execute("DELETE FROM import_lease WHERE lease_until < ?", (_absorb_format_ts(now_utc),))
         conn.commit()
     except Exception as exc:
         logger.warning("import sweep: could not drop expired leases: %s", exc)
