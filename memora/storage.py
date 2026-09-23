@@ -2968,7 +2968,9 @@ def _corpus_cache_budget_bytes() -> int:
         mb = float(raw) if raw is not None else _DEFAULT_CORPUS_CACHE_BUDGET_MB
     except ValueError:
         mb = _DEFAULT_CORPUS_CACHE_BUDGET_MB
-    if mb <= 0:
+    # Only a finite positive number is valid: float() also accepts "nan" and
+    # "inf", which pass a <= 0 check and then break int() on every cold load.
+    if not math.isfinite(mb) or mb <= 0:
         mb = _DEFAULT_CORPUS_CACHE_BUDGET_MB
     return int(mb * 1024 * 1024)
 
