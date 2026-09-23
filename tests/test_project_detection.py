@@ -1354,3 +1354,93 @@ def test_ownership_is_checked_before_each_row_insert(fake_d1_backend, monkeypatc
         assert result["imported"] == 1 and "lease lost" in result["errors"][0]["error"]
         assert "left_marked" not in result
         assert _contents(conn) == ["new row 0"]  # row 1 was never inserted
+
+
+# --- round 10: post-write steps only under verified ownership (7116) ---
+
+def _crossref_rows(conn):
+    return conn.execute("SELECT COUNT(*) FROM memories_crossrefs").fetchone()[0]
+
+
+def test_no_post_write_by_an_importer_that_lost_its_lease(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        real_marker, real_execute, state = storage._import_marker, conn.execute, {"n": 0, "lost": False}
+        after_loss = []
+
+        def marker(import_id, started, index):
+            state["n"] += 1
+            if state["n"] == 2:  # row 0 counted; a takeover importer now owns the store
+                real_execute("UPDATE import_lease SET owner = 'takeover'")
+                state["lost"] = True
+            return real_marker(import_id, started, index)
+
+        def execute(sql, params=None):
+            if state["lost"]:
+                after_loss.append(sql.strip())
+            return real_execute(sql, params)
+
+        monkeypatch.setattr(storage, "_import_marker", marker)
+        monkeypatch.setattr(conn, "execute", execute)
+        result = storage.import_memories(conn, NEW)
+        monkeypatch.setattr(conn, "execute", real_execute)
+        monkeypatch.setattr(storage, "_import_marker", real_marker)
+        assert result["imported"] == 1 and result["post_write"] == "skipped"
+        assert "memory_rebuild_crossrefs" in result["post_write_note"]
+        writes = [q for q in after_loss if q.split()[0].upper() in ("INSERT", "UPDATE", "DELETE")]
+        assert not [q for q in writes if "memories_crossrefs" in q or "memories_embeddings" in q
+                    or "memories_meta" in q], writes
+        assert _crossref_rows(conn) == 0
+
+
+def test_lease_expiring_during_the_rebuild_stops_it_incomplete(fake_d1_backend, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        real_iter = storage._iter_memories_with_embeddings
+
+        def iter_then_expire(c, *a, **k):
+            c.execute("UPDATE import_lease SET lease_until = '2000-01-01 00:00:00'")  # rebuild starts, lease lapses
+            yield from real_iter(c, *a, **k)
+
+        monkeypatch.setattr(storage, "_iter_memories_with_embeddings", iter_then_expire)
+        result = storage.import_memories(conn, NEW)
+        monkeypatch.setattr(storage, "_iter_memories_with_embeddings", real_iter)
+        assert result["imported"] == 3 and result["total_errors"] == 0
+        assert result["post_write"] == "incomplete" and "lost the store's lease" in result["post_write_note"]
+        assert _crossref_rows(conn) == 0  # the bulk write was fenced off
+
+
+def test_a_normal_d1_import_rebuilds_and_restores_the_stamp_under_its_lease(fake_d1_backend, monkeypatch):
+    from memora.embeddings import get_embedding_integrity, invalidate_embedding_integrity_cache
+
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    with storage.connect() as conn:
+        _setup_previous(conn)
+        storage.semantic_search(conn, "old row")  # the audit writes a stamp
+        invalidate_embedding_integrity_cache(conn)
+        stamp = get_embedding_integrity(conn)
+        fences = {"n": 0}
+        real_fence = storage._ImportLease.fence
+
+        def counting_fence(self):
+            fences["n"] += 1
+            return real_fence(self)
+
+        monkeypatch.setattr(storage._ImportLease, "fence", counting_fence)
+        import memora.embeddings as embeddings_mod
+        real_write, restored = embeddings_mod._write_embedding_integrity, []
+
+        def spy_write(c, value, **kw):
+            restored.append((value, fences["n"]))
+            return real_write(c, value, **kw)
+
+        monkeypatch.setattr(embeddings_mod, "_write_embedding_integrity", spy_write)
+        result = storage.import_memories(conn, NEW, strategy="replace")
+        monkeypatch.setattr(embeddings_mod, "_write_embedding_integrity", real_write)
+        assert [v for v, _n in restored] == [stamp]  # restored once, under a fence
+        assert restored[0][1] > 3 * 3
+        assert result["replaced"] is True and result["post_write"] == "done" and "post_write_note" not in result
+        assert _crossref_rows(conn) == 3
+        invalidate_embedding_integrity_cache(conn)
+        assert stamp and get_embedding_integrity(conn) == stamp
+        assert fences["n"] > 3 * 3  # rows, plus the post-write steps

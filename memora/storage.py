@@ -3547,6 +3547,8 @@ def _store_crossrefs_bulk(
     conn: sqlite3.Connection,
     rows: List[Tuple[int, List[Dict[str, Any]]]],
     chunk_size: int = 50,
+    *,
+    fence: Optional[Any] = None,
 ) -> None:
     """Bulk-write crossrefs for many memories using chunked multi-row INSERTs.
 
@@ -3567,6 +3569,8 @@ def _store_crossrefs_bulk(
             f"VALUES {placeholders} "
             f"ON CONFLICT(memory_id) DO UPDATE SET related=excluded.related"
         )
+        if fence is not None:
+            fence()
         conn.execute(sql, tuple(params))
 
 
@@ -5235,8 +5239,13 @@ def _update_crossrefs(
     # memory_rebuild_crossrefs or memory_related(refresh=True).
 
 
-def rebuild_crossrefs(conn: sqlite3.Connection) -> int:
+def rebuild_crossrefs(conn: sqlite3.Connection, *, fence: Optional[Any] = None) -> int:
     """Recompute every memory's score-based crossrefs.
+
+    fence: called before every write (each lazy embedding backfill or empty
+    crossref, and each bulk crossref chunk); it raises to stop the rebuild
+    with nothing further written. An import passes its lease fence, so a
+    rebuild never writes after the import lost the store's lease.
 
     Optimized path: pull all (id, metadata, embedding) rows ONCE via the
     paginated JOIN helper, compute the all-pairs cosine matrix in pure
@@ -5265,6 +5274,8 @@ def rebuild_crossrefs(conn: sqlite3.Connection) -> int:
 
         # Lazy-backfill genuinely missing legacy/imported embeddings.
         if vector is _CERTIFIED_EMPTY_EMBEDDING:
+            if fence is not None:
+                fence()
             _store_crossrefs(conn, memory_id, [])
             continue
         if vector is None:
@@ -5275,11 +5286,15 @@ def rebuild_crossrefs(conn: sqlite3.Connection) -> int:
             tags = json.loads(tags_json) if tags_json else []
             content = row["content"]
             vector = _compute_embedding(content, metadata, tags)
+            if fence is not None:
+                fence()
             _upsert_embedding(conn, memory_id, vector)
 
         if not vector:
             # Genuinely empty (e.g. blank content) — store an empty crossref
             # so the lookup still finds the row but skip it as a candidate.
+            if fence is not None:
+                fence()
             _store_crossrefs(conn, memory_id, [])
             continue
 
@@ -5341,7 +5356,7 @@ def rebuild_crossrefs(conn: sqlite3.Connection) -> int:
 
     # Bulk write all crossrefs in chunked multi-row INSERTs to amortize the
     # per-statement HTTP round-trip cost on D1.
-    _store_crossrefs_bulk(conn, pending_writes)
+    _store_crossrefs_bulk(conn, pending_writes, fence=fence)
     conn.commit()
     return len(pending_writes)
 
@@ -9662,15 +9677,22 @@ def _import_memories_body(conn, data, strategy, lease: Optional["_ImportLease"])
     imported = outcome["imported"]
     errors.extend(outcome["errors"])
 
-    if replace_integrity_stamp and outcome["replaced"] is True:
-        from .embeddings import _write_embedding_integrity, invalidate_embedding_integrity_cache
-        _write_embedding_integrity(conn, replace_integrity_stamp)
-        invalidate_embedding_integrity_cache(conn)
-        conn.commit()
-
-    # Rebuild cross-references after import
-    if imported > 0:
-        rebuild_crossrefs(conn)
+    post_write: Optional[str] = None
+    if lease is None:
+        # Local SQLite: the rows are committed as one transaction; the
+        # post-write steps follow as before.
+        _import_post_write(conn, outcome, replace_integrity_stamp, None)
+    elif outcome["errors"]:
+        # A partial or lost D1 result: no further write of any kind -- a
+        # takeover importer may already own this store.
+        post_write = "skipped"
+    else:
+        try:
+            _import_post_write(conn, outcome, replace_integrity_stamp, lease.fence)
+            post_write = "done"
+        except ImportLeaseLostError as exc:
+            logger.error("import: lease lost during the post-write steps: %s", exc)
+            post_write = "incomplete"
 
     result: Dict[str, Any] = {
         "imported": imported,
@@ -9692,7 +9714,35 @@ def _import_memories_body(conn, data, strategy, lease: Optional["_ImportLease"])
                 result[key] = outcome[key]
     if sweep.get("scanned") or sweep.get("error"):
         result["sweep"] = sweep
+    if post_write is not None:
+        result["post_write"] = post_write
+        if post_write != "done":
+            result["post_write_note"] = (
+                "cross-references"
+                + (" and the embedding-integrity baseline" if strategy == "replace" else "")
+                + (" were not rebuilt (the row phase did not complete)" if post_write == "skipped"
+                   else " were only partly rebuilt: the import lost the store's lease")
+                + "; run memory_rebuild_crossrefs once no import is running to complete them."
+            )
     return result
+
+
+def _import_post_write(conn, outcome, replace_integrity_stamp, fence) -> None:
+    """The steps after the row phase: restore the replace's integrity stamp,
+    then rebuild cross-references. `fence` (the import lease's, on D1) runs
+    before each step and before every write of the rebuild; it raises
+    ImportLeaseLostError to stop with nothing further written."""
+    if replace_integrity_stamp and outcome["replaced"] is True:
+        from .embeddings import _write_embedding_integrity, invalidate_embedding_integrity_cache
+        if fence is not None:
+            fence()
+        _write_embedding_integrity(conn, replace_integrity_stamp)
+        invalidate_embedding_integrity_cache(conn)
+        conn.commit()
+    if outcome["imported"] > 0:
+        if fence is not None:
+            fence()
+        rebuild_crossrefs(conn, fence=fence)
 
 
 _IMPORT_WRITE_ATTEMPTS = 3
