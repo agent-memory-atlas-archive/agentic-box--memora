@@ -2,7 +2,7 @@
   "contract": "memora-api/v1",
   "contract_version": "1.0.0",
   "files": {
-    "README.md": "0a7e8ce47c3c5cfa356ae5390bc7a147a4fed0793cbadf61a9027c37b301945c",
+    "README.md": "5bac91cd60c0d5519b6bdd018ccd1122311ffb4a02b977e3a2e81049f0a8ba5b",
     "VERSION": "59854984853104df5c353e2f681a15fc7924742f9a2e468c29af248dce45ce03",
     "fixtures/absorb_done.json": "834352aa093c85a254826970fc8b9667e1a95597a82be30b6e2a0551e5cdb983",
     "fixtures/absorb_in_progress.json": "1aca3a6f78de1a5b0581ecefe50f986929f5355f1378995a8ee54b1e27149998",
