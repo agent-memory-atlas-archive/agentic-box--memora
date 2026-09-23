@@ -49,6 +49,7 @@ def parse_document(
     tags: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     skip_fragment_crossrefs: bool = True,
+    project: Optional[str] = None,
 ) -> DocumentPlan:
     """Parse a markdown document into a root + typed fragments.
 
@@ -67,6 +68,8 @@ def parse_document(
         tags: Tags to apply to root and fragments
         metadata: Extra metadata merged into each fragment
         skip_fragment_crossrefs: Whether fragments skip crossref computation
+        project: The document's project: the root tag is "<project>/documents",
+            or bare "documents" without one (issue #47)
 
     Returns:
         DocumentPlan with root info and ordered fragment list
@@ -82,7 +85,8 @@ def parse_document(
         "hierarchy": {"path": document_key.split("/")},
         **metadata,
     }
-    root_tags = list(tags) + (["memora/documents"] if "memora/documents" not in tags else [])
+    documents_tag = f"{project}/documents" if project else "documents"
+    root_tags = list(tags) + ([documents_tag] if documents_tag not in tags else [])
 
     # Split document into heading-delimited sections
     sections = _split_by_headings(content)

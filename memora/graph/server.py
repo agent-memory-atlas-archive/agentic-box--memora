@@ -288,7 +288,7 @@ def start_graph_server(host: str, port: int) -> None:
         """API endpoint: Get memories with optional filters (timeline, issues).
 
         Query params:
-          type=issue           → only issue memories (metadata.type OR memora/issues tag)
+          type=issue           → only issue memories (metadata.type OR an issues / <project>/issues tag)
           status=open|closed   → issue status (normalizes legacy in_progress/resolved/wontfix)
           severity=critical|major|minor → missing defaults to minor
           component, category  → exact match
@@ -331,12 +331,12 @@ def start_graph_server(host: str, port: int) -> None:
             if is_issue_query:
                 clauses.append(
                     "(json_extract(metadata, '$.type') = 'issue' "
-                    "OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = 'memora/issues'))"
+                    "OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = 'issues' OR value LIKE '%/issues'))"
                 )
             elif is_todo_query:
                 clauses.append(
                     "(json_extract(metadata, '$.type') = 'todo' "
-                    "OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = 'memora/todos'))"
+                    "OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = 'todos' OR value LIKE '%/todos'))"
                 )
 
             if status_filter == "open":

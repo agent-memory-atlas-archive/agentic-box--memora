@@ -45,6 +45,10 @@ from .storage import (
     generate_insights,
     get_crossrefs,
     get_related,
+    project_tag,
+    _resolve_project as storage_resolve_project,
+    load_projects_config,
+    ProjectConfigError,
     get_hierarchy_paths,
     get_memories_metadata_batch,
     get_memory,
@@ -155,19 +159,15 @@ def _infer_type(content: str) -> Optional[str]:
     return None
 
 
-def _suggest_tags(content: str, inferred_type: Optional[str]) -> List[str]:
-    """Suggest tags based on content and inferred type."""
-    suggestions = []
+def _suggest_tags(content: str, inferred_type: Optional[str], project: Optional[str] = None) -> List[str]:
+    """Suggest a type tag for the memory's own project ("<project>/todos"),
+    or a bare one ("todos") when it has none -- never another project's tag
+    (issue #47)."""
+    from .storage import project_tag
 
-    # Type-based suggestions
-    if inferred_type == 'todo':
-        suggestions.append('memora/todos')
-    elif inferred_type == 'issue':
-        suggestions.append('memora/issues')
-    elif inferred_type in ('note', 'idea', 'question'):
-        suggestions.append('memora/knowledge')
-
-    return suggestions
+    kind = {"todo": "todos", "issue": "issues", "note": "knowledge",
+            "idea": "knowledge", "question": "knowledge"}.get(inferred_type or "")
+    return [project_tag(project, kind)] if kind else []
 
 
 from .graph import export_graph_html, start_graph_server  # noqa: E402
@@ -1055,7 +1055,11 @@ async def memory_create(
         if inferred_type:
             suggestions["type"] = inferred_type
 
-        suggested_tags = _suggest_tags(redacted_content, inferred_type)
+        record_meta = record.get("metadata") or {}
+        suggestion_project = project or storage_resolve_project(
+            None, record.get("tags") or [], record_meta, strict=False,
+        )
+        suggested_tags = _suggest_tags(redacted_content, inferred_type, suggestion_project)
         # Only suggest tags not already applied
         existing_tags = set(tags or [])
         new_suggestions = [t for t in suggested_tags if t not in existing_tags]
@@ -1150,10 +1154,10 @@ async def memory_create_issue(
         component: Component/area affected (e.g., "graph", "storage", "api")
         category: Issue category (e.g., "bug", "enhancement", "performance")
         project: Optional project the issue belongs to; its tag becomes
-            "<project>/issues" (default, without a project: "memora/issues")
+            "<project>/issues", or bare "issues" without a project
 
     Returns:
-        Created issue memory with auto-assigned tag "<project>/issues"
+        Created issue memory with auto-assigned tag "<project>/issues" or "issues"
     """
     # Validate status
     valid_statuses = {"open", "closed"}
@@ -1187,7 +1191,7 @@ async def memory_create_issue(
         metadata["category"] = category
 
     # Create with auto-tag
-    tags = [f"{project}/issues" if project else "memora/issues"]
+    tags = [project_tag(project, "issues")]
 
     try:
         record = await _create_memory(content.strip(), metadata, tags, project)
@@ -1216,10 +1220,10 @@ async def memory_create_todo(
         priority: Task priority - "high", "medium" (default), "low"
         category: Task category (e.g., "cloud-backend", "graph-visualization", "docs")
         project: Optional project the task belongs to; its tag becomes
-            "<project>/todos" (default, without a project: "memora/todos")
+            "<project>/todos", or bare "todos" without a project
 
     Returns:
-        Created TODO memory with auto-assigned tag "<project>/todos"
+        Created TODO memory with auto-assigned tag "<project>/todos" or "todos"
     """
     # Validate status
     valid_statuses = {"open", "closed"}
@@ -1251,7 +1255,7 @@ async def memory_create_todo(
         metadata["category"] = category
 
     # Create with auto-tag
-    tags = [f"{project}/todos" if project else "memora/todos"]
+    tags = [project_tag(project, "todos")]
 
     try:
         record = await _create_memory(content.strip(), metadata, tags, project)
@@ -1267,6 +1271,7 @@ async def memory_create_section(
     content: str,
     section: Optional[str] = None,
     subsection: Optional[str] = None,
+    project: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new section/subsection header memory.
 
@@ -1279,9 +1284,11 @@ async def memory_create_section(
         content: Title/description of the section
         section: Parent section name (e.g., "Architecture", "API")
         subsection: Subsection path (e.g., "endpoints/auth")
+        project: Optional project the section belongs to; its tag becomes
+            "<project>/sections", or bare "sections" without a project
 
     Returns:
-        Created section memory with auto-assigned tag "memora/sections"
+        Created section memory with auto-assigned tag "<project>/sections" or "sections"
     """
     # Build metadata
     metadata: Dict[str, Any] = {
@@ -1293,10 +1300,10 @@ async def memory_create_section(
         metadata["subsection"] = subsection
 
     # Create with auto-tag
-    tags = ["memora/sections"]
+    tags = [project_tag(project, "sections")]
 
     try:
-        record = await _create_memory(content.strip(), metadata, tags)
+        record = await _create_memory(content.strip(), metadata, tags, project)
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
 
@@ -1611,6 +1618,7 @@ async def memory_store_document(
     tags: Optional[list[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     skip_fragment_crossrefs: bool = True,
+    project: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Store a structured document as a root memory + searchable fragments.
 
@@ -1625,6 +1633,9 @@ async def memory_store_document(
         tags: Tags applied to root and fragments
         metadata: Additional metadata merged into root and fragments
         skip_fragment_crossrefs: If True, fragments skip crossref computation (default: True)
+        project: Optional project the document belongs to: recorded on the root
+            and every fragment, whose tag becomes "<project>/documents" (bare
+            "documents" without a project)
 
     Returns:
         {document_key, root_id, fragment_count, node_map: {node_kind: [ids]}}
@@ -1636,6 +1647,7 @@ async def memory_store_document(
             content, document_key, version=version,
             tags=tags, metadata=metadata,
             skip_fragment_crossrefs=skip_fragment_crossrefs,
+            project=project,
         )
     except Exception as exc:
         return {"error": "parse_error", "message": str(exc)}
@@ -1646,6 +1658,7 @@ async def memory_store_document(
             content=plan.root_content,
             metadata=plan.root_metadata,
             tags=plan.root_tags,
+            project=project,
         )
     except ValueError as exc:
         return {"error": "invalid_input", "message": f"Root creation failed: {exc}"}
@@ -1659,6 +1672,7 @@ async def memory_store_document(
             "content": frag.content,
             "metadata": frag.metadata,
             "tags": list(plan.root_tags),
+            "project": project,
         }
         fragment_entries.append(entry)
 
@@ -2345,7 +2359,8 @@ async def memory_digest(
         topic: Subject to digest.
         k: Maximum active search hits and TODO/issue matches to include.
         include_lineage: Include supersession history for active hits.
-        include_todos: Include matching memora/todos and memora/issues entries.
+        include_todos: Include matching todos and issues (metadata.type todo/issue,
+            or a legacy memora/todos or memora/issues tag).
         include_related_hops: Number of cross-reference hops to collect, capped at 3.
         synthesize: Reserved for future LLM synthesis. False by default.
         preview_chars: Preview length per returned memory.
@@ -3325,6 +3340,14 @@ def _configure_memora_logging(env: Optional[Mapping[str, str]] = None) -> Option
 
 def main(argv: Optional[list[str]] = None) -> None:
     from . import __version__
+
+    # A malformed MEMORA_PROJECTS must stop the server here, not surface on
+    # some later write (issue #47): every entry is validated, used or not.
+    try:
+        load_projects_config()
+    except ProjectConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
 
     _configure_memora_logging()
 

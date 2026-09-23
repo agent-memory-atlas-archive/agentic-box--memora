@@ -1335,27 +1335,61 @@ class ProjectConfigError(ValueError):
     """MEMORA_PROJECTS is malformed, or an explicit project is not allowed."""
 
 
-def configured_projects(store: Optional[str] = None) -> Tuple[str, ...]:
-    """Projects MEMORA_PROJECTS declares for `store` (default: the store this
-    call is bound to). Empty when none are configured."""
+def _project_list_ok(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(p, str) and _PROJECT_NAME_RE.match(p) for p in value
+    )
+
+
+def load_projects_config() -> Any:
+    """The whole MEMORA_PROJECTS value, validated: None (unset), a list of
+    project names, or {store name: list of project names}. Every entry is
+    checked, including stores this process never opens, so a malformed value
+    fails at startup (server main) instead of on some later write."""
     raw = os.getenv("MEMORA_PROJECTS", "").strip()
     if not raw:
-        return ()
+        return None
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ProjectConfigError(f"MEMORA_PROJECTS is not valid JSON: {exc}") from exc
+    if isinstance(data, list):
+        if not _project_list_ok(data):
+            raise ProjectConfigError("MEMORA_PROJECTS: every project must match [a-z0-9_-]{1,64}")
+        return data
+    if isinstance(data, dict):
+        for store, projects in data.items():
+            if not (isinstance(store, str) and _PROJECT_NAME_RE.match(store)):
+                raise ProjectConfigError(f"MEMORA_PROJECTS: invalid store name {store!r}")
+            if not _project_list_ok(projects):
+                raise ProjectConfigError(
+                    f"MEMORA_PROJECTS[{store!r}]: every project must match [a-z0-9_-]{{1,64}}"
+                )
+        return data
+    raise ProjectConfigError(
+        "MEMORA_PROJECTS must be a JSON list of project names or {store: [project names]}"
+    )
+
+
+def configured_projects(store: Optional[str] = None) -> Tuple[str, ...]:
+    """Projects MEMORA_PROJECTS declares for `store` (default: the store this
+    call is bound to). Empty when none are configured."""
+    data = load_projects_config()
+    if data is None:
+        return ()
     if isinstance(data, dict):
         if store is None:
             store = effective_database_name() or "default"
         data = data.get(store, [])
-    if not isinstance(data, list) or not all(
-        isinstance(p, str) and _PROJECT_NAME_RE.match(p) for p in data
-    ):
-        raise ProjectConfigError(
-            "MEMORA_PROJECTS must be a JSON list of project names or {store: [project names]}"
-        )
     return tuple(dict.fromkeys(data))
+
+
+def project_tag(project: Optional[str], kind: str) -> str:
+    """The tag for a typed memory (issues, todos, sections, documents,
+    knowledge): "<project>/<kind>" with a project, bare "<kind>" without --
+    never another project's prefix (issue #47). Under MEMORA_PROJECTS with
+    memora configured, existing memora/<kind> tags still resolve to memora."""
+    return f"{project}/{kind}" if project else kind
 
 
 def _projects_in_tags(tags: Optional[Iterable[str]], known: Iterable[str]) -> set:
@@ -1369,30 +1403,44 @@ def _projects_in_tags(tags: Optional[Iterable[str]], known: Iterable[str]) -> se
     return found
 
 
+def _check_project(project: Any, known: Tuple[str, ...], source: str) -> str:
+    if not isinstance(project, str) or not _PROJECT_NAME_RE.match(project):
+        raise ProjectConfigError(f"invalid project name {project!r} ({source})")
+    if known and project not in known:
+        raise ProjectConfigError(
+            f"project {project!r} ({source}) is not configured for this store "
+            f"(MEMORA_PROJECTS: {', '.join(known)})"
+        )
+    return project
+
+
 def _resolve_project(
     explicit: Optional[str],
     tags: Optional[Iterable[str]] = None,
     metadata: Optional[Mapping[str, Any]] = None,
+    *,
+    strict: bool = True,
 ) -> Optional[str]:
     """The memory's project, from explicit markers only (see the block above).
 
-    An explicit project must be a valid name and, when the store configures
-    projects, one of them (ProjectConfigError otherwise). Ambiguous tags (two
-    configured projects) give no project rather than a guess.
+    An explicit project, and a metadata.project, must each be a valid name
+    and, when the store configures projects, one of them -- the SAME rule for
+    both, or metadata would be a way around it. strict (every write path):
+    ProjectConfigError otherwise. strict=False (read-only diagnosis of stored
+    data, e.g. backfill and its preview): an invalid metadata.project is
+    ignored instead. Ambiguous tags (two configured projects) give no project
+    rather than a guess.
     """
     known = configured_projects()
     if explicit is not None:
-        if not isinstance(explicit, str) or not _PROJECT_NAME_RE.match(explicit):
-            raise ProjectConfigError(f"invalid project name {explicit!r}")
-        if known and explicit not in known:
-            raise ProjectConfigError(
-                f"project {explicit!r} is not configured for this store "
-                f"(MEMORA_PROJECTS: {', '.join(known)})"
-            )
-        return explicit
+        return _check_project(explicit, known, "project argument")
     meta_project = metadata.get("project") if isinstance(metadata, Mapping) else None
-    if isinstance(meta_project, str) and _PROJECT_NAME_RE.match(meta_project):
-        return meta_project
+    if meta_project is not None:
+        try:
+            return _check_project(meta_project, known, "metadata.project")
+        except ProjectConfigError:
+            if strict:
+                raise
     if known:
         found = _projects_in_tags(tags, known)
         if len(found) == 1:
@@ -7649,7 +7697,7 @@ def backfill_tags(
             old_tags = []
 
         processed += 1
-        resolved_project = _resolve_project(None, old_tags, metadata)
+        resolved_project = _resolve_project(None, old_tags, metadata, strict=False)
         new_tags = _normalize_tags(old_tags, resolved_project)
 
         # Auto-assign section if missing
@@ -7955,6 +8003,10 @@ def update_memory(
     if metadata is not None:
         if not isinstance(metadata, Mapping):
             raise ValueError("Metadata must be a mapping")
+        if metadata.get("project") is not None:
+            # A project this update supplies obeys the same rule as create
+            # (issue #47); a stored one is only read tolerantly below.
+            _check_project(metadata["project"], configured_projects(), "metadata.project")
         if replace_metadata:
             metadata_input = dict(metadata)
         else:
@@ -7972,7 +8024,9 @@ def update_memory(
     new_tags = _validate_tags(tags) if tags is not None else existing.get("tags", [])
 
     if tags is not None:
-        new_tags = _normalize_tags(new_tags, _resolve_project(None, new_tags, new_metadata))
+        # A stored (possibly legacy) metadata.project is tolerated here; a
+        # project supplied by THIS update was validated above.
+        new_tags = _normalize_tags(new_tags, _resolve_project(None, new_tags, new_metadata, strict=False))
         _enforce_tag_whitelist(new_tags)
 
     # Check what changed (affects whether we need to recompute indexes)

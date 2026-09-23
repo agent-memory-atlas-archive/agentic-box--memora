@@ -288,3 +288,127 @@ def test_report_lists_memories_the_keywords_would_have_classified(db, projects, 
     with storage.connect() as conn:  # read-only: nothing changed
         assert conn.execute("SELECT COUNT(*), MAX(id) FROM memories").fetchone() == before
         assert storage.get_memory(conn, guessed["id"])["tags"] == ["clmux/architecture"]
+
+
+# --- round 2: metadata.project obeys the same rule (review 7030 HIGH 1) --------
+
+def test_metadata_project_cannot_bypass_the_configured_list(db, projects):
+    from memora import server
+
+    projects(["memora"])
+    with storage.connect() as conn:
+        with pytest.raises(storage.ProjectConfigError):
+            _add(conn, "a pi fact", metadata={"project": "pi"}, tags=["analysis"])
+        # import: the entry fails, nothing tagged pi/ is written
+        result = storage.import_memories(
+            conn, [{"content": "imported pi fact", "metadata": {"project": "pi"}, "tags": ["analysis"]}],
+        )
+        assert result.get("errors") and not any(
+            "pi/analysis" in (m.get("tags") or []) for m in storage.list_memories(conn)
+        )
+    bad = asyncio.run(server.memory_create("a pi fact", metadata={"project": "pi"}, tags=["analysis"]))
+    assert bad["error"] == "invalid_input"
+
+
+def test_update_rejects_a_supplied_project_but_tolerates_a_stored_one(db, projects):
+    projects(None)
+    with storage.connect() as conn:
+        legacy = _add(conn, "legacy memory", metadata={"project": "target"}, tags=["plan"])
+    projects(["memora"])
+    with storage.connect() as conn:
+        with pytest.raises(storage.ProjectConfigError):
+            storage.update_memory(conn, legacy["id"], metadata={"project": "pi"})
+        # The stored legacy value is not configured: tolerated, but no prefixing.
+        updated = storage.update_memory(conn, legacy["id"], tags=["design"])
+    assert updated["tags"] == ["design"]
+
+
+# --- round 2: typed tags follow the project, no memora default (HIGH 2) --------
+
+def test_typed_tags_follow_the_project_with_no_memora_default(db, projects, monkeypatch):
+    from memora import server
+
+    projects(["memora", "clmux", "pi"])
+    monkeypatch.setattr(storage, "_search_snapshot_full", lambda *a, **k: [])
+    assert asyncio.run(server.memory_create_issue("an issue"))["memory"]["tags"] == ["issues"]
+    assert asyncio.run(server.memory_create_todo("a task"))["memory"]["tags"] == ["todos"]
+    assert asyncio.run(server.memory_create_section("Arch"))["memory"]["tags"] == ["sections"]
+    section = asyncio.run(server.memory_create_section("Arch", project="pi"))["memory"]
+    assert section["tags"] == ["pi/sections"] and section["metadata"]["project"] == "pi"
+
+
+def test_documents_take_the_project(db, projects):
+    from memora import server
+
+    projects(["memora", "pi"])
+    doc = "# Plan\n\n1. first step\n2. second step\n"
+    out = asyncio.run(server.memory_store_document(doc, "pi/plan-doc", project="pi"))
+    with storage.connect() as conn:
+        root = storage.get_memory(conn, out["root_id"])
+        frags = [storage.get_memory(conn, i) for ids in out["node_map"].values() for i in ids]
+    assert "pi/documents" in root["tags"] and root["metadata"]["project"] == "pi"
+    assert frags and all("pi/documents" in f["tags"] and f["metadata"]["project"] == "pi" for f in frags)
+    plain = asyncio.run(server.memory_store_document(doc, "plain-doc"))
+    with storage.connect() as conn:
+        assert "documents" in storage.get_memory(conn, plain["root_id"])["tags"]
+        assert "memora/documents" not in storage.get_memory(conn, plain["root_id"])["tags"]
+
+
+def test_create_suggestions_use_the_memorys_own_project(db, projects, monkeypatch):
+    from memora import server
+
+    projects(["memora", "pi"])
+    monkeypatch.setattr(storage, "_search_snapshot_full", lambda *a, **k: [])
+    pi = asyncio.run(server.memory_create("TODO: wire the pi inbox", project="pi"))
+    assert pi["suggestions"]["tags"] == ["pi/todos"]
+    none = asyncio.run(server.memory_create("TODO: something generic"))
+    assert none["suggestions"]["tags"] == ["todos"]
+    # memora-tagged content still resolves to memora under MEMORA_PROJECTS.
+    mem = asyncio.run(server.memory_create("TODO: absorb gate", tags=["memora/absorb"]))
+    assert mem["suggestions"]["tags"] == ["memora/todos"]
+
+
+def test_graph_issue_filter_accepts_any_project_issues_tag(graph_request, projects):
+    projects(["pi"])
+    with storage.connect() as conn:
+        tagged = _add(conn, "tag-only pi issue", tags=["pi/issues"])
+        bare = _add(conn, "tag-only bare issue", tags=["issues"])
+        other = _add(conn, "not an issue", tags=["pi/notes"])
+    status, api = graph_request("GET", "/api/memories?type=issue&limit=50")
+    assert status == 200
+    ids = {m["id"] for m in api.get("memories", api if isinstance(api, list) else [])}
+    assert {tagged["id"], bare["id"]} <= ids and other["id"] not in ids
+
+
+# --- round 2: full MEMORA_PROJECTS validation at startup ------------------------
+
+@pytest.mark.parametrize("raw", [
+    '{"memora": ["memora"], "unused": ["Bad Name"]}',
+    '{"memora": "memora"}',
+    '{"Bad Store": ["memora"]}',
+    '"memora"',
+    '["ok", 3]',
+    "not json",
+])
+def test_malformed_projects_config_fails_at_startup(monkeypatch, raw, capsys):
+    from memora import server
+
+    monkeypatch.setenv("MEMORA_PROJECTS", raw)
+    with pytest.raises(storage.ProjectConfigError):
+        storage.load_projects_config()
+    with pytest.raises(SystemExit) as exit_info:
+        server.main(["--transport", "stdio"])
+    assert exit_info.value.code == 2
+    assert "MEMORA_PROJECTS" in capsys.readouterr().err
+
+
+def test_report_says_it_is_a_preview_not_the_backfill(db, projects, capsys):
+    sys.path.insert(0, "scripts")
+    import report_project_detection as report
+
+    projects(["clmux"])
+    assert report.main([]) == 0
+    out = capsys.readouterr().out
+    assert "REMEDIATION PREVIEW" in out and "backfill_tags does NOT perform" in out
+    assert report.main(["--json"]) == 0
+    assert "does NOT perform" in json.loads(capsys.readouterr().out)["summary"]["kind"]

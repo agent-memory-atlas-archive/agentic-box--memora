@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Dry-run report for issue #47: which memories got a section or a
-project-prefixed tag from the removed keyword heuristics?
+"""Remediation PREVIEW for issue #47: which memories got a section or a
+project-prefixed tag from the removed keyword heuristics, and what would a
+remediation change?
 
-READ-ONLY. It runs SELECTs only and never writes; it exists so a backfill
-(or re-tag) can be decided from facts. Point it at a store with the usual
+READ-ONLY. It runs SELECTs only and never writes. It PREVIEWS a remediation
+that does not exist yet: the current `backfill_tags` does NOT perform these
+changes (it keeps an existing section and treats legacy clmux/... and
+memora/... tags as identity, so a keyword-misfiled memory stays misfiled).
+The remediation itself is a separate item; this exists so it can be decided
+from facts. Point it at a store with the usual
 memora configuration (MEMORA_DATABASES + --db NAME, or MEMORA_STORAGE_URI),
 and set MEMORA_PROJECTS as the server will run with it.
 
@@ -15,7 +20,8 @@ Method, per memory:
      state, with no explicit project argument -- only what the memory itself
      carries (metadata.project, configured project tags), as a backfill would.
   3. Report the memory when its STORED section, subsection or tags differ
-     from the new result -- exactly what a backfill would change -- AND the
+     from the new result -- what the proposed remediation would change (NOT
+     what today's backfill_tags does) -- AND the
      old content keyword indicators fired for it (scripts/_legacy_project_
      detection.py, verbatim from 795c40e): those are the keyword-caused cases
      issue #47 is about. --all also lists differences with no keyword hit
@@ -78,10 +84,10 @@ def _raw_state(content: str, metadata: Optional[Dict[str, Any]], tags: List[str]
 
 def assess(memory_id: int, content: str, metadata: Optional[Dict[str, Any]], tags: List[str]) -> Optional[Dict[str, Any]]:
     """A report row when the STORED section/subsection/tags differ from what
-    the new rules give for this memory (what a backfill would change);
-    None otherwise."""
+    the new rules give for this memory (what the proposed remediation would
+    change); None otherwise."""
     raw_meta, raw_tags = _raw_state(content, metadata, tags)
-    new_project = storage._resolve_project(None, raw_tags, raw_meta)
+    new_project = storage._resolve_project(None, raw_tags, raw_meta, strict=False)
     new_meta = storage._auto_assign_section(raw_meta, raw_tags, new_project) or {}
     new_tags = storage._normalize_tags(raw_tags, new_project)
 
@@ -150,6 +156,7 @@ def main(argv=None) -> int:
             break
 
     summary = {
+        "kind": "remediation preview (read-only); the current backfill_tags does NOT perform these changes",
         "scanned": len(rows),
         "differ_from_new_rules": differ_total,
         "reported": len(report),
@@ -160,6 +167,7 @@ def main(argv=None) -> int:
     if args.json:
         print(json.dumps({"summary": summary, "memories": report}, indent=1, ensure_ascii=False))
         return 0
+    print("REMEDIATION PREVIEW (read-only). The current backfill_tags does NOT perform these changes.")
     print(f"scanned {summary['scanned']} memories; {summary['differ_from_new_rules']} differ from "
           f"the new rules; {summary['reported']} reported ({summary['reported_filter']}); "
           f"configured projects: {summary['configured_projects'] or 'none'}")
