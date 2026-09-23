@@ -141,23 +141,48 @@ def test_preview_reads_only_the_header(store, tmp_path, monkeypatch):
     assert preview.main(["--out", str(out / "p.json")]) == 0
 
 
-def test_preview_refuses_an_s3_cloud_store_without_connecting(tmp_path, monkeypatch):
-    pytest.importorskip("boto3")
+def test_preview_refuses_an_s3_cloud_store_before_building_any_backend(tmp_path, monkeypatch):
+    """From a FRESH home and registry: refused by the configured URI, before
+    any backend exists -- no cache directory, no S3 client, no output."""
     from memora.backends import CloudSQLiteBackend
 
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"cloudy": "s3://some-bucket/memora/memories.db"}))
-    monkeypatch.setenv("MEMORA_DEFAULT_DB", "cloudy")
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"cloudy": "s3://some-bucket/memora/memories.db",
+                                                       "local": str(tmp_path / "l.db")}))
+    monkeypatch.setenv("MEMORA_DEFAULT_DB", "local")
     monkeypatch.setenv("MEMORA_PROJECTS", json.dumps(PROJECTS))
     storage._registry_cache = None
-    calls = []
+    storage._registry_source = None
+
+    def no_backend(self, *a, **k):
+        raise AssertionError("a cloud backend was constructed")
+
+    monkeypatch.setattr(CloudSQLiteBackend, "__init__", no_backend)
     for name in ("connect", "sync_before_use"):
-        monkeypatch.setattr(CloudSQLiteBackend, name, lambda self, *a, **k: calls.append(1))
-    assert isinstance(storage.backend_for("cloudy"), CloudSQLiteBackend)
+        monkeypatch.setattr(CloudSQLiteBackend, name, lambda self, *a, **k: pytest.fail(name))
     out = tmp_path / "p.json"
     with pytest.raises(SystemExit) as exc:
         preview.main(["--out", str(out), "--db", "cloudy"])
     assert exc.value.code != 0 and "local SQLite and D1 stores only" in str(exc.value.code)
-    assert calls == [] and not out.exists()
+    assert not out.exists() and not (home / ".cache").exists()
     storage._registry_cache = None
+
+
+def test_the_script_refuses_an_s3_storage_uri_before_importing_memora(tmp_path):
+    """MEMORA_STORAGE_URI=s3://... builds the cloud backend at memora import:
+    the script must refuse before that import."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("MEMORA_", "AWS_"))}
+    env.update({"HOME": str(home), "MEMORA_STORAGE_URI": "s3://some-bucket/memora/memories.db"})
+    root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run([sys.executable, str(root / "scripts" / "preview_backfill_47.py"),
+                           "--out", str(tmp_path / "p.json")], env=env, capture_output=True, text=True)
+    assert proc.returncode != 0 and "local SQLite and D1 stores only" in proc.stderr
+    assert not (tmp_path / "p.json").exists() and not (home / ".cache").exists()

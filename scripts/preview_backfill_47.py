@@ -55,6 +55,46 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
+UNSUPPORTED_STORE = ("the preview supports local SQLite and D1 stores only: {uri!r} is refused "
+                     "(an S3 cloud store's backend syncs a local cache; nothing was opened)")
+
+
+def configured_uri(db_name: Optional[str]) -> Optional[str]:
+    """The store URI the preview would open, from the environment TEXT only
+    -- no backend is resolved or constructed (a cloud backend's constructor
+    already creates its cache directory and an S3 client). None: the legacy
+    local database (MEMORA_DB_PATH or the default path)."""
+    import os
+
+    raw = os.getenv("MEMORA_DATABASES", "").strip()
+    if raw:
+        registry = json.loads(raw)
+        name = db_name or os.getenv("MEMORA_DEFAULT_DB", "").strip() or (
+            next(iter(registry)) if len(registry) == 1 else None)
+        if name not in registry:
+            raise SystemExit(f"unknown store {name!r} (MEMORA_DATABASES: {sorted(registry)})")
+        return str(registry[name])
+    if db_name:
+        raise SystemExit("--db needs MEMORA_DATABASES")
+    return os.getenv("MEMORA_STORAGE_URI") or None
+
+
+def refuse_unsupported_store(db_name: Optional[str]) -> None:
+    """Allow only a local path, file://, or d1://; refuse s3:// and anything
+    else BEFORE any backend exists."""
+    uri = configured_uri(db_name)
+    if uri is None or "://" not in uri or uri.startswith(("file://", "d1://")):
+        return
+    raise SystemExit(UNSUPPORTED_STORE.format(uri=uri))
+
+
+if __name__ == "__main__":
+    # Before importing memora: with MEMORA_STORAGE_URI=s3://... the storage
+    # module builds its cloud backend at import time.
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument("--db")
+    refuse_unsupported_store(_pre.parse_known_args()[0].db)
+
 import _legacy_project_detection as legacy  # noqa: E402
 from memora import storage  # noqa: E402
 from memora.backends import CloudSQLiteBackend, LocalSQLiteBackend  # noqa: E402
@@ -76,11 +116,8 @@ def open_read_only():
     Guarantee: creates nothing, may refuse.
     """
     backend = storage.current_backend()
-    if isinstance(backend, CloudSQLiteBackend):
-        # Its connect() can sync (download to / upload from) its local cache.
-        raise SystemExit(
-            "the preview supports local SQLite and D1 stores only: an S3 cloud store's "
-            "connect can sync its cache, so it is refused (nothing opened)")
+    if isinstance(backend, CloudSQLiteBackend):  # belt and braces: refused earlier by URI
+        raise SystemExit(UNSUPPORTED_STORE.format(uri=getattr(backend, "cloud_url", "s3")))
     if isinstance(backend, LocalSQLiteBackend):
         path = backend.db_path
         if not path.is_file():
@@ -229,6 +266,7 @@ def main(argv=None) -> int:
     ap.add_argument("--out", required=True, help="preview JSON file to write (the approval list)")
     ap.add_argument("--markdown", help="also write a markdown table here")
     args = ap.parse_args(argv)
+    refuse_unsupported_store(args.db)  # before ANY backend is resolved or built
 
     token = storage.CURRENT_DB.set(args.db) if args.db else None
     try:
