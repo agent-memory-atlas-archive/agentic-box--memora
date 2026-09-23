@@ -1444,3 +1444,92 @@ def test_a_normal_d1_import_rebuilds_and_restores_the_stamp_under_its_lease(fake
         invalidate_embedding_integrity_cache(conn)
         assert stamp and get_embedding_integrity(conn) == stamp
         assert fences["n"] > 3 * 3  # rows, plus the post-write steps
+
+
+# --- typed tags are not project evidence (leader msg 7182; live items 537, 545, 633-668, 961-964) ---
+
+LEGACY_CLMUX_ISSUE = "**clmux: workspace rename does not work**  Attempting to rename a workspace does not take."
+
+
+def _legacy_issue(conn, tags=("memora/issues",), metadata=None):
+    """A clmux issue filed under the old default typed tag memora/issues."""
+    meta = {"type": "issue", "status": "open", **(metadata or {})}
+    policy = memora.TAG_WHITELIST
+    memora.TAG_WHITELIST = set()  # the legacy write path applied it itself
+    try:
+        return _add(conn, LEGACY_CLMUX_ISSUE, tags=list(tags), metadata=meta)
+    finally:
+        memora.TAG_WHITELIST = policy
+
+
+def test_a_typed_tag_is_not_project_evidence(db, projects):
+    projects(["memora", "clmux", "acebar", "pi"])
+    for kind in ("issues", "todos", "sections", "documents", "knowledge"):
+        assert storage._resolve_project(None, [f"memora/{kind}"], {"type": "issue"}) is None
+    # A non-typed project tag is evidence, and a typed tag never makes it ambiguous.
+    assert storage._resolve_project(None, ["memora/issues", "clmux/tui"], {"type": "issue"}) == "clmux"
+    assert storage._resolve_project(None, ["memora/issues"], {"project": "clmux"}) == "clmux"
+    assert storage._resolve_project("clmux", ["memora/issues"], {}) == "clmux"
+
+
+def test_a_legacy_typed_issue_no_longer_resolves_to_memora(db, projects):
+    projects(["memora", "clmux", "acebar", "pi"])
+    with storage.connect() as conn:
+        mid = _legacy_issue(conn)["id"]
+        stored = storage.get_memory(conn, mid)
+    assert (stored["metadata"] or {}).get("section") is None  # no memora section from the typed tag
+    assert stored["tags"] == ["memora/issues"]  # left as is while no project is resolved
+
+
+def test_the_typed_tag_follows_a_later_resolved_project(default_policy_db, projects):
+    projects(["memora", "clmux", "acebar", "pi"])
+    with storage.connect() as conn:
+        mid = _legacy_issue(conn)["id"]
+        # Declaring the project re-prefixes the memory's own typed tag, under
+        # the default tag policy (exempt: memora applied it).
+        updated = storage.update_memory(conn, mid, metadata={"project": "clmux"})
+    assert updated["tags"] == ["clmux/issues"]
+    assert updated["metadata"]["project"] == "clmux"
+
+
+def test_the_typed_tag_follows_a_non_typed_project_tag_on_a_tag_update(db, projects):
+    projects(["memora", "clmux", "acebar", "pi"])
+    with storage.connect() as conn:
+        mid = _legacy_issue(conn)["id"]
+        updated = storage.update_memory(conn, mid, tags=["memora/issues", "clmux/tui"])
+    assert sorted(updated["tags"]) == ["clmux/issues", "clmux/tui"]
+
+
+def test_an_update_without_a_project_keeps_the_legacy_typed_tag(default_policy_db, projects):
+    projects(["memora", "clmux", "acebar", "pi"])
+    with storage.connect() as conn:
+        mid = _legacy_issue(conn)["id"]
+        updated = storage.update_memory(conn, mid, content=LEGACY_CLMUX_ISSUE + " Still open.")
+    assert updated["tags"] == ["memora/issues"]
+
+
+def test_another_kinds_typed_tag_is_not_exempt(default_policy_db, projects):
+    projects(["memora", "clmux"])
+    with storage.connect() as conn:
+        mid = _legacy_issue(conn)["id"]
+        # "todos" is not this issue's own kind: a user tag, enforced by the policy.
+        with pytest.raises(ValueError):
+            storage.update_memory(conn, mid, tags=["memora/issues", "pi/todos"])
+
+
+def test_export_import_round_trip_of_a_legacy_typed_issue(db, projects):
+    projects(["memora", "clmux", "acebar", "pi"])
+    with storage.connect() as conn:
+        _legacy_issue(conn)
+        exported = storage.export_memories(conn)
+    (entry,) = exported
+    assert entry["system_tags"] == ["memora/issues"]
+    with storage.connect() as conn:
+        # Restored as is while no project is resolved...
+        assert storage.import_memories(conn, [dict(entry)], strategy="replace")["replaced"] is True
+        (restored,) = storage.list_memories(conn, limit=-1)
+        assert restored["tags"] == ["memora/issues"]
+        # ...and re-prefixed when the import declares the project.
+        assert storage.import_memories(conn, [dict(entry, project="clmux")], strategy="replace")["replaced"] is True
+        (restored,) = storage.list_memories(conn, limit=-1)
+        assert restored["tags"] == ["clmux/issues"] and restored["metadata"]["project"] == "clmux"

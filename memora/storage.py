@@ -1400,12 +1400,29 @@ _SYSTEM_KIND_TYPES: Dict[str, frozenset] = {
     "sections": frozenset({"section"}),
     "documents": frozenset({"document_root", "document_fragment"}),
 }
+# Every "<project>/<kind>" (or bare "<kind>") tag memora applies by TYPE:
+# the system kinds above plus the "knowledge" suggestion. A typed tag says
+# what a memory IS, not which project it belongs to -- the old default put
+# memora/issues on every issue -- so it is never project evidence.
+_TYPED_TAG_KINDS = frozenset(_SYSTEM_KIND_TYPES) | {"knowledge"}
+
+
+def _typed_tag_kind(tag: Any) -> Optional[str]:
+    """The kind of a typed tag ("issues" for "clmux/issues" or "issues"), or None."""
+    if not isinstance(tag, str):
+        return None
+    if "/" in tag:
+        head, rest = tag.split("/", 1)
+        return rest if rest in _TYPED_TAG_KINDS and _PROJECT_NAME_RE.match(head) else None
+    return tag if tag in _TYPED_TAG_KINDS else None
 
 
 def _system_typed_tags(
     system_tags: Optional[Iterable[str]],
     project: Optional[str],
     metadata: Optional[Mapping[str, Any]],
+    *,
+    legacy_prefix_ok: bool = False,
 ) -> List[str]:
     """Validate the typed tags memora itself applies to a memory.
 
@@ -1418,6 +1435,11 @@ def _system_typed_tags(
     pass them (add_memory/add_memories parameters, the typed tools, an
     import re-applying an export's system_tags field); public entry dicts
     cannot carry them.
+
+    legacy_prefix_ok (import only): with NO resolved project, a stored
+    "<other project>/<kind>" (e.g. the old default memora/issues) is kept as
+    it is -- typed tags are not project evidence, so there is nothing to
+    re-prefix it to yet (see _retarget_typed_tags).
     """
     mtype = metadata.get("type") if isinstance(metadata, Mapping) else None
     out: List[str] = []
@@ -1426,7 +1448,9 @@ def _system_typed_tags(
             raise ValueError(f"invalid system tag {tag!r}")
         kind = tag.split("/", 1)[1] if "/" in tag else tag
         expected = project_tag(project, kind)
-        if kind not in _SYSTEM_KIND_TYPES or tag != expected:
+        legacy = (legacy_prefix_ok and project is None and "/" in tag
+                  and _typed_tag_kind(tag) == kind)
+        if kind not in _SYSTEM_KIND_TYPES or (tag != expected and not legacy):
             raise ValueError(f"invalid system tag {tag!r} (expected {expected!r})")
         if mtype not in _SYSTEM_KIND_TYPES[kind]:
             raise ValueError(f"system tag {tag!r} does not match metadata.type {mtype!r}")
@@ -1436,34 +1460,55 @@ def _system_typed_tags(
 
 
 def _existing_system_tags(tags: Any, metadata: Optional[Mapping[str, Any]]) -> List[str]:
-    """The stored tags that ARE legitimate system typed tags for this memory
-    (its own project's or bare, matching its metadata.type) -- preserved and
-    exempt on update, exported as system_tags."""
+    """The stored tags that ARE this memory's own system typed tags: a system
+    kind matching its metadata.type, bare or under ANY project prefix (the old
+    default memora/issues included) -- memora put them there. Preserved and
+    exempt on update, exported as system_tags, and re-prefixed once the
+    memory's project is resolved (_retarget_typed_tags)."""
     if not isinstance(tags, list):
         return []
-    project = _resolve_project(None, tags, metadata, strict=False)
-    out = []
+    mtype = metadata.get("type") if isinstance(metadata, Mapping) else None
+    return [
+        tag for tag in tags
+        if (kind := _typed_tag_kind(tag)) in _SYSTEM_KIND_TYPES and mtype in _SYSTEM_KIND_TYPES[kind]
+    ]
+
+
+def _retarget_typed_tags(
+    tags: List[str], project: Optional[str], metadata: Optional[Mapping[str, Any]],
+) -> List[str]:
+    """With a resolved project, re-prefix the memory's own system typed tags
+    to it ("memora/issues" -> "clmux/issues" for a clmux issue); without one,
+    tags are returned unchanged. Order kept, duplicates dropped."""
+    if not project:
+        return list(tags)
+    own = set(_existing_system_tags(tags, metadata))
+    out: List[str] = []
     for tag in tags:
-        try:
-            if _system_typed_tags([tag], project, metadata):
-                out.append(tag)
-        except ValueError:
-            continue
+        new = project_tag(project, _typed_tag_kind(tag)) if tag in own else tag
+        if new not in out:
+            out.append(new)
     return out
 
 
 def project_tag(project: Optional[str], kind: str) -> str:
     """The tag for a typed memory (issues, todos, sections, documents,
     knowledge): "<project>/<kind>" with a project, bare "<kind>" without --
-    never another project's prefix (issue #47). Under MEMORA_PROJECTS with
-    memora configured, existing memora/<kind> tags still resolve to memora."""
+    never another project's prefix (issue #47). A typed tag is never project
+    evidence (_projects_in_tags): the old default memora/<kind> on a clmux
+    issue does not make it a memora memory; it is re-prefixed once the
+    memory's project is resolved (_retarget_typed_tags)."""
     return f"{project}/{kind}" if project else kind
 
 
 def _projects_in_tags(tags: Optional[Iterable[str]], known: Iterable[str]) -> set:
+    """Configured projects named by the tags' prefixes. Typed tags
+    (<project>/issues, todos, sections, documents, knowledge) are NOT evidence:
+    they record a memory's type, and the old default gave every issue and
+    todo a memora/ one whatever its project."""
     found = set()
     for tag in tags or []:
-        if not isinstance(tag, str):
+        if not isinstance(tag, str) or _typed_tag_kind(tag) is not None:
             continue
         head = tag.split("/", 1)[0]
         if head in known:
@@ -8248,18 +8293,24 @@ def update_memory(
         new_metadata = existing.get("metadata")
     new_tags = _validate_tags(tags) if tags is not None else existing.get("tags", [])
 
+    # A stored (possibly legacy) metadata.project is tolerated here; a
+    # project supplied by THIS update was validated above.
+    resolved = _resolve_project(None, new_tags, new_metadata, strict=False)
+    # The memory's OWN typed tags (e.g. "pi/issues" on this issue, or the old
+    # default "memora/issues") stay exempt when kept, and follow its project
+    # once one is resolved; anything new is a user tag.
+    kept_system = set(_existing_system_tags(existing.get("tags") or [], existing.get("metadata")))
+    exempt = kept_system | {project_tag(resolved, _typed_tag_kind(t)) for t in kept_system} if resolved \
+        else kept_system
     if tags is not None:
-        # A stored (possibly legacy) metadata.project is tolerated here; a
-        # project supplied by THIS update was validated above.
-        new_tags = _normalize_tags(new_tags, _resolve_project(None, new_tags, new_metadata, strict=False))
-        # The memory's OWN legitimate typed tags (e.g. "pi/issues" on this
-        # issue) stay exempt when kept; anything new is a user tag.
-        kept_system = set(_existing_system_tags(existing.get("tags") or [], existing.get("metadata")))
-        _enforce_tag_whitelist(new_tags, exempt=kept_system)
+        new_tags = _normalize_tags(new_tags, resolved)
+    new_tags = _retarget_typed_tags(list(new_tags), resolved, new_metadata)
+    if tags is not None:
+        _enforce_tag_whitelist(new_tags, exempt=exempt)
 
     # Check what changed (affects whether we need to recompute indexes)
     content_changed = content is not None and new_content != existing["content"]
-    tags_changed = tags is not None and sorted(new_tags) != sorted(existing.get("tags", []))
+    tags_changed = sorted(new_tags) != sorted(existing.get("tags", []))
     metadata_changed = metadata is not None and new_metadata != existing.get("metadata")
     index_changed = content_changed or tags_changed or metadata_changed
 
@@ -9709,7 +9760,12 @@ def _import_memories_body(conn, data, strategy, lease: Optional["_ImportLease"])
 
             # Prepare data
             resolved_project, metadata = _project_metadata(entry.get("project"), metadata, user_tags)
-            typed = _system_typed_tags(system, resolved_project, metadata)
+            if resolved_project and isinstance(system, list):
+                # Re-prefix typed tags to the now-resolved project (the old
+                # default memora/issues on a clmux issue becomes clmux/issues).
+                system = [project_tag(resolved_project, _typed_tag_kind(t))
+                          if _typed_tag_kind(t) in _SYSTEM_KIND_TYPES else t for t in system]
+            typed = _system_typed_tags(system, resolved_project, metadata, legacy_prefix_ok=True)
             metadata = _auto_assign_section(metadata, user_tags + typed, resolved_project)
             prepared_metadata = _prepare_metadata(metadata) if metadata else None
             validated_tags = _validate_tags(user_tags)
