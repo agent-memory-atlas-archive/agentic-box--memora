@@ -412,3 +412,112 @@ def test_report_says_it_is_a_preview_not_the_backfill(db, projects, capsys):
     assert "REMEDIATION PREVIEW" in out and "backfill_tags does NOT perform" in out
     assert report.main(["--json"]) == 0
     assert "does NOT perform" in json.loads(capsys.readouterr().out)["summary"]["kind"]
+
+
+# --- round 3: typed tags under the DEFAULT tag policy (review 7040 HIGH 1) ------
+
+@pytest.fixture(params=["local_db", "fake_d1_backend"])
+def default_policy_db(request, monkeypatch):
+    """The real out-of-the-box policy: memora.DEFAULT_TAGS, no ALLOW_ANY."""
+    request.getfixturevalue(request.param)
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set(memora.DEFAULT_TAGS))
+    monkeypatch.setattr(storage, "_search_snapshot_full", lambda *a, **k: [])
+    return request.param
+
+
+def test_typed_tools_work_under_the_default_policy(default_policy_db, projects):
+    from memora import server
+
+    projects(["pi"])
+    for tool, kind in ((server.memory_create_issue, "issues"), (server.memory_create_todo, "todos"),
+                       (server.memory_create_section, "sections")):
+        bare = asyncio.run(tool("typed thing"))
+        assert "error" not in bare, bare
+        assert bare["memory"]["tags"] == [kind]
+        pi = asyncio.run(tool("typed pi thing", project="pi"))
+        assert "error" not in pi, pi
+        assert pi["memory"]["tags"] == [f"pi/{kind}"]
+
+
+def test_user_supplied_tags_are_still_enforced_under_the_default_policy(default_policy_db, projects):
+    from memora import server
+
+    projects(["pi"])
+    # A caller cannot hand-apply a typed tag: only memora's own are exempt.
+    denied = asyncio.run(server.memory_create("x y z", tags=["pi/issues"]))
+    assert denied["error"] == "invalid_input"
+    denied = asyncio.run(server.memory_create("x y z", tags=["not-allowed"]))
+    assert denied["error"] == "invalid_input"
+    with storage.connect() as conn:
+        with pytest.raises(ValueError):  # a system tag for ANOTHER project
+            _add(conn, "x y z", project="pi", system_tags=["clmux/issues"])
+        with pytest.raises(ValueError):  # not a typed kind
+            _add(conn, "x y z", system_tags=["anything"])
+
+
+def test_explicit_project_keeps_allowed_generic_tags_bare_under_the_default_policy(default_policy_db, projects):
+    projects(["pi"])
+    with storage.connect() as conn:
+        rec = _add(conn, "pi plan text", tags=["plan", "analysis"], project="pi")
+    # pi/plan is not in the default policy: stays "plan" instead of failing.
+    assert rec["tags"] == ["plan", "analysis"] and rec["metadata"]["section"] == "pi"
+
+
+def test_documents_work_under_the_default_policy(default_policy_db, projects):
+    from memora import server
+
+    projects(["pi"])
+    doc = "# Plan\n\n1. first step\n2. second step\n"
+    out = asyncio.run(server.memory_store_document(doc, "pi/default-policy", project="pi"))
+    assert "error" not in out, out
+    with storage.connect() as conn:
+        assert "pi/documents" in storage.get_memory(conn, out["root_id"])["tags"]
+
+
+# --- round 3: documents resolve their project before the plan (HIGH 2) ----------
+
+@pytest.mark.parametrize("how", ["metadata", "tag"])
+def test_document_project_inferred_from_metadata_or_tag(db, projects, how):
+    from memora import server
+
+    projects(["memora", "pi"])
+    doc = "# Plan\n\n1. first step\n2. second step\n"
+    kwargs = {"metadata": {"project": "pi"}} if how == "metadata" else {"tags": ["pi/notes"]}
+    out = asyncio.run(server.memory_store_document(doc, f"inferred-{how}", **kwargs))
+    assert "error" not in out, out
+    with storage.connect() as conn:
+        root = storage.get_memory(conn, out["root_id"])
+        frags = [storage.get_memory(conn, i) for ids in out["node_map"].values() for i in ids]
+    for mem in [root, *frags]:
+        assert "pi/documents" in mem["tags"] and "documents" not in mem["tags"], mem["tags"]
+
+
+def test_document_rejects_an_unconfigured_metadata_project(db, projects):
+    from memora import server
+
+    projects(["memora"])
+    out = asyncio.run(server.memory_store_document("# T\n\ntext\n", "bad", metadata={"project": "pi"}))
+    assert out["error"] == "invalid_input"
+
+
+# --- round 3: the digest recognises any typed tag (MEDIUM) ------------------------
+
+def test_digest_buckets_include_tag_only_typed_entries(db, projects):
+    from memora import server
+
+    projects(None)
+    with storage.connect() as conn:
+        entries = {
+            "todos": _add(conn, "routing digest todo bare", tags=["todos", "routing"]),
+            "pi/todos": _add(conn, "routing digest todo pi", tags=["pi/todos", "routing"]),
+            "pi/issues": _add(conn, "routing digest issue pi", tags=["pi/issues", "routing"]),
+            "memora/issues": _add(conn, "routing digest issue legacy", tags=["memora/issues", "routing"]),
+            "issues": _add(conn, "routing digest issue bare", tags=["issues", "routing"]),
+        }
+        noise = _add(conn, "routing digest plain note", tags=["routing"])
+    digest = asyncio.run(server.memory_digest("routing digest", k=20))
+    todo_ids = {item["id"] for item in digest["todos"]}
+    issue_ids = {item["id"] for item in digest["issues"]}
+    assert {entries["todos"]["id"], entries["pi/todos"]["id"]} <= todo_ids
+    assert {entries["pi/issues"]["id"], entries["memora/issues"]["id"], entries["issues"]["id"]} <= issue_ids
+    assert noise["id"] not in todo_ids | issue_ids

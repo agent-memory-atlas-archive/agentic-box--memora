@@ -366,9 +366,11 @@ def _create_memory(
     metadata: Optional[Dict[str, Any]],
     tags: Optional[list[str]],
     project: Optional[str] = None,
+    system_tags: Optional[list[str]] = None,
 ):
     return add_memory(
         conn, content=content.strip(), metadata=metadata, tags=tags or [], project=project,
+        system_tags=system_tags,
     )
 
 
@@ -625,16 +627,17 @@ def _append_digest_memory(
     items.append(preview)
 
 
-def _has_digest_tag(memory: Dict[str, Any], tag: str) -> bool:
-    return tag in set(memory.get("tags") or [])
+def _has_kind_tag(memory: Dict[str, Any], kind: str) -> bool:
+    """A typed tag of this kind: bare ("todos"), or any project's
+    ("pi/todos"), which includes the legacy "memora/todos" (issue #47)."""
+    return any(
+        isinstance(t, str) and (t == kind or t.endswith("/" + kind))
+        for t in (memory.get("tags") or [])
+    )
 
 
-def _digest_bucket_type(bucket_tag: str) -> Optional[str]:
-    if bucket_tag == "memora/todos":
-        return "todo"
-    if bucket_tag == "memora/issues":
-        return "issue"
-    return None
+def _digest_bucket_type(kind: str) -> Optional[str]:
+    return {"todos": "todo", "issues": "issue"}.get(kind)
 
 
 def _memory_metadata_type(memory: Dict[str, Any]) -> Optional[str]:
@@ -646,9 +649,9 @@ def _memory_metadata_type(memory: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _active_item_matches_bucket(memory: Dict[str, Any], bucket_tag: str) -> bool:
-    bucket_type = _digest_bucket_type(bucket_tag)
-    return _has_digest_tag(memory, bucket_tag) or (
+def _active_item_matches_bucket(memory: Dict[str, Any], kind: str) -> bool:
+    bucket_type = _digest_bucket_type(kind)
+    return _has_kind_tag(memory, kind) or (
         bucket_type is not None and _memory_metadata_type(memory) == bucket_type
     )
 
@@ -668,7 +671,7 @@ def _metadata_filters_for_bucket_type(
 def _list_digest_bucket(
     conn,
     topic: str,
-    bucket_tag: str,
+    kind: str,
     k: int,
     metadata_filters: Optional[Dict[str, Any]],
     date_from: Optional[str],
@@ -679,9 +682,6 @@ def _list_digest_bucket(
     items: List[Dict[str, Any]] = []
     seen_ids: set[int] = set()
 
-    combined_tags_all = list(tags_all or [])
-    if bucket_tag not in combined_tags_all:
-        combined_tags_all.append(bucket_tag)
     for item in list_memories(
         conn,
         query=topic,
@@ -690,15 +690,16 @@ def _list_digest_bucket(
         date_from=date_from,
         date_to=date_to,
         tags_any=tags_any,
-        tags_all=combined_tags_all,
+        tags_all=tags_all,
         tags_none=None,
         follow="active",
+        kind_tag=kind,
     ):
         if item["id"] not in seen_ids:
             seen_ids.add(item["id"])
             items.append(item)
 
-    bucket_type = _digest_bucket_type(bucket_tag)
+    bucket_type = _digest_bucket_type(kind)
     if bucket_type is None:
         return items
 
@@ -860,14 +861,14 @@ def _build_memory_digest(
         todo_seen: set[int] = set()
         issue_seen: set[int] = set()
         for memory in active_memories:
-            if _active_item_matches_bucket(memory, "memora/todos"):
+            if _active_item_matches_bucket(memory, "todos"):
                 _append_digest_memory(todos, todo_seen, memory, preview_chars, source="active_hit")
-            if _active_item_matches_bucket(memory, "memora/issues"):
+            if _active_item_matches_bucket(memory, "issues"):
                 _append_digest_memory(issues, issue_seen, memory, preview_chars, source="active_hit")
         for item in _list_digest_bucket(
             conn,
             topic,
-            "memora/todos",
+            "todos",
             k,
             metadata_filters,
             date_from,
@@ -879,7 +880,7 @@ def _build_memory_digest(
         for item in _list_digest_bucket(
             conn,
             topic,
-            "memora/issues",
+            "issues",
             k,
             metadata_filters,
             date_from,
@@ -1191,10 +1192,11 @@ async def memory_create_issue(
         metadata["category"] = category
 
     # Create with auto-tag
-    tags = [project_tag(project, "issues")]
+    # memora's own typed tag: exempt from the tag allowlist (issue #47).
+    typed = [project_tag(project, "issues")]
 
     try:
-        record = await _create_memory(content.strip(), metadata, tags, project)
+        record = await _create_memory(content.strip(), metadata, [], project, typed)
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
 
@@ -1255,10 +1257,11 @@ async def memory_create_todo(
         metadata["category"] = category
 
     # Create with auto-tag
-    tags = [project_tag(project, "todos")]
+    # memora's own typed tag: exempt from the tag allowlist (issue #47).
+    typed = [project_tag(project, "todos")]
 
     try:
-        record = await _create_memory(content.strip(), metadata, tags, project)
+        record = await _create_memory(content.strip(), metadata, [], project, typed)
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
 
@@ -1300,10 +1303,11 @@ async def memory_create_section(
         metadata["subsection"] = subsection
 
     # Create with auto-tag
-    tags = [project_tag(project, "sections")]
+    # memora's own typed tag: exempt from the tag allowlist (issue #47).
+    typed = [project_tag(project, "sections")]
 
     try:
-        record = await _create_memory(content.strip(), metadata, tags, project)
+        record = await _create_memory(content.strip(), metadata, [], project, typed)
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
 
@@ -1642,12 +1646,20 @@ async def memory_store_document(
     """
     from .document import parse_document
 
+    # The documents tag follows the document's RESOLVED project -- explicit,
+    # else metadata.project, else a configured project tag -- resolved once
+    # here, before the plan is built (issue #47).
+    try:
+        document_project = storage_resolve_project(project, tags or [], metadata)
+    except ValueError as exc:
+        return {"error": "invalid_input", "message": str(exc)}
+
     try:
         plan = parse_document(
             content, document_key, version=version,
             tags=tags, metadata=metadata,
             skip_fragment_crossrefs=skip_fragment_crossrefs,
-            project=project,
+            project=document_project,
         )
     except Exception as exc:
         return {"error": "parse_error", "message": str(exc)}
@@ -1659,6 +1671,7 @@ async def memory_store_document(
             metadata=plan.root_metadata,
             tags=plan.root_tags,
             project=project,
+            system_tags=plan.system_tags,
         )
     except ValueError as exc:
         return {"error": "invalid_input", "message": f"Root creation failed: {exc}"}
@@ -1673,6 +1686,7 @@ async def memory_store_document(
             "metadata": frag.metadata,
             "tags": list(plan.root_tags),
             "project": project,
+            "system_tags": list(plan.system_tags),
         }
         fragment_entries.append(entry)
 
@@ -2359,8 +2373,9 @@ async def memory_digest(
         topic: Subject to digest.
         k: Maximum active search hits and TODO/issue matches to include.
         include_lineage: Include supersession history for active hits.
-        include_todos: Include matching todos and issues (metadata.type todo/issue,
-            or a legacy memora/todos or memora/issues tag).
+        include_todos: Include matching todos and issues: metadata.type todo/issue,
+            or a todos/issues tag, bare or with any project prefix (the legacy
+            memora/todos and memora/issues included).
         include_related_hops: Number of cross-reference hops to collect, capped at 3.
         synthesize: Reserved for future LLM synthesis. False by default.
         preview_chars: Preview length per returned memory.

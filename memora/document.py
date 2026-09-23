@@ -26,6 +26,9 @@ class DocumentPlan:
     root_metadata: Dict[str, Any]
     root_tags: List[str]
     fragments: List[Fragment]
+    # memora's own typed tags ("<project>/documents"): stored on root and
+    # fragments, exempt from the tag allowlist (issue #47).
+    system_tags: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +89,8 @@ def parse_document(
         **metadata,
     }
     documents_tag = f"{project}/documents" if project else "documents"
-    root_tags = list(tags) + ([documents_tag] if documents_tag not in tags else [])
+    root_tags = [t for t in tags if t != documents_tag]
+    system_tags = [documents_tag]
 
     # Split document into heading-delimited sections
     sections = _split_by_headings(content)
@@ -130,6 +134,7 @@ def parse_document(
         root_metadata=root_metadata,
         root_tags=root_tags,
         fragments=fragments,
+        system_tags=system_tags,
     )
 
 

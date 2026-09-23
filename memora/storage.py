@@ -1384,6 +1384,31 @@ def configured_projects(store: Optional[str] = None) -> Tuple[str, ...]:
     return tuple(dict.fromkeys(data))
 
 
+# Typed tags memora generates itself (issue/todo/section/document tools,
+# create suggestions): "<kind>" or "<project>/<kind>".
+TYPED_TAG_KINDS = ("issues", "todos", "sections", "documents", "knowledge")
+
+
+def _system_typed_tags(system_tags: Optional[Iterable[str]], project: Optional[str]) -> List[str]:
+    """Validate typed tags a memora tool adds itself.
+
+    They are exempt from the tag allowlist (issue #47 review): memora
+    generates them from a fixed kind list and an already-validated project,
+    so they cannot be used as free-form tags -- unlike putting the kinds into
+    the global policy, which would also let callers hand-apply them. Each
+    must be exactly a kind, or "<project>/<kind>" for THIS memory's project.
+    """
+    out: List[str] = []
+    for tag in system_tags or []:
+        kind = tag.split("/", 1)[1] if "/" in tag else tag
+        expected = project_tag(project, kind)
+        if kind not in TYPED_TAG_KINDS or tag != expected:
+            raise ValueError(f"invalid system tag {tag!r} (expected {expected!r})")
+        if tag not in out:
+            out.append(tag)
+    return out
+
+
 def project_tag(project: Optional[str], kind: str) -> str:
     """The tag for a typed memory (issues, todos, sections, documents,
     knowledge): "<project>/<kind>" with a project, bare "<kind>" without --
@@ -1455,16 +1480,22 @@ def _normalize_tags(
     """Prefix generic tags ("architecture") with the memory's project.
 
     Only for an explicitly resolved project (_resolve_project); with none,
-    tags are returned unchanged. Idempotent: tags containing '/' are never
-    touched.
+    tags are returned unchanged. Only when the tag policy permits the
+    prefixed form: otherwise the tag stays bare, so an explicit project never
+    turns an allowed tag ("plan") into a rejected one ("pi/plan") under the
+    default policy. Idempotent: tags containing '/' are never touched.
     """
     if not tags or not project:
         return tags
+    from . import TAG_WHITELIST
 
     normalized = []
     seen: set = set()
     for tag in tags:
-        if tag in _GENERIC_TAGS_TO_PREFIX and "/" not in tag:
+        if (
+            tag in _GENERIC_TAGS_TO_PREFIX and "/" not in tag
+            and (not TAG_WHITELIST or tag_matches_policy(f"{project}/{tag}", TAG_WHITELIST))
+        ):
             prefixed = f"{project}/{tag}"
             if prefixed not in seen:
                 normalized.append(prefixed)
@@ -1582,14 +1613,17 @@ def _auto_assign_section(
     return updated
 
 
-def _enforce_tag_whitelist(tags: List[str]) -> None:
+def _enforce_tag_whitelist(tags: List[str], exempt: Iterable[str] = ()) -> None:
+    """Every tag must match the configured policy, except the exempt ones --
+    memora's own typed tags (_system_typed_tags), never user-supplied ones."""
     from . import TAG_WHITELIST
 
     if not TAG_WHITELIST:
         return
 
+    exempt = set(exempt)
     for tag in tags:
-        if tag_matches_policy(tag, TAG_WHITELIST):
+        if tag in exempt or tag_matches_policy(tag, TAG_WHITELIST):
             continue
         raise ValueError(f"Tag '{tag}' is not in the allowed tag list")
 
@@ -5308,8 +5342,13 @@ def add_memory(
     absorb_operation_key: Optional[str] = None,
     corpus: Optional[_CorpusSnapshot] = None,
     project: Optional[str] = None,
+    system_tags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Create a memory.
+
+    system_tags: typed tags a memora tool adds itself ("issues",
+    "<project>/documents", ...; _system_typed_tags) -- exempt from the tag
+    allowlist, which still applies to every other tag.
 
     project: the memory's project, explicitly (issue #47). Recorded as
     metadata.project and drives section/tag prefixing; without it the
@@ -5328,11 +5367,13 @@ def add_memory(
     content = _validate_content(content)
 
     resolved_project, metadata = _project_metadata(project, metadata, tags)
-    metadata = _auto_assign_section(metadata, tags, resolved_project)
+    typed = _system_typed_tags(system_tags, resolved_project)
+    metadata = _auto_assign_section(metadata, list(tags or []) + typed, resolved_project)
 
     validated_tags = _validate_tags(tags)
     validated_tags = _normalize_tags(validated_tags, resolved_project)
     _enforce_tag_whitelist(validated_tags)
+    validated_tags = validated_tags + [t for t in _validate_tags(typed) if t not in validated_tags]
     tags_json = json.dumps(validated_tags, ensure_ascii=False)
 
     has_images = (
@@ -5465,11 +5506,13 @@ def add_memories(
         metadata = entry.get("metadata")
         tags = entry.get("tags") or []
         resolved_project, metadata = _project_metadata(entry.get("project"), metadata, tags)
-        metadata = _auto_assign_section(metadata, tags, resolved_project)
+        typed = _system_typed_tags(entry.get("system_tags"), resolved_project)
+        metadata = _auto_assign_section(metadata, list(tags) + typed, resolved_project)
         prepared_metadata = _prepare_metadata(metadata)
         validated_tags = _validate_tags(tags)
         validated_tags = _normalize_tags(validated_tags, resolved_project)
         _enforce_tag_whitelist(validated_tags)
+        validated_tags = validated_tags + [t for t in _validate_tags(typed) if t not in validated_tags]
         metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
         tags_json = json.dumps(validated_tags, ensure_ascii=False)
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -8409,14 +8452,25 @@ def _list_memory_sql_rows(
     return rows
 
 
+def _has_kind_tag(tags: Any, kind: str) -> bool:
+    """A typed tag of this kind: bare ("todos") or any project's ("pi/todos",
+    including the legacy "memora/todos")."""
+    return isinstance(tags, list) and any(
+        isinstance(t, str) and (t == kind or t.endswith("/" + kind)) for t in tags
+    )
+
+
 def _records_pass_post_sql_filters(
     record: Dict[str, Any],
     validated_filters: Optional[Dict[str, Any]],
     tags_any: Optional[List[str]],
     tags_all: Optional[List[str]],
     tags_none: Optional[List[str]],
+    kind_tag: Optional[str] = None,
 ) -> bool:
     if validated_filters and not _metadata_matches_filters(record.get("metadata"), validated_filters):
+        return False
+    if kind_tag and not _has_kind_tag(record.get("tags"), kind_tag):
         return False
     record_tags = set(record.get("tags", []))
     if tags_any and not any(tag in record_tags for tag in tags_any):
@@ -8441,7 +8495,13 @@ def list_memories(
     tags_none: Optional[List[str]] = None,
     sort_by_importance: bool = False,
     follow: Optional[str] = None,
+    kind_tag: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    """List memories with optional query, metadata, date, tag and lineage filters.
+
+    kind_tag: only memories with a typed tag of this kind ("todos"), bare or
+    with any project prefix (_has_kind_tag); applied before limit/offset.
+    """
     validated_filters = _validate_metadata_filters(metadata_filters)
     limit = _clamp_limit(limit)
     offset = _clamp_offset(offset) or 0
@@ -8451,7 +8511,8 @@ def list_memories(
     # Lineage (active/latest) is also post-SQL: windowed continuation below.
     lineage_filters_results = follow in {"active", "latest"}
     has_post_sql_filters = bool(
-        validated_filters or tags_any or tags_all or tags_none or lineage_filters_results
+        validated_filters or tags_any or tags_all or tags_none or kind_tag
+        or lineage_filters_results
     )
 
     parsed_date_from = _parse_date_filter(date_from) if date_from else None
@@ -8511,7 +8572,7 @@ def list_memories(
                 rec
                 for rec in (_serialise_row(row) for row in rows)
                 if _records_pass_post_sql_filters(
-                    rec, validated_filters, tags_any, tags_all, tags_none
+                    rec, validated_filters, tags_any, tags_all, tags_none, kind_tag
                 )
             ]
             batch = apply_follow(
@@ -8570,7 +8631,7 @@ def list_memories(
         rec
         for rec in (_serialise_row(row) for row in rows)
         if _records_pass_post_sql_filters(
-            rec, validated_filters, tags_any, tags_all, tags_none
+            rec, validated_filters, tags_any, tags_all, tags_none, kind_tag
         )
     ]
 
