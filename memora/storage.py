@@ -1187,18 +1187,45 @@ def _fts_delete(conn: sqlite3.Connection, memory_id: int) -> None:
     conn.execute("DELETE FROM memories_fts WHERE rowid = ?", (memory_id,))
 
 
+_bad_tags_warned: set = set()
+
+
+def _parse_tags_json(tags_json: Optional[str], memory_id: Any = None) -> Tuple[Any, bool]:
+    """(tags, ok). The one tags parse every reader uses (_serialise_row, the
+    corpus snapshot). An unparseable blob -- e.g. a malformed import -- is
+    read as untagged, (ok=False), and warned once per memory id, instead of
+    raising: before, it failed any list/search/get that serialised the row,
+    and aborted absorb's snapshot load."""
+    if not tags_json:
+        return [], True
+    try:
+        return json.loads(tags_json), True
+    except (json.JSONDecodeError, TypeError) as exc:
+        if memory_id not in _bad_tags_warned:
+            _bad_tags_warned.add(memory_id)
+            logger.warning("memory #%s has unparseable tags JSON (%s); reading it as untagged",
+                           memory_id, exc)
+        return [], False
+
+
 def _serialise_row(row: sqlite3.Row) -> Dict[str, Any]:
     metadata = row["metadata"]
     tags = row["tags"]
     row_keys = row.keys() if hasattr(row, 'keys') else []
+    parsed_tags, tags_ok = _parse_tags_json(tags, row["id"])
     result = {
         "id": row["id"],
         "content": row["content"],
         "metadata": _present_metadata(json.loads(metadata)) if metadata else None,
-        "tags": json.loads(tags) if tags else [],
+        "tags": parsed_tags,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"] if "updated_at" in row_keys else None,
     }
+    if not tags_ok:
+        # Stored tags are not valid JSON (e.g. a malformed import). Reported
+        # as untagged, with this marker so a caller can tell "no tags" from
+        # "tags unreadable"; every filter treats the row as untagged.
+        result["tags_invalid"] = True
 
     # Add importance fields if available (may not exist in older schemas during migration)
     if "importance" in row_keys:
@@ -2395,9 +2422,20 @@ def _search_by_vector(
 
     entries = base.entries_in_id_order()
     if fresh_empty:
+        # The sink spans every cold-load attempt of this call. Merge a row
+        # only if the FINAL snapshot still holds it certified-empty; take its
+        # fields from that snapshot. A row a concurrent writer re-embedded
+        # (non-empty now), deleted, or that is otherwise absent is ranked by
+        # the final snapshot alone.
         merged = {e.id: e for e in entries}
         for e in fresh_empty:
-            merged[e.id] = e
+            current = merged.get(e.id)
+            if current is None or current.vector is not _CERTIFIED_EMPTY_EMBEDDING:
+                continue
+            merged[e.id] = _CorpusEntry(
+                e.id, {}, current.created_at, current.metadata_type,
+                current.encoding_source, current.metadata_json, current.tags,
+            )
         entries = [merged[i] for i in sorted(merged)]
     scored: List[Tuple[float, str, int]] = []
     for entry in entries:
@@ -2543,7 +2581,7 @@ def _search_by_vector_ids_only(
             metadata_json = row["metadata"]
             tags_json = row["tags"]
             meta = json.loads(metadata_json) if metadata_json else None
-            tags = json.loads(tags_json) if tags_json else []
+            tags = _parse_tags_json(tags_json, memory_id)[0]
             vector = _compute_embedding(row["content"], meta, tags)
             _upsert_embedding(conn, memory_id, vector)
 
@@ -2696,24 +2734,9 @@ class _CorpusSnapshot:
         return [(entry_id, score) for score, _, entry_id in results[:top_k]]
 
 
-_bad_tags_warned: set = set()
-
-
 def _tags_from_json(tags_json: Optional[str], memory_id: Optional[int] = None) -> Any:
-    """Tags for snapshot filtering: _serialise_row's parse, except that an
-    unparseable blob (e.g. a malformed import) filters as no tags instead of
-    aborting the whole load -- the snapshot loader serves absorb too, whose
-    loader never read tags before. Warned once per memory id."""
-    if not tags_json:
-        return []
-    try:
-        return json.loads(tags_json)
-    except (json.JSONDecodeError, TypeError) as exc:
-        if memory_id not in _bad_tags_warned:
-            _bad_tags_warned.add(memory_id)
-            logger.warning("memory #%s has unparseable tags JSON (%s); filtering it as untagged",
-                           memory_id, exc)
-        return []
+    """Tags for snapshot filtering: the same parse as _serialise_row."""
+    return _parse_tags_json(tags_json, memory_id)[0]
 
 
 def _metadata_type_from_metadata(metadata_json: Optional[str]) -> Optional[str]:
@@ -2827,8 +2850,7 @@ def _repair_corpus_embeddings(
         ).fetchall()
         for row in rows:
             meta = _metadata_dict_from_json(row["metadata"])
-            tags_json = row["tags"]
-            tags = json.loads(tags_json) if tags_json else []
+            tags = _parse_tags_json(row["tags"], row["id"])[0]
             # FAIL CLOSED: a repair embedding failure must propagate, not be
             # swallowed. The old lazy-backfill path let a strict/provider
             # failure re-raise into absorb's per-fact handler so the fact was
@@ -2855,6 +2877,13 @@ def _repair_corpus_embeddings(
                         _metadata_type_from_metadata(meta_by_id.get(row["id"])), "python",
                         row["metadata"], tags,
                     ))
+                # The snapshot records what the DB now holds: a certified-
+                # empty row, which every search skips.
+                snapshot.append(
+                    row["id"], _CERTIFIED_EMPTY_EMBEDDING, created_by_id.get(row["id"]),
+                    _metadata_type_from_metadata(meta_by_id.get(row["id"])), "python",
+                    metadata_json=row["metadata"], tags=tags,
+                )
                 continue
             snapshot.append(
                 row["id"], vector, created_by_id.get(row["id"]),
@@ -2914,18 +2943,99 @@ def _repair_corpus_embeddings(
 # retries; under sustained writes every absorb scans and never caches.
 # ---------------------------------------------------------------------------
 
-_corpus_cache: Dict[str, "_CorpusCacheEntry"] = {}
+# BOUNDS (added when reads started caching too): least-recently-used order,
+# a byte budget across every store (MEMORA_CORPUS_CACHE_BUDGET_MB, default
+# 384), and eviction of a store's entries cached under an embedding model the
+# store no longer records. An evicted snapshot is simply exact-loaded again
+# on next use -- the cold path above -- so bounds never affect correctness.
+_corpus_cache: "OrderedDict[str, _CorpusCacheEntry]" = OrderedDict()
 _corpus_cache_lock = threading.Lock()
 _EPOCH_KEY = "embedding_change_epoch"
 _CORPUS_LOAD_RETRIES = 3
+_DEFAULT_CORPUS_CACHE_BUDGET_MB = 384
+# Measured bytes per vector component for the Dict[str, float] vectors
+# json_to_embedding builds (~93 KB per 1024-dim row), plus fixed per-entry
+# overhead. An estimate for the budget, not an exact accounting.
+_CORPUS_BYTES_PER_COMPONENT = 91
+_CORPUS_BYTES_PER_ENTRY = 400
+
+
+def _corpus_cache_budget_bytes() -> int:
+    """MEMORA_CORPUS_CACHE_BUDGET_MB (default 384), read per call so tests and
+    operators can change it; invalid or non-positive values use the default."""
+    raw = os.getenv("MEMORA_CORPUS_CACHE_BUDGET_MB")
+    try:
+        mb = float(raw) if raw is not None else _DEFAULT_CORPUS_CACHE_BUDGET_MB
+    except ValueError:
+        mb = _DEFAULT_CORPUS_CACHE_BUDGET_MB
+    if mb <= 0:
+        mb = _DEFAULT_CORPUS_CACHE_BUDGET_MB
+    return int(mb * 1024 * 1024)
+
+
+def _estimate_snapshot_bytes(snapshot: "_CorpusSnapshot") -> int:
+    total = 0
+    for entry in snapshot._by_id.values():
+        vec = entry.vector
+        total += _CORPUS_BYTES_PER_ENTRY
+        if isinstance(vec, dict):
+            total += _CORPUS_BYTES_PER_COMPONENT * len(vec)
+        total += len(entry.metadata_json or "")
+        tags = entry.tags
+        if isinstance(tags, list):
+            total += 80 * len(tags)
+    return total
 
 
 class _CorpusCacheEntry:
-    __slots__ = ("snapshot", "epoch")
+    __slots__ = ("snapshot", "epoch", "nbytes")
 
-    def __init__(self, snapshot: _CorpusSnapshot, epoch: int):
+    def __init__(self, snapshot: _CorpusSnapshot, epoch: int, nbytes: int = 0):
         self.snapshot = snapshot
         self.epoch = epoch
+        self.nbytes = nbytes
+
+
+def _corpus_cache_get(key: str, epoch: int) -> Optional["_CorpusSnapshot"]:
+    """A fresh hit (matching epoch) for key, marked most recently used."""
+    with _corpus_cache_lock:
+        entry = _corpus_cache.get(key)
+        if entry is None or entry.epoch != epoch:
+            return None
+        _corpus_cache.move_to_end(key)
+        return entry.snapshot
+
+
+def _evict_stale_models_locked(store: str, key: str) -> None:
+    """Drop this store's entries cached under another model stamp: after a
+    model switch they can never be hit again (the key carries the model)."""
+    prefix = f"{store}|"
+    for other in [k for k in _corpus_cache if k.startswith(prefix) and k != key]:
+        entry = _corpus_cache.pop(other)
+        logger.info("corpus cache: evicted %s (model no longer current; ~%.1f MB)",
+                    other, entry.nbytes / 1048576)
+
+
+def _corpus_cache_publish_locked(key: str, snapshot: "_CorpusSnapshot", epoch: int) -> bool:
+    """Cache snapshot under key within the byte budget, evicting whole
+    least-recently-used snapshots of other keys first. A snapshot larger
+    than the whole budget is not cached (returned to its caller uncached).
+    Returns whether it was cached."""
+    nbytes = _estimate_snapshot_bytes(snapshot)
+    budget = _corpus_cache_budget_bytes()
+    _corpus_cache.pop(key, None)
+    if nbytes > budget:
+        logger.info("corpus cache: not caching %s (~%.1f MB > budget %.1f MB)",
+                    key, nbytes / 1048576, budget / 1048576)
+        return False
+    used = sum(e.nbytes for e in _corpus_cache.values())
+    while _corpus_cache and used + nbytes > budget:
+        old_key, old = _corpus_cache.popitem(last=False)
+        used -= old.nbytes
+        logger.info("corpus cache: evicted %s (least recently used; ~%.1f MB, budget %.1f MB)",
+                    old_key, old.nbytes / 1048576, budget / 1048576)
+    _corpus_cache[key] = _CorpusCacheEntry(snapshot, epoch, nbytes)
+    return True
 
 
 # memories_meta keys a search needs at call start, read in ONE statement and
@@ -3023,14 +3133,16 @@ def _corpus_base(
         loaded._cache_key = None
         return loaded
     key = _corpus_cache_key_for(store, model)
-    entry = _corpus_cache.get(key)
-    if entry is not None and entry.epoch == epoch:
-        return entry.snapshot
+    hit = _corpus_cache_get(key, epoch)
+    if hit is not None:
+        return hit
     # Cold load: only cache if the epoch is stable across the read, so we never
     # publish a snapshot under an epoch it did not observe.
     with _corpus_cache_lock:
+        _evict_stale_models_locked(store, key)
         entry = _corpus_cache.get(key)
         if entry is not None and entry.epoch == epoch:
+            _corpus_cache.move_to_end(key)
             return entry.snapshot
         loaded: Optional[_CorpusSnapshot] = None
         for _ in range(_CORPUS_LOAD_RETRIES):
@@ -3045,8 +3157,10 @@ def _corpus_base(
                 loaded._cache_key = None
                 return loaded
             if before == after:
+                # _cache_key stays set even if the budget refuses the entry:
+                # invalidate_corpus_cache(key) is then a harmless no-op.
                 loaded._cache_key = key
-                _corpus_cache[key] = _CorpusCacheEntry(loaded, after)
+                _corpus_cache_publish_locked(key, loaded, after)
                 return loaded
         # See RETRY EXHAUSTION in the module comment: last load, uncached.
         loaded._cache_key = None

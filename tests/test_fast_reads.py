@@ -468,20 +468,52 @@ def test_cold_search_repairs_more_than_100_missing_embeddings(fake_d1_backend, m
         assert len(storage._get_embeddings_for_ids(conn, ids)) == 101
 
 
-def test_malformed_tags_blob_does_not_abort_search_or_absorb(db, caplog, monkeypatch):
-    monkeypatch.setattr(storage, "_bad_tags_warned", set())  # warn-once is per process
+def _store_with_bad_tags_row(conn):
+    ids = _seed_search_store(conn)
+    # A row that MATCHES the query strongly, with unparseable tags.
+    bad = _raw_insert(conn, "deploy proxy deploy proxy", created="2026-09-10 00:00:00")
+    conn.execute("UPDATE memories SET tags = ? WHERE id = ?", ("{not json", bad))
+    conn.commit()
+    storage.rebuild_embeddings(conn)  # integrity stamp so semantic_search runs
+    storage._corpus_cache.clear()
+    return ids, bad
+
+
+@pytest.mark.parametrize("mode", ["no_filter", "tags_any", "tags_none", "dates", "hybrid"])
+def test_matching_row_with_malformed_tags_is_read_as_untagged(db, mode, caplog, monkeypatch):
+    """Deliberate behaviour change: unparseable tags read as untagged (plus a
+    tags_invalid marker) in every mode -- filtered as untagged AND returned
+    without raising. The old scan raised on such a row."""
+    monkeypatch.setattr(storage, "_bad_tags_warned", set())
     with storage.connect() as conn:
-        _seed_search_store(conn)
-        bad = _raw_insert(conn, "zzz unrelated bad tags row")
-        conn.execute("UPDATE memories SET tags = ? WHERE id = ?", ("{not json", bad))
-        conn.commit()
-        storage._corpus_cache.clear()
-        q = storage._compute_embedding("deploy proxy", None, [])
-        # A tag filter treats the bad row as untagged instead of raising.
-        out = storage._search_by_vector(conn, q, top_k=5, tags_none=["memora/deploy"])
-        assert out and bad not in {r["memory"]["id"] for r in out}
+        _ids, bad = _store_with_bad_tags_row(conn)
+        if mode == "hybrid":
+            results = storage.hybrid_search(conn, "deploy proxy", top_k=5)
+        else:
+            kwargs = {
+                "no_filter": {},
+                "tags_any": {"tags_any": ["memora/deploy"]},
+                "tags_none": {"tags_none": ["memora/cache"]},
+                "dates": {"date_from": "2026-09-09", "date_to": "2026-09-11"},
+            }[mode]
+            results = storage.semantic_search(conn, "deploy proxy", top_k=5, **kwargs)
+        by_id = {r["memory"]["id"]: r["memory"] for r in results}
+        if mode == "tags_any":
+            assert bad not in by_id  # untagged: cannot match a required tag
+        else:
+            assert bad in by_id, "a matching untagged row must rank"
+            assert by_id[bad]["tags"] == [] and by_id[bad]["tags_invalid"] is True
         assert "unparseable tags JSON" in caplog.text
-        storage._corpus_cache.clear()
+        # Other readers agree: get and list serialise it the same way.
+        got = storage.get_memory(conn, bad)
+        assert got["tags"] == [] and got["tags_invalid"] is True
+        assert bad not in {m["id"] for m in storage.list_memories(conn, tags_any=["memora/deploy"])}
+        assert all("tags_invalid" not in m for m in storage.list_memories(conn) if m["id"] != bad)
+
+
+def test_malformed_tags_do_not_abort_absorb(db):
+    with storage.connect() as conn:
+        _store_with_bad_tags_row(conn)
         result = storage.absorb_memory(conn, ["a brand new fact about lighthouses"])
         assert result["created"] == 1
 
@@ -529,3 +561,106 @@ def test_d1_transport_never_retries_after_response_bytes(fake_d1_http):
     assert [sql for _, sql in srv.requests].count("SELECT 3") == 1
     # The transport recovers on the next call with a fresh socket.
     assert conn.execute("SELECT 4").fetchone() is not None
+
+
+# --- fresh-empty rows vs concurrent writers across cold-load retries -------
+
+def test_fresh_empty_row_rewritten_between_load_attempts_ranks_by_real_vector(db, monkeypatch):
+    """Attempt 1 repairs X to empty (epoch moves); a concurrent writer then
+    gives X a real vector (epoch moves again); the stable attempt loads X
+    with that vector. The stale sink entry must not override it with 0."""
+    with storage.connect() as conn:
+        _raw_insert(conn, "deploy proxy one")
+        x = _raw_insert(conn, "!!! ...", embed=False)
+        conn.commit()
+        real = storage._load_corpus_snapshot
+        calls = {"n": 0}
+
+        def load_then_concurrent_write(c, **kw):
+            snap = real(c, **kw)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                storage._upsert_embedding(c, x, storage._compute_embedding("deploy proxy x", None, []))
+                c.commit()
+            return snap
+
+        monkeypatch.setattr(storage, "_load_corpus_snapshot", load_then_concurrent_write)
+        q = storage._compute_embedding("deploy proxy", None, [])
+        out = storage._search_by_vector(conn, q, top_k=None)
+    assert calls["n"] >= 2
+    score = {r["memory"]["id"]: r["score"] for r in out}
+    assert score[x] > 0.0
+
+
+def test_fresh_empty_row_scores_zero_when_the_repair_itself_moved_the_epoch(db):
+    with storage.connect() as conn:
+        _raw_insert(conn, "deploy proxy one")
+        x = _raw_insert(conn, "!!! ...", embed=False)
+        conn.commit()
+        q = storage._compute_embedding("deploy proxy", None, [])
+        first = {r["memory"]["id"]: r["score"] for r in storage._search_by_vector(conn, q, top_k=None)}
+        second = {r["memory"]["id"] for r in storage._search_by_vector(conn, q, top_k=None)}
+    assert first[x] == 0.0 and x not in second
+
+
+# --- corpus cache bounds -----------------------------------------------------
+
+def _cached_store(tmp_path, monkeypatch, name, rows):
+    from memora.backends import LocalSQLiteBackend
+
+    monkeypatch.setattr(storage, "STORAGE_BACKEND", LocalSQLiteBackend(tmp_path / f"{name}.db"))
+    with storage.connect() as conn:
+        for i in range(rows):
+            _raw_insert(conn, f"{name} deploy proxy row {i}")
+        conn.commit()
+        snap = storage._corpus_base(conn)
+        return snap._cache_key, storage._estimate_snapshot_bytes(snap)
+
+
+def test_corpus_cache_evicts_least_recently_used_whole_snapshots(tmp_path, monkeypatch, caplog):
+    import logging
+    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    storage._corpus_cache.clear()
+    caplog.set_level(logging.INFO, logger="memora.storage")
+    key_a, size_a = _cached_store(tmp_path, monkeypatch, "a", 30)
+    # Budget fits one snapshot of this size, not two.
+    monkeypatch.setenv("MEMORA_CORPUS_CACHE_BUDGET_MB", str(size_a * 1.5 / 1048576))
+    key_b, _ = _cached_store(tmp_path, monkeypatch, "b", 30)
+    assert list(storage._corpus_cache) == [key_b]
+    assert f"evicted {key_a} (least recently used" in caplog.text
+    # Using A again reloads it (cold path) and evicts B, now the LRU.
+    key_a2, _ = _cached_store(tmp_path, monkeypatch, "a", 0)
+    assert key_a2 == key_a and list(storage._corpus_cache) == [key_a]
+    storage._corpus_cache.clear()
+
+
+def test_corpus_cache_does_not_cache_a_snapshot_over_budget(tmp_path, monkeypatch, caplog):
+    import logging
+    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    storage._corpus_cache.clear()
+    caplog.set_level(logging.INFO, logger="memora.storage")
+    monkeypatch.setenv("MEMORA_CORPUS_CACHE_BUDGET_MB", "0.001")
+    key, _ = _cached_store(tmp_path, monkeypatch, "big", 30)
+    assert key not in storage._corpus_cache and "not caching" in caplog.text
+
+
+def test_corpus_cache_evicts_entries_of_a_replaced_model(tmp_path, monkeypatch, caplog):
+    import logging
+    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    storage._corpus_cache.clear()
+    caplog.set_level(logging.INFO, logger="memora.storage")
+    old_key, _ = _cached_store(tmp_path, monkeypatch, "m", 5)
+    with storage.connect() as conn:
+        conn.execute(
+            "INSERT INTO memories_meta(key, value) VALUES ('embedding_model', 'another-model') "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        )
+        conn.commit()
+        new_key = storage._corpus_base(conn)._cache_key
+    assert new_key != old_key
+    assert old_key not in storage._corpus_cache and new_key in storage._corpus_cache
+    assert f"evicted {old_key} (model no longer current" in caplog.text
+    storage._corpus_cache.clear()

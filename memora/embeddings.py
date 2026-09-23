@@ -1481,6 +1481,18 @@ def check_embedding_model_mismatch(conn: sqlite3.Connection, current_model: str)
     return bool(get_embedding_integrity_status(conn, current_model)["mismatch"])
 
 
+def _tags_or_untagged(tags_json: Optional[str]) -> Any:
+    """Stored tags for embedding text; unparseable JSON reads as untagged, as
+    every reader does (storage._parse_tags_json) -- a malformed import must
+    not abort a rebuild, including semantic_search's auto-rebuild."""
+    if not tags_json:
+        return []
+    try:
+        return json.loads(tags_json)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> int:
     """Rebuild all embeddings and finish with a SQL-derived audit stamp."""
     import uuid
@@ -1517,7 +1529,7 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
             {
                 "content": row["content"],
                 "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
-                "tags": json.loads(row["tags"]) if row["tags"] else [],
+                "tags": _tags_or_untagged(row["tags"]),
             }
             for row in chunk
         ]

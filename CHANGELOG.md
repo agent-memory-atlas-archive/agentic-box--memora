@@ -19,10 +19,13 @@ Fast reads (branch perf/fast-reads).
 ### Behaviour change
 - `memory_related`: a memory whose stored crossref list is **empty** now gets that empty list back; it is recomputed only with `refresh=True` or `memory_rebuild_crossrefs`, the same staleness rule every non-empty list already had. Previously an empty list was recomputed (a full-store scan) on every call, which also let a list stored empty while the store had no neighbours heal itself on the next read; it now stays empty until refreshed. A memory whose crossrefs were never computed (no stored row) is still computed on read.
 
+- **Malformed tags JSON** (e.g. from a bad import) is read as untagged everywhere instead of raising: every filter mode (tags_any, tags_all, tags_none, dates, none) and hybrid search treat the row as untagged, and search, get and list return it with `"tags": []` plus `"tags_invalid": true` (the marker appears only on such rows). The embedding rebuild (including semantic search's auto-rebuild) and the corpus snapshot load also read it as untagged. A warning is logged once per memory. Previously any search that scanned such a row, and any get/list that returned it, failed with a JSON error.
+
 ### Performance
 - `memory_semantic_search` / `memory_hybrid_search` score against the epoch-validated in-process corpus snapshot and hydrate only the ranked results; one `memories_meta` read feeds the integrity and cache checks; `follow` filtering, `memory_get` and `memory_related` recomputes need far fewer D1 statements; D1 keeps one HTTPS connection per worker thread; query embeddings are cached (LRU 256). Fake-D1 bench, warm calls: semantic search 16 -> 3 requests, hybrid 17 -> 4, `memory_get` 8 -> 1, `memory_list` 4 -> 2. Results are identical to the previous read paths (tests/test_fast_reads.py).
 - Read tools return a `profile` field (per-phase seconds and D1 request counts).
 - **Memory:** the corpus snapshot is now also cached for databases that are only searched (previously only after an absorb). About 93 KB per row with 1024-dim vectors (vectors dominate; metadata and tags add ~0.6 KB), i.e. ~93 MB per 1k-row database; see the note on `_CorpusSnapshot`.
+- The corpus cache is now bounded: least-recently-used eviction of whole snapshots under a byte budget across all stores, **`MEMORA_CORPUS_CACHE_BUDGET_MB`** (new, optional, default 384; a snapshot larger than the budget is served uncached), and a store's entries cached under a previous embedding model are dropped on its next load. Evictions are logged at INFO. An evicted store is simply loaded cold on next use.
 
 ## 0.4.3
 
