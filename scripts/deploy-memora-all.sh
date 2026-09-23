@@ -69,7 +69,14 @@
 #     zero on a server that answers but can't actually serve requests), an
 #     absorb result with a "decisions" list and a "profile" field, a search
 #     result with a "results" list and a "profile" field, and a stats result
-#     with an integer "import_pending" field, before calling this done.
+#     with an integer "import_pending" field. Then EVERY store in
+#     MEMORA_DATABASES (not only the default one the calls above use; /health
+#     itself touches no database): /health/db/<store> must reach a current
+#     (not stale) 200 ok within 90 s, and memory_stats over /mcp/<store> must
+#     report that store as its bound database, with an integer
+#     import_pending. Any store failing is named and fails the deploy.
+#     ("pi" in the memora project list is a tag project inside the memora
+#     store, not a store; pi agents have no MCP config.)
 #
 # HARDENED (queue item 23 follow-up, sealed review msg 5698/5699): the
 # credentials-env parser used to stream straight into the while loop via
@@ -251,11 +258,14 @@ if [ "$healthy" -ne 1 ]; then
   exit 1
 fi
 
-python3 - "${TAG#v}" <<'PY'
-import json, sys, time, urllib.request
+python3 - "${TAG#v}" "$MEMORA_DATABASES" "$HEALTH_TOKEN" <<'PY'
+import json, sys, time, urllib.error, urllib.request
 
 EXPECTED_VERSION = sys.argv[1]
-BASE = "http://127.0.0.1:8920/mcp/memora"
+STORES = list(json.loads(sys.argv[2]))
+HEALTH_TOKEN = sys.argv[3]
+ROOT = "http://127.0.0.1:8920"
+BASE = f"{ROOT}/mcp/memora"
 
 # The version the RUNNING process reports -- a stale image or a failed
 # rebuild would still answer /health, just with the old version.
@@ -267,11 +277,11 @@ if health.get("version") != EXPECTED_VERSION:
 print(f"/health reports version {EXPECTED_VERSION}")
 HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 
-def _post(body, session_id=None):
+def _post(body, session_id=None, base=BASE):
     headers = dict(HEADERS)
     if session_id:
         headers["mcp-session-id"] = session_id
-    req = urllib.request.Request(BASE, data=json.dumps(body).encode(), headers=headers, method="POST")
+    req = urllib.request.Request(base, data=json.dumps(body).encode(), headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=30) as resp:
         sid = resp.headers.get("mcp-session-id")
         raw = resp.read().decode()
@@ -288,20 +298,24 @@ def _parse_sse(raw):
 # session id actually came back; a smoke test that only checks HTTP status
 # would print and exit zero on a server that answers but can't actually
 # serve requests.
-sid, init_raw = _post({
-    "jsonrpc": "2.0", "id": 1, "method": "initialize",
-    "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-               "clientInfo": {"name": "deploy-check", "version": "0"}},
-})
-init_result = _parse_sse(init_raw)
-if "error" in init_result:
-    print(f"initialize returned a JSON-RPC error: {init_result['error']}", file=sys.stderr)
-    sys.exit(1)
-if not sid:
-    print("initialize succeeded but no mcp-session-id header was returned", file=sys.stderr)
-    sys.exit(1)
+def _initialize(base):
+    sid, init_raw = _post({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                   "clientInfo": {"name": "deploy-check", "version": "0"}},
+    }, base=base)
+    init_result = _parse_sse(init_raw)
+    if "error" in init_result:
+        print(f"initialize at {base} returned a JSON-RPC error: {init_result['error']}", file=sys.stderr)
+        sys.exit(1)
+    if not sid:
+        print(f"initialize at {base} succeeded but no mcp-session-id header was returned", file=sys.stderr)
+        sys.exit(1)
+    _post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id=sid, base=base)
+    return sid
 
-_post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id=sid)
+
+sid = _initialize(BASE)
 
 def _tool_dict(tool_result, name):
     """The tool's result dict: FastMCP sends it as JSON text content (and as
@@ -322,12 +336,12 @@ def _tool_dict(tool_result, name):
     return out
 
 
-def _call_tool(req_id, name, arguments):
+def _call_tool(req_id, name, arguments, session=None, base=BASE):
     t0 = time.time()
     _, raw = _post({
         "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
         "params": {"name": name, "arguments": arguments},
-    }, session_id=sid)
+    }, session_id=session or sid, base=base)
     elapsed = time.time() - t0
     result = _parse_sse(raw)
     if "error" in result:
@@ -380,5 +394,58 @@ if not isinstance(pending, int) or isinstance(pending, bool):
     sys.exit(1)
 print(f"memory_stats via memory store: {elapsed:.1f}s, {stats.get('total_memories')} memories, "
       f"import_pending={pending}")
+
+# EVERY store, not just the default one: /health is liveness only (no
+# database), and the calls above all went to the memora store. A store the
+# new image cannot reach, or misreads, must fail the deploy by name.
+#  a) /health/db/<store>: poll to a CURRENT 200 ok (not stale), bounded.
+#  b) memory_stats over /mcp/<store>: a real tool call through the router,
+#     bound to that very database, with an integer import_pending.
+def _store_health(store):
+    req = urllib.request.Request(f"{ROOT}/health/db/{store}",
+                                 headers={"Authorization": f"Bearer {HEALTH_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read().decode() or "{}")
+        except ValueError:
+            return exc.code, {}
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return None, {"error": str(exc)}
+
+failed = []
+for store in STORES:
+    deadline = time.time() + 90
+    healthy = False
+    while not healthy:
+        status, body = _store_health(store)
+        healthy = status == 200 and body.get("status") == "ok" and body.get("stale") is False
+        if not healthy and time.time() > deadline:
+            break
+        if not healthy:
+            time.sleep(3)
+    if not healthy:
+        failed.append(f"{store}: /health/db/{store} not a current 200 ok after 90s "
+                      f"(last: HTTP {status}, {json.dumps(body)[:300]})")
+        continue
+    store_base = f"{ROOT}/mcp/{store}"
+    store_sid = _initialize(store_base)
+    stats, elapsed = _call_tool(10, "memory_stats", {}, session=store_sid, base=store_base)
+    if stats.get("database") != store:
+        failed.append(f"{store}: memory_stats is bound to {stats.get('database')!r}, not {store!r}")
+        continue
+    pending = stats.get("import_pending")
+    if not isinstance(pending, int) or isinstance(pending, bool):
+        failed.append(f"{store}: memory_stats has no integer import_pending")
+        continue
+    print(f"store {store}: /health/db 200 ok (latency {body.get('latency_ms')} ms); memory_stats "
+          f"{stats.get('total_memories')} memories, import_pending={pending} ({elapsed:.1f}s)")
+if failed:
+    for line in failed:
+        print(f"STORE CHECK FAILED — {line}", file=sys.stderr)
+    sys.exit(1)
+print(f"all {len(STORES)} stores verified: {', '.join(STORES)}")
 PY
 REMOTE
