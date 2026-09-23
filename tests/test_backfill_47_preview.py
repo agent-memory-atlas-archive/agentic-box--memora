@@ -186,3 +186,44 @@ def test_the_script_refuses_an_s3_storage_uri_before_importing_memora(tmp_path):
                            "--out", str(tmp_path / "p.json")], env=env, capture_output=True, text=True)
     assert proc.returncode != 0 and "local SQLite and D1 stores only" in proc.stderr
     assert not (tmp_path / "p.json").exists() and not (home / ".cache").exists()
+
+
+
+def test_the_script_ignores_an_s3_storage_uri_when_the_registry_selects_a_local_store(tmp_path):
+    """Registry selects a local store AND MEMORA_STORAGE_URI=s3://... (which
+    memora.storage would build at import): the import-time backend is pinned
+    to the selected store; no cloud backend, no ~/.cache."""
+    import sqlite3 as _sqlite3
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    home = tmp_path / "home"
+    home.mkdir()
+    local = tmp_path / "l.db"
+    conn = _sqlite3.connect(local)
+    conn.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT, metadata TEXT, tags TEXT)")
+    conn.commit()
+    conn.close()
+    guard = tmp_path / "guard"
+    guard.mkdir()
+    # Fails the run if a CloudSQLiteBackend is ever constructed in the subprocess.
+    (guard / "sitecustomize.py").write_text(
+        "import memora.backends as b\n"
+        "def _no(self, *a, **k):\n"
+        "    raise SystemExit('CloudSQLiteBackend constructed')\n"
+        "b.CloudSQLiteBackend.__init__ = _no\n")
+    root = Path(__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("MEMORA_", "AWS_"))}
+    env.update({
+        "HOME": str(home),
+        "PYTHONPATH": os.pathsep.join([str(guard), str(root)]),
+        "MEMORA_DATABASES": json.dumps({"local": str(local)}),
+        "MEMORA_STORAGE_URI": "s3://some-bucket/memora/memories.db",
+    })
+    out = tmp_path / "p.json"
+    proc = subprocess.run([sys.executable, str(root / "scripts" / "preview_backfill_47.py"),
+                           "--out", str(out), "--db", "local"], env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert out.exists() and not (home / ".cache").exists()
+    assert "CloudSQLiteBackend constructed" not in proc.stderr + proc.stdout

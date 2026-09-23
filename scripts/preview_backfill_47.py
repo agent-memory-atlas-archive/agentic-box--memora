@@ -88,12 +88,27 @@ def refuse_unsupported_store(db_name: Optional[str]) -> None:
     raise SystemExit(UNSUPPORTED_STORE.format(uri=uri))
 
 
+def pin_import_time_backend(db_name: Optional[str]) -> None:
+    """memora.storage builds a module-level backend from MEMORA_STORAGE_URI
+    at IMPORT, whatever the registry selects. With a registry present, the
+    registry's selection is what the preview reads, so MEMORA_STORAGE_URI is
+    set to that selected (already allowed) URI for this process: the
+    import-time backend is then the selected local or D1 store, never an S3
+    cloud one (whose constructor creates its cache directory)."""
+    import os
+
+    if os.getenv("MEMORA_DATABASES", "").strip():
+        os.environ["MEMORA_STORAGE_URI"] = configured_uri(db_name)
+
+
 if __name__ == "__main__":
-    # Before importing memora: with MEMORA_STORAGE_URI=s3://... the storage
-    # module builds its cloud backend at import time.
+    # Before importing memora: refuse an unsupported selected store, and
+    # keep the import-time backend on the selected one (see above).
     _pre = argparse.ArgumentParser(add_help=False)
     _pre.add_argument("--db")
-    refuse_unsupported_store(_pre.parse_known_args()[0].db)
+    _db = _pre.parse_known_args()[0].db
+    refuse_unsupported_store(_db)
+    pin_import_time_backend(_db)
 
 import _legacy_project_detection as legacy  # noqa: E402
 from memora import storage  # noqa: E402
